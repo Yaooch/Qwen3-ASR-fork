@@ -20,6 +20,22 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+# # 新增：在 import datasets 之前设置独立缓存目录
+
+# try:
+#     import torch.distributed as dist
+#     if dist.is_available() and dist.is_initialized():
+#         rank = dist.get_rank()
+#     else:
+#         rank = int(os.environ.get("LOCAL_RANK", 0))
+# except:
+#     rank = int(os.environ.get("LOCAL_RANK", 0))
+
+# # 每个进程使用独立的缓存目录
+# cache_dir = f"/cfs/data/private/WangYaoChi/hf_cache/rank{rank}"
+# os.makedirs(cache_dir, exist_ok=True)
+# os.environ["HF_DATASETS_CACHE"] = cache_dir
+
 import librosa
 import torch
 from datasets import load_dataset
@@ -81,9 +97,17 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return best_path
 
 
-def load_audio(path: str, sr: int = 16000):
-    wav, _ = librosa.load(path, sr=sr, mono=True)
-    return wav
+def load_audio(path: str, sr: int = 16000, max_duration: float = 30.0):
+    try:
+        wav, _ = librosa.load(path, sr=sr, mono=True)
+        duration = len(wav) / sr
+        if duration > max_duration:
+            print(f"Warning: Audio too long ({duration:.1f}s > {max_duration}s), skipping: {path}")
+            return None
+        return wav
+    except Exception as e:
+        print(f"Warning: Failed to load audio {path}: {e}")
+        return None
 
 
 def build_prefix_messages(prompt: str, audio_array):
@@ -115,11 +139,27 @@ def make_preprocess_fn_prefix_only(processor):
 class DataCollatorForQwen3ASRFinetuning:
     processor: Any
     sampling_rate: int = 16000
+    corrupted_count: int = 0  # 添加：损坏文件计数器
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        audio_paths = [f["audio"] for f in features]
-        prefix_texts = [f["prefix_text"] for f in features]
-        targets = [f["target"] for f in features]
+        # 加载音频并过滤失败的
+        valid_features = []
+        for f in features:
+            wav = load_audio(f["audio"], sr=self.sampling_rate)
+            if wav is not None:
+                f["_audio"] = wav  # 缓存加载好的音频
+                valid_features.append(f)
+            else:
+                self.corrupted_count += 1  # 累加计数
+                # if rank == 0:
+                #     print(f"Skipping corrupted audio [{self.corrupted_count}]: {f['audio']}")
+        
+        if len(valid_features) == 0:
+            return None  # 整个 batch 都失败时返回 None，Trainer 会跳过
+        
+        audio_paths = [f["audio"] for f in valid_features]
+        prefix_texts = [f["prefix_text"] for f in valid_features]
+        targets = [f["target"] for f in valid_features]
 
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
@@ -155,6 +195,8 @@ class DataCollatorForQwen3ASRFinetuning:
 
 class CastFloatInputsTrainer(Trainer):
     def _prepare_inputs(self, inputs):
+        if inputs is None:
+            return None
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
         if model_dtype is not None:
@@ -162,6 +204,25 @@ class CastFloatInputsTrainer(Trainer):
                 if torch.is_tensor(v) and v.is_floating_point():
                     inputs[k] = v.to(dtype=model_dtype)
         return inputs
+    # 添加：训练结束时统计损坏文件数
+    def on_train_end(self, args, state, control, **kwargs):
+        if hasattr(self.data_collator, 'corrupted_count'):
+            local_count = self.data_collator.corrupted_count
+            
+            # 如果是分布式训练，汇总所有进程的计数
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                count_tensor = torch.tensor(local_count, dtype=torch.int64, device=args.device)
+                torch.distributed.all_reduce(count_tensor, op=torch.distributed.ReduceOp.SUM)
+                total_count = count_tensor.item()
+            else:
+                total_count = local_count
+            
+            if args.process_index == 0:
+                print(f"\n{'='*60}")
+                print(f"Training Complete!")
+                print(f"Total corrupted audio files skipped: {total_count}")
+                print(f"{'='*60}\n")
+        return super().on_train_end(args, state, control, **kwargs)
 
 
 def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
@@ -252,19 +313,26 @@ def main():
         device_map=None,
     )
     model = asr_wrapper.model
+    # model.gradient_checkpointing_enable()
     processor = asr_wrapper.processor
 
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
-    raw_ds = load_dataset(
-        "json",
-        data_files={
-            "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-        },
-    )
-    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
+    from accelerate import PartialState
+    with PartialState().main_process_first():
+        raw_ds = load_dataset(
+            "json",
+            data_files={
+                "train": args_cli.train_file,
+                **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
+            },
+        )
+        ds = raw_ds.map(
+            make_preprocess_fn_prefix_only(processor),
+            num_proc=16,
+            desc="Preprocessing dataset",
+        )
 
     keep = {"prompt", "audio", "target", "prefix_text"}
     for split in ds.keys():
@@ -298,7 +366,9 @@ def main():
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
-        report_to="none",
+        report_to="tensorboard",
+        logging_dir="./logs_3", #自定义日志目录
+        # deepspeed="ds_config_zero2.json",
     )
 
     trainer = CastFloatInputsTrainer(

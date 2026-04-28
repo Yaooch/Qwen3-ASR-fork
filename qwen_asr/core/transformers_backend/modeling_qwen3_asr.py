@@ -671,6 +671,8 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         input_features,
         feature_lens=None,
         aftercnn_lens=None,
+        return_pre_proj=False,
+        ctc_layer_idx=None,   # 新增，按人类习惯传 1~24
     ):
         r"""
         feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
@@ -725,16 +727,36 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
-        for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
-                hidden_states,
-                cu_seqlens,
-            )
+        # for encoder_layer in self.layers:
+        #     layer_outputs = encoder_layer(
+        #         hidden_states,
+        #         cu_seqlens,
+        #     )
 
+        #     hidden_states = layer_outputs[0]
+
+        ctc_hidden_states_lay = None
+
+        for layer_id, encoder_layer in enumerate(self.layers, start=1):
+            layer_outputs = encoder_layer(hidden_states, cu_seqlens)
             hidden_states = layer_outputs[0]
 
+            if ctc_layer_idx is not None and layer_id == ctc_layer_idx:
+                ctc_hidden_states_lay = hidden_states
+
         hidden_states = self.ln_post(hidden_states)
-        hidden_states = self.proj1(hidden_states)
+        if ctc_layer_idx == 24:
+            ctc_hidden_states_lay = hidden_states
+
+        # 这是最终层、proj1/proj2 之前的特征
+        pre_final = hidden_states
+
+        if return_pre_proj:
+            if ctc_layer_idx is not None:
+                return BaseModelOutput(last_hidden_state=pre_final), ctc_hidden_states_lay
+            return BaseModelOutput(last_hidden_state=pre_final), pre_final
+
+        hidden_states = self.proj1(pre_final)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
         return BaseModelOutput(last_hidden_state=hidden_states)
