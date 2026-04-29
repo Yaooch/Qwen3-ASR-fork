@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+cd "${SCRIPT_DIR}"
+
 # --------------------------------------------------
 # 推理 + WER 评测脚本
 #

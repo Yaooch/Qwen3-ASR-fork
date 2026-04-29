@@ -1,45 +1,4 @@
-# # qwen_joint/ctc.py
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
-
-# class CTC(nn.Module):
-#     """CTC 预测模块（投影 + log_softmax + CTCLoss）"""
-#     def __init__(self, odim: int, encoder_output_size: int, blank_id: int = 0):
-#         super().__init__()
-#         self.ctc_lo = nn.Linear(encoder_output_size, odim)
-#         self.blank_id = blank_id
-#         self.ctc_loss = nn.CTCLoss(blank=blank_id, zero_infinity=True)
-
-#     def log_softmax(self, hs_pad: torch.Tensor) -> torch.Tensor:
-#         return F.log_softmax(self.ctc_lo(hs_pad), dim=2)
-
-#     def forward(self, hs_pad, hs_lengths, targets, target_lengths):
-#         log_probs = self.log_softmax(hs_pad).transpose(0, 1).float()
-#         return self.ctc_loss(log_probs, targets, hs_lengths, target_lengths)
-
-#     @torch.no_grad()
-#     def greedy_decode(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor):
-#         """返回 List[List[int]]，已做 blank 去除与连续去重。"""
-#         log_probs = self.log_softmax(hs_pad)           # (B, T, V)
-#         preds = log_probs.argmax(dim=-1)               # (B, T)
-#         results = []
-#         for b in range(preds.size(0)):
-#             T = int(hs_lengths[b].item())
-#             ids = preds[b, :T].cpu().tolist()
-#             dedup, prev = [], -1
-#             for i in ids:
-#                 if i != self.blank_id and i != prev:
-#                     dedup.append(i)
-#                 prev = i
-#             results.append(dedup)
-#         return results
-
-
-
-
-#qwen_joint/ctc.py
+# qwen_asr/joint/ctc.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

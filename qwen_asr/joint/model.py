@@ -1,4 +1,4 @@
-# qwen_joint/joint_model.py
+# qwen_asr/joint/model.py
 import json
 import os
 from typing import Dict, List, Optional, Tuple, Union
@@ -10,7 +10,7 @@ from qwen_asr.inference.utils import parse_asr_output
 
 from .ctc import CTC
 from .rnnt import RNNT
-from .tokenize_utils import build_id_to_token, ids_to_text
+from .tokens import build_id_to_token, ids_to_text
 
 
 class Qwen3ASRJointModel(nn.Module):
@@ -166,7 +166,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         return instance
 
-    def save_ctc(self, output_dir: str) -> None:
+    def save_aux(self, output_dir: str) -> None:
         """保存辅助头和配置。文件名保持 ctc_config.json，兼容旧流程。"""
         os.makedirs(output_dir, exist_ok=True)
 
@@ -196,12 +196,16 @@ class Qwen3ASRJointModel(nn.Module):
         with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-    def _get_feat_extract_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
+    def save_ctc(self, output_dir: str) -> None:
+        """兼容旧训练代码的保存入口。"""
+        self.save_aux(output_dir)
+
+    def _out_lens(self, input_lengths: torch.Tensor) -> torch.Tensor:
         leave = input_lengths % 100
         feat_lengths = (leave - 1) // 2 + 1
         return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
 
-    def _encode_audio_for_joint(
+    def _enc_joint(
         self,
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
@@ -222,7 +226,7 @@ class Qwen3ASRJointModel(nn.Module):
             for start in range(0, batch_size, encoder_batch_size):
                 end = start + encoder_batch_size
                 sub_mask = feature_attention_mask[start:end] if feature_attention_mask is not None else None
-                sub_hs, sub_llm_features, sub_out_lens, sub_feat_lens = self._encode_audio_for_joint(
+                sub_hs, sub_llm_features, sub_out_lens, sub_feat_lens = self._enc_joint(
                     input_features[start:end],
                     sub_mask,
                     need_llm_features=need_llm_features,
@@ -284,7 +288,7 @@ class Qwen3ASRJointModel(nn.Module):
             if need_llm_features:
                 audio_features_for_llm = audio_tower.proj2(audio_tower.act(audio_tower.proj1(pre_final)))
 
-        out_lens = self._get_feat_extract_output_lengths(feat_lens)
+        out_lens = self._out_lens(feat_lens)
         max_len = int(out_lens.max().item())
 
         hs_pad = torch.zeros(
@@ -303,7 +307,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         return hs_pad, audio_features_for_llm, out_lens, feat_lens
 
-    def _compute_aux_loss(self, hs_pad, out_lens, target_ids, target_lengths):
+    def _aux_loss(self, hs_pad, out_lens, target_ids, target_lengths):
         if target_ids is None:
             return torch.tensor(0.0, device=hs_pad.device)
 
@@ -315,7 +319,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         raise ValueError(f"不支持的 aux_loss_type: {self.aux_loss_type}")
 
-    def _build_feature_stream_windows(
+    def _train_windows(
         self,
         input_features: torch.Tensor,
         feat_lens: torch.Tensor,
@@ -357,7 +361,7 @@ class Qwen3ASRJointModel(nn.Module):
                 start = end
         return windows
 
-    def _pad_feature_windows(self, windows: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _pad_windows(self, windows: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
         if not windows:
             raise RuntimeError("No feature windows were produced.")
 
@@ -374,7 +378,7 @@ class Qwen3ASRJointModel(nn.Module):
             mask[i, :cur_len] = 1
         return padded, mask
 
-    def _encode_aux_streaming_train_features(
+    def _enc_train_stream(
         self,
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
@@ -390,15 +394,15 @@ class Qwen3ASRJointModel(nn.Module):
                 device=input_features.device,
             )
 
-        windows = self._build_feature_stream_windows(input_features, feat_lens)
+        windows = self._train_windows(input_features, feat_lens)
         per_sample_chunks = [[] for _ in range(input_features.shape[0])]
         window_batch_size = max(1, int(self.aux_stream_window_batch_size))
         device = input_features.device
 
         for batch_start in range(0, len(windows), window_batch_size):
             batch_windows = windows[batch_start: batch_start + window_batch_size]
-            window_features, window_mask = self._pad_feature_windows(batch_windows)
-            hs_pad, _, out_lens, _ = self._encode_audio_for_joint(
+            window_features, window_mask = self._pad_windows(batch_windows)
+            hs_pad, _, out_lens, _ = self._enc_joint(
                 window_features,
                 window_mask,
                 need_llm_features=False,
@@ -409,8 +413,8 @@ class Qwen3ASRJointModel(nn.Module):
             for i, item in enumerate(batch_windows):
                 keep_start_frames = item["start"] - item["enc_start"]
                 keep_end_frames = item["end"] - item["enc_start"]
-                keep_start_idx = self._encoder_len_from_feature_len(keep_start_frames, device)
-                keep_end_idx = self._encoder_len_from_feature_len(keep_end_frames, device)
+                keep_start_idx = self._enc_len(keep_start_frames, device)
+                keep_end_idx = self._enc_len(keep_end_frames, device)
                 cur_len = int(out_lens[i].item())
                 keep_start_idx = max(0, min(keep_start_idx, cur_len))
                 keep_end_idx = max(keep_start_idx, min(keep_end_idx, cur_len))
@@ -454,25 +458,25 @@ class Qwen3ASRJointModel(nn.Module):
     ):
         use_streaming_aux_train = bool(self.training and self.aux_streaming_train)
         if use_streaming_aux_train:
-            hs_pad, out_lens = self._encode_aux_streaming_train_features(
+            hs_pad, out_lens = self._enc_train_stream(
                 input_features,
                 feature_attention_mask,
             )
             audio_features_for_llm = None
             if not self.ctc_only:
-                _, audio_features_for_llm, _, _ = self._encode_audio_for_joint(
+                _, audio_features_for_llm, _, _ = self._enc_joint(
                     input_features,
                     feature_attention_mask,
                     need_llm_features=True,
                 )
         else:
-            hs_pad, audio_features_for_llm, out_lens, _ = self._encode_audio_for_joint(
+            hs_pad, audio_features_for_llm, out_lens, _ = self._enc_joint(
                 input_features,
                 feature_attention_mask,
                 need_llm_features=not self.ctc_only,
             )
 
-        aux_loss = self._compute_aux_loss(hs_pad, out_lens, ctc_target_ids, ctc_target_lengths)
+        aux_loss = self._aux_loss(hs_pad, out_lens, ctc_target_ids, ctc_target_lengths)
 
         if self.ctc_only:
             llm_loss = torch.zeros_like(aux_loss)
@@ -538,7 +542,7 @@ class Qwen3ASRJointModel(nn.Module):
         return results
 
     @torch.no_grad()
-    def decode_aux_features(
+    def decode_feats(
         self,
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
@@ -552,7 +556,7 @@ class Qwen3ASRJointModel(nn.Module):
         if feature_attention_mask is not None:
             feature_attention_mask = feature_attention_mask.to(device=ref.device)
 
-        hs_pad, _, out_lens, _ = self._encode_audio_for_joint(
+        hs_pad, _, out_lens, _ = self._enc_joint(
             input_features,
             feature_attention_mask,
             need_llm_features=False,
@@ -574,7 +578,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         return [ids_to_text(ids, self._id_to_token) for ids in pred_ids_batch]
 
-    def _normalize_audio_to_list(self, audio) -> List:
+    def _audio_list(self, audio) -> List:
         if isinstance(audio, str):
             return [audio]
         if isinstance(audio, list):
@@ -586,7 +590,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         raise TypeError(f"不支持的音频类型：{type(audio)}")
 
-    def _build_ctc_feature_batch(self, waveform_list: List):
+    def _feature_batch(self, waveform_list: List):
         feature_extractor = self.processor.feature_extractor
         batch = feature_extractor(
             waveform_list,
@@ -600,7 +604,7 @@ class Qwen3ASRJointModel(nn.Module):
             batch["feature_attention_mask"] = batch.pop("attention_mask")
         return batch
 
-    def _feature_len_for_num_samples(self, num_samples: int, cache: Optional[Dict[int, int]] = None) -> int:
+    def _feat_len(self, num_samples: int, cache: Optional[Dict[int, int]] = None) -> int:
         """Feature extractor valid length for a waveform with this many samples."""
         if num_samples <= 0:
             return 0
@@ -623,13 +627,13 @@ class Qwen3ASRJointModel(nn.Module):
             cache[num_samples] = value
         return value
 
-    def _encoder_len_from_feature_len(self, feature_len: int, device: torch.device) -> int:
+    def _enc_len(self, feature_len: int, device: torch.device) -> int:
         if feature_len <= 0:
             return 0
         x = torch.tensor([feature_len], dtype=torch.long, device=device)
-        return int(self._get_feat_extract_output_lengths(x)[0].item())
+        return int(self._out_lens(x)[0].item())
 
-    def _build_stream_windows(
+    def _windows(
         self,
         wav,
         chunk_sec: float,
@@ -679,7 +683,7 @@ class Qwen3ASRJointModel(nn.Module):
         return windows
 
     @torch.no_grad()
-    def _encode_aux_feature_windows(
+    def _enc_aux_windows(
         self,
         window_wavs: List,
         encoder_batch_size: int = 1,
@@ -689,11 +693,11 @@ class Qwen3ASRJointModel(nn.Module):
             return []
 
         ref = next(self.qwen_model.parameters())
-        batch = self._build_ctc_feature_batch(window_wavs)
+        batch = self._feature_batch(window_wavs)
         input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
         feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
 
-        hs_pad, _, out_lens, _ = self._encode_audio_for_joint(
+        hs_pad, _, out_lens, _ = self._enc_joint(
             input_features,
             feature_attention_mask,
             need_llm_features=False,
@@ -703,7 +707,7 @@ class Qwen3ASRJointModel(nn.Module):
         return [hs_pad[i, : int(length)] for i, length in enumerate(out_lens.tolist())]
 
     @torch.no_grad()
-    def _encode_joint_feature_windows(
+    def _enc_joint_windows(
         self,
         window_wavs: List,
         encoder_batch_size: int = 1,
@@ -713,11 +717,11 @@ class Qwen3ASRJointModel(nn.Module):
             return [], []
 
         ref = next(self.qwen_model.parameters())
-        batch = self._build_ctc_feature_batch(window_wavs)
+        batch = self._feature_batch(window_wavs)
         input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
         feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
 
-        hs_pad, llm_features, out_lens, _ = self._encode_audio_for_joint(
+        hs_pad, llm_features, out_lens, _ = self._enc_joint(
             input_features,
             feature_attention_mask,
             need_llm_features=True,
@@ -736,7 +740,7 @@ class Qwen3ASRJointModel(nn.Module):
         return aux_results, llm_results
 
     @torch.no_grad()
-    def _build_streaming_aux_chunks(
+    def _stream_aux_chunks(
         self,
         wav,
         chunk_sec: float = 0.64,
@@ -749,7 +753,7 @@ class Qwen3ASRJointModel(nn.Module):
     ) -> List[torch.Tensor]:
         """Encode overlap windows and keep only the newly arrived chunk frames."""
         device = next(self.qwen_model.parameters()).device
-        windows = self._build_stream_windows(
+        windows = self._windows(
             wav,
             chunk_sec=chunk_sec,
             left_context_sec=left_context_sec,
@@ -762,7 +766,7 @@ class Qwen3ASRJointModel(nn.Module):
         kept_chunks = []
         for batch_start in range(0, len(windows), window_batch_size):
             batch_windows = windows[batch_start: batch_start + window_batch_size]
-            window_features_batch = self._encode_aux_feature_windows(
+            window_features_batch = self._enc_aux_windows(
                 [x[5] for x in batch_windows],
                 encoder_batch_size=window_encoder_batch_size,
             )
@@ -772,10 +776,10 @@ class Qwen3ASRJointModel(nn.Module):
             ):
                 keep_start_samples = left_pad_samples + start - enc_start
                 keep_end_samples = left_pad_samples + end - enc_start
-                keep_start_feat = self._feature_len_for_num_samples(keep_start_samples, feature_len_cache)
-                keep_end_feat = self._feature_len_for_num_samples(keep_end_samples, feature_len_cache)
-                keep_start_idx = self._encoder_len_from_feature_len(keep_start_feat, device)
-                keep_end_idx = self._encoder_len_from_feature_len(keep_end_feat, device)
+                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._enc_len(keep_start_feat, device)
+                keep_end_idx = self._enc_len(keep_end_feat, device)
 
                 keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
                 keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
@@ -788,7 +792,7 @@ class Qwen3ASRJointModel(nn.Module):
         return kept_chunks
 
     @torch.no_grad()
-    def _build_streaming_llm_features(
+    def _stream_llm_feats(
         self,
         wav,
         chunk_sec: float = 0.64,
@@ -801,7 +805,7 @@ class Qwen3ASRJointModel(nn.Module):
     ) -> torch.Tensor:
         """Encode overlap windows and concatenate current-chunk LLM audio features."""
         device = next(self.qwen_model.parameters()).device
-        windows = self._build_stream_windows(
+        windows = self._windows(
             wav,
             chunk_sec=chunk_sec,
             left_context_sec=left_context_sec,
@@ -814,7 +818,7 @@ class Qwen3ASRJointModel(nn.Module):
         kept_chunks = []
         for batch_start in range(0, len(windows), window_batch_size):
             batch_windows = windows[batch_start: batch_start + window_batch_size]
-            _aux_features_batch, llm_features_batch = self._encode_joint_feature_windows(
+            _aux_features_batch, llm_features_batch = self._enc_joint_windows(
                 [x[5] for x in batch_windows],
                 encoder_batch_size=window_encoder_batch_size,
             )
@@ -824,10 +828,10 @@ class Qwen3ASRJointModel(nn.Module):
             ):
                 keep_start_samples = left_pad_samples + start - enc_start
                 keep_end_samples = left_pad_samples + end - enc_start
-                keep_start_feat = self._feature_len_for_num_samples(keep_start_samples, feature_len_cache)
-                keep_end_feat = self._feature_len_for_num_samples(keep_end_samples, feature_len_cache)
-                keep_start_idx = self._encoder_len_from_feature_len(keep_start_feat, device)
-                keep_end_idx = self._encoder_len_from_feature_len(keep_end_feat, device)
+                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._enc_len(keep_start_feat, device)
+                keep_end_idx = self._enc_len(keep_end_feat, device)
 
                 keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
                 keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
@@ -840,7 +844,7 @@ class Qwen3ASRJointModel(nn.Module):
         return torch.cat(kept_chunks, dim=0)
 
     @torch.no_grad()
-    def _rnnt_streaming_greedy_decode(
+    def _rnnt_stream_decode(
         self,
         chunks: List[torch.Tensor],
         max_symbols_per_step: int = 5,
@@ -885,7 +889,7 @@ class Qwen3ASRJointModel(nn.Module):
         return emitted
 
     @torch.no_grad()
-    def _ctc_streaming_greedy_decode(self, chunks: List[torch.Tensor]) -> List[int]:
+    def _ctc_stream_decode(self, chunks: List[torch.Tensor]) -> List[int]:
         """Streaming CTC greedy decode with CTC collapse state carried across chunks."""
         if self.aux_loss_type != "ctc":
             raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 ctc。")
@@ -903,7 +907,7 @@ class Qwen3ASRJointModel(nn.Module):
         return emitted
 
     @torch.no_grad()
-    def _aux_decode_from_audio(
+    def _aux_decode(
         self,
         audio,
         max_symbols_per_step: int = 5,
@@ -914,7 +918,7 @@ class Qwen3ASRJointModel(nn.Module):
         import librosa
         import numpy as np
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         waveform_list = []
 
         for item in audios:
@@ -932,14 +936,14 @@ class Qwen3ASRJointModel(nn.Module):
         ref = next(self.qwen_model.parameters())
         for start in range(0, len(waveform_list), aux_encoder_batch_size):
             sub_wavs = waveform_list[start: start + aux_encoder_batch_size]
-            batch = self._build_ctc_feature_batch(sub_wavs)
+            batch = self._feature_batch(sub_wavs)
             input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
             feature_attention_mask = batch.get("feature_attention_mask", None)
             if feature_attention_mask is not None:
                 feature_attention_mask = feature_attention_mask.to(device=ref.device)
 
             results.extend(
-                self.decode_aux_features(
+                self.decode_feats(
                     input_features,
                     feature_attention_mask,
                     max_symbols_per_step=max_symbols_per_step,
@@ -950,13 +954,13 @@ class Qwen3ASRJointModel(nn.Module):
         return results
 
     @torch.no_grad()
-    def _ctc_decode_from_audio(self, audio, aux_encoder_batch_size: int = 1) -> List[str]:
+    def _ctc_decode(self, audio, aux_encoder_batch_size: int = 1) -> List[str]:
         if self.aux_loss_type != "ctc":
             raise RuntimeError("当前 checkpoint 不是 CTC 模式，请使用 transcribe_rnnt 或 joint。")
-        return self._aux_decode_from_audio(audio, aux_encoder_batch_size=aux_encoder_batch_size)
+        return self._aux_decode(audio, aux_encoder_batch_size=aux_encoder_batch_size)
 
     @torch.no_grad()
-    def _rnnt_decode_from_audio(
+    def _rnnt_decode(
         self,
         audio,
         max_symbols_per_step: int = 5,
@@ -965,7 +969,7 @@ class Qwen3ASRJointModel(nn.Module):
     ) -> List[str]:
         if self.aux_loss_type != "rnnt":
             raise RuntimeError("当前 checkpoint 不是 RNNT 模式。")
-        return self._aux_decode_from_audio(
+        return self._aux_decode(
             audio,
             max_symbols_per_step=max_symbols_per_step,
             rnnt_decode_strategy=rnnt_decode_strategy,
@@ -973,7 +977,7 @@ class Qwen3ASRJointModel(nn.Module):
         )
 
     @torch.no_grad()
-    def _rnnt_streaming_decode_from_audio(
+    def _rnnt_stream(
         self,
         audio,
         max_symbols_per_step: int = 5,
@@ -997,7 +1001,7 @@ class Qwen3ASRJointModel(nn.Module):
         import librosa
         import numpy as np
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         waveform_list = []
         for item in audios:
             if isinstance(item, str):
@@ -1010,7 +1014,7 @@ class Qwen3ASRJointModel(nn.Module):
         results = []
         feature_len_cache: Dict[int, int] = {}
         for wav in waveform_list:
-            chunks = self._build_streaming_aux_chunks(
+            chunks = self._stream_aux_chunks(
                 wav,
                 chunk_sec=chunk_sec,
                 left_context_sec=left_context_sec,
@@ -1020,7 +1024,7 @@ class Qwen3ASRJointModel(nn.Module):
                 window_encoder_batch_size=window_encoder_batch_size,
                 feature_len_cache=feature_len_cache,
             )
-            ids = self._rnnt_streaming_greedy_decode(
+            ids = self._rnnt_stream_decode(
                 chunks,
                 max_symbols_per_step=max_symbols_per_step,
             )
@@ -1028,7 +1032,7 @@ class Qwen3ASRJointModel(nn.Module):
         return results
 
     @torch.no_grad()
-    def _ctc_streaming_decode_from_audio(
+    def _ctc_stream(
         self,
         audio,
         chunk_sec: float = 0.64,
@@ -1044,7 +1048,7 @@ class Qwen3ASRJointModel(nn.Module):
         import librosa
         import numpy as np
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         waveform_list = []
         for item in audios:
             if isinstance(item, str):
@@ -1057,7 +1061,7 @@ class Qwen3ASRJointModel(nn.Module):
         results = []
         feature_len_cache: Dict[int, int] = {}
         for wav in waveform_list:
-            chunks = self._build_streaming_aux_chunks(
+            chunks = self._stream_aux_chunks(
                 wav,
                 chunk_sec=chunk_sec,
                 left_context_sec=left_context_sec,
@@ -1067,13 +1071,13 @@ class Qwen3ASRJointModel(nn.Module):
                 window_encoder_batch_size=window_encoder_batch_size,
                 feature_len_cache=feature_len_cache,
             )
-            ids = self._ctc_streaming_greedy_decode(chunks)
+            ids = self._ctc_stream_decode(chunks)
             results.append(ids_to_text(ids, self._id_to_token))
         return results
 
     @torch.no_grad()
     def transcribe_ctc(self, audio, aux_encoder_batch_size: int = 1) -> Union[str, List[str]]:
-        results = self._ctc_decode_from_audio(audio, aux_encoder_batch_size=aux_encoder_batch_size)
+        results = self._ctc_decode(audio, aux_encoder_batch_size=aux_encoder_batch_size)
         return results[0] if isinstance(audio, str) else results
 
     @torch.no_grad()
@@ -1087,7 +1091,7 @@ class Qwen3ASRJointModel(nn.Module):
         window_batch_size: int = 4,
         window_encoder_batch_size: int = 1,
     ) -> Union[str, List[str]]:
-        results = self._ctc_streaming_decode_from_audio(
+        results = self._ctc_stream(
             audio,
             chunk_sec=chunk_sec,
             left_context_sec=left_context_sec,
@@ -1106,7 +1110,7 @@ class Qwen3ASRJointModel(nn.Module):
         rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
     ) -> Union[str, List[str]]:
-        results = self._rnnt_decode_from_audio(
+        results = self._rnnt_decode(
             audio,
             max_symbols_per_step=max_symbols_per_step,
             rnnt_decode_strategy=rnnt_decode_strategy,
@@ -1126,7 +1130,7 @@ class Qwen3ASRJointModel(nn.Module):
         window_batch_size: int = 4,
         window_encoder_batch_size: int = 1,
     ) -> Union[str, List[str]]:
-        results = self._rnnt_streaming_decode_from_audio(
+        results = self._rnnt_stream(
             audio,
             max_symbols_per_step=max_symbols_per_step,
             chunk_sec=chunk_sec,
@@ -1138,7 +1142,7 @@ class Qwen3ASRJointModel(nn.Module):
         )
         return results[0] if isinstance(audio, str) else results
 
-    def _extract_asr_fields(self, obj):
+    def _asr_fields(self, obj):
         if obj is None:
             return {"text": "", "language": None}
         if isinstance(obj, str):
@@ -1152,8 +1156,8 @@ class Qwen3ASRJointModel(nn.Module):
             if len(obj) == 0:
                 return {"text": "", "language": None}
             if len(obj) == 1:
-                return self._extract_asr_fields(obj[0])
-            items = [self._extract_asr_fields(x) for x in obj]
+                return self._asr_fields(obj[0])
+            items = [self._asr_fields(x) for x in obj]
             text = " ".join([x["text"] for x in items if x["text"]]).strip()
             language = next((x["language"] for x in items if x["language"]), None)
             return {"text": text, "language": language}
@@ -1165,7 +1169,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         return {"text": str(obj), "language": None}
 
-    def _normalize_transcribe_outputs(self, outputs, batch_size: int):
+    def _norm_outputs(self, outputs, batch_size: int):
         if isinstance(outputs, list):
             if len(outputs) == batch_size:
                 return outputs
@@ -1174,7 +1178,7 @@ class Qwen3ASRJointModel(nn.Module):
             raise ValueError(f"底座输出数量不匹配：expect {batch_size}, got {len(outputs)}")
         return [outputs]
 
-    def _build_manual_audio_prompt(self, num_audio_tokens: int, context: str, language: Optional[str]) -> str:
+    def _audio_prompt(self, num_audio_tokens: int, context: str, language: Optional[str]) -> str:
         if self._asr_wrapper is None:
             raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
         if num_audio_tokens <= 0:
@@ -1187,7 +1191,7 @@ class Qwen3ASRJointModel(nn.Module):
         return prompt.replace(audio_token, audio_token * num_audio_tokens, 1)
 
     @torch.no_grad()
-    def _generate_llm_from_audio_features(
+    def _gen_llm_feats(
         self,
         audio_features_list: List[torch.Tensor],
         contexts: List[Optional[str]],
@@ -1200,7 +1204,7 @@ class Qwen3ASRJointModel(nn.Module):
         dtype = next(thinker.parameters()).dtype
 
         prompts = [
-            self._build_manual_audio_prompt(
+            self._audio_prompt(
                 num_audio_tokens=int(audio_features.shape[0]),
                 context=context or "",
                 language=language,
@@ -1271,7 +1275,7 @@ class Qwen3ASRJointModel(nn.Module):
         if self._asr_wrapper is None:
             raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         batch_size = len(audios)
 
         call_kwargs = dict(kwargs)
@@ -1281,11 +1285,11 @@ class Qwen3ASRJointModel(nn.Module):
             call_kwargs["context"] = context
 
         raw_outputs = self._asr_wrapper.transcribe(audios, **call_kwargs)
-        raw_outputs = self._normalize_transcribe_outputs(raw_outputs, batch_size)
+        raw_outputs = self._norm_outputs(raw_outputs, batch_size)
 
         results = []
         for idx, raw_out in enumerate(raw_outputs):
-            fields = self._extract_asr_fields(raw_out)
+            fields = self._asr_fields(raw_out)
             if isinstance(language, list):
                 input_lang = language[idx]
             elif isinstance(language, str):
@@ -1317,7 +1321,7 @@ class Qwen3ASRJointModel(nn.Module):
         import librosa
         import numpy as np
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         waveform_list = []
         for item in audios:
             if isinstance(item, str):
@@ -1343,7 +1347,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         feature_len_cache: Dict[int, int] = {}
         audio_features_list = [
-            self._build_streaming_llm_features(
+            self._stream_llm_feats(
                 wav,
                 chunk_sec=chunk_sec,
                 left_context_sec=left_context_sec,
@@ -1355,7 +1359,7 @@ class Qwen3ASRJointModel(nn.Module):
             )
             for wav in waveform_list
         ]
-        results = self._generate_llm_from_audio_features(
+        results = self._gen_llm_feats(
             audio_features_list,
             contexts=contexts,
             languages=languages,
@@ -1363,7 +1367,7 @@ class Qwen3ASRJointModel(nn.Module):
         )
         return results[0] if isinstance(audio, str) else results
 
-    def _build_joint_context(
+    def _joint_context(
         self,
         aux_text: str,
         prompt: Optional[str] = None,
@@ -1409,7 +1413,7 @@ class Qwen3ASRJointModel(nn.Module):
         if self._asr_wrapper is None:
             raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
 
-        audios = self._normalize_audio_to_list(audio)
+        audios = self._audio_list(audio)
         if language is None:
             languages = [None] * len(audios)
         elif isinstance(language, str):
@@ -1419,7 +1423,7 @@ class Qwen3ASRJointModel(nn.Module):
 
         if stream_aux and self.aux_loss_type in ("ctc", "rnnt"):
             if self.aux_loss_type == "rnnt":
-                aux_texts = self._rnnt_streaming_decode_from_audio(
+                aux_texts = self._rnnt_stream(
                     audios,
                     max_symbols_per_step=aux_max_symbols_per_step,
                     chunk_sec=stream_chunk_sec,
@@ -1430,7 +1434,7 @@ class Qwen3ASRJointModel(nn.Module):
                     window_encoder_batch_size=stream_window_encoder_batch_size,
                 )
             else:
-                aux_texts = self._ctc_streaming_decode_from_audio(
+                aux_texts = self._ctc_stream(
                     audios,
                     chunk_sec=stream_chunk_sec,
                     left_context_sec=stream_left_context_sec,
@@ -1440,7 +1444,7 @@ class Qwen3ASRJointModel(nn.Module):
                     window_encoder_batch_size=stream_window_encoder_batch_size,
                 )
         else:
-            aux_texts = self._aux_decode_from_audio(
+            aux_texts = self._aux_decode(
                 audios,
                 max_symbols_per_step=aux_max_symbols_per_step,
                 rnnt_decode_strategy=rnnt_decode_strategy,
@@ -1450,7 +1454,7 @@ class Qwen3ASRJointModel(nn.Module):
         contexts = []
         hotwords_list = []
         for aux_text in aux_texts:
-            context, hotwords = self._build_joint_context(
+            context, hotwords = self._joint_context(
                 aux_text=aux_text,
                 prompt=prompt,
                 hotword_retriever=hotword_retriever,
@@ -1480,13 +1484,13 @@ class Qwen3ASRJointModel(nn.Module):
                 context=contexts,
                 **kwargs,
             )
-            raw_outputs = self._normalize_transcribe_outputs(raw_outputs, len(audios))
+            raw_outputs = self._norm_outputs(raw_outputs, len(audios))
 
         results = []
         for raw_out, lang, aux_text, hotwords, context in zip(
             raw_outputs, languages, aux_texts, hotwords_list, contexts
         ):
-            fields = self._extract_asr_fields(raw_out)
+            fields = self._asr_fields(raw_out)
             results.append({
                 "ctc_stream_text": aux_text,
                 "aux_stream_text": aux_text,

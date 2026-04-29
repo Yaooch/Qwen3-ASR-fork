@@ -12,7 +12,7 @@ import librosa
 import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
-from qwen_joint.joint_model import Qwen3ASRJointModel
+from qwen_asr.joint import Qwen3ASRJointModel
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -272,7 +272,7 @@ class JointTrainer(Trainer):
         with torch.no_grad():
             for batch in dataloader:
                 inputs = self._prepare_inputs(batch)
-                predictions = base_model.decode_aux_features(
+                predictions = base_model.decode_feats(
                     inputs["input_features"],
                     inputs.get("feature_attention_mask", None),
                 )
@@ -467,8 +467,6 @@ def parse_args():
     p.add_argument("--aux_stream_right_context_frames", type=int, default=7, help="流式 aux 训练右上下文，7 约等于 70ms")
     p.add_argument("--aux_stream_random_left", type=int, default=1, help="是否随机采样左上下文长度；0 表示总是使用最大左上下文")
     p.add_argument("--aux_stream_window_batch_size", type=int, default=4, help="流式 aux 训练时一次送入 encoder 的窗口数量")
-    p.add_argument("--ctc_layer_idx", type=int, default=16)
-    p.add_argument("--ctc_position", type=str, default="post_proj", choices=["pre_proj", "post_proj"])
     p.add_argument("--vocab_path", type=str, default="")
     p.add_argument("--sp_model_path", type=str, default=None)
 
@@ -569,8 +567,8 @@ def main():
         vocab=vocab,
         ctc_weight=args_cli.ctc_weight,
         blank_id=0,
-        ctc_layer_idx=args_cli.ctc_layer_idx,
-        ctc_position=args_cli.ctc_position,
+        ctc_layer_idx=None,
+        ctc_position="pre_proj",
         ctc_only=(args_cli.aux_only == 1),
         aux_loss_type=args_cli.aux_loss_type,
         aux_encoder_batch_size=args_cli.aux_encoder_batch_size,

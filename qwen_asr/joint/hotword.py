@@ -1,4 +1,4 @@
-# qwen_joint/hotword_rag.py
+# qwen_asr/joint/hotword.py
 """简单热词 RAG：基于字符 n-gram / 编辑距离 / 可选向量检索。
 默认用 rapidfuzz（纯 CPU，快），如未安装退化到 editdistance。
 """

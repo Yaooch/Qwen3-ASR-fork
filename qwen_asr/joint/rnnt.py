@@ -1,4 +1,4 @@
-# qwen_joint/rnnt.py
+# qwen_asr/joint/rnnt.py
 import torch
 import torch.nn as nn
 

@@ -3,9 +3,14 @@
 # ==============================================================================
 # Qwen3-ASR + CTC/RNNT 联合微调启动脚本
 # 用法:
-#   CTC:  bash train_joint.sh "0,1"
-#   RNNT: AUX_LOSS_TYPE=rnnt bash train_joint.sh "0,1"
+#   CTC:  bash train.sh "0,1"
+#   RNNT: AUX_LOSS_TYPE=rnnt bash train.sh "0,1"
 # ==============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+cd "${SCRIPT_DIR}"
 
 GPU_IDS=${1:-"0,1,2,3,4,5,6,7"}
 NUM_GPUS=$(echo "$GPU_IDS" | awk -F',' '{print NF}')
@@ -49,10 +54,6 @@ AUX_STREAM_RIGHT_CONTEXT_FRAMES=${AUX_STREAM_RIGHT_CONTEXT_FRAMES:-7}
 AUX_STREAM_RANDOM_LEFT=${AUX_STREAM_RANDOM_LEFT:-1}
 AUX_STREAM_WINDOW_BATCH_SIZE=${AUX_STREAM_WINDOW_BATCH_SIZE:-4}
 
-# post_proj 不需要关心 ctc_layer_idx；pre_proj 时才会使用该层号。
-CTC_POSITION=${CTC_POSITION:-pre_proj}
-CTC_LAYER_IDX=${CTC_LAYER_IDX:-24}
-
 SAVE_STEPS=${SAVE_STEPS:-1000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MASTER_PORT=$(shuf -n 1 -i 20000-65000)
@@ -60,7 +61,7 @@ MASTER_PORT=$(shuf -n 1 -i 20000-65000)
 torchrun \
     --nproc_per_node="$NUM_GPUS" \
     --master_port="$MASTER_PORT" \
-    train_joint.py \
+    train.py \
     --model_path "$MODEL_PATH" \
     --train_file "$TRAIN_FILE" \
     --eval_file "$EVAL_FILE" \
@@ -83,8 +84,6 @@ torchrun \
     --aux_stream_right_context_frames "$AUX_STREAM_RIGHT_CONTEXT_FRAMES" \
     --aux_stream_random_left "$AUX_STREAM_RANDOM_LEFT" \
     --aux_stream_window_batch_size "$AUX_STREAM_WINDOW_BATCH_SIZE" \
-    --ctc_position "$CTC_POSITION" \
-    --ctc_layer_idx "$CTC_LAYER_IDX" \
     --save_steps "$SAVE_STEPS" \
     --log_steps 10 \
     --num_workers "$NUM_WORKERS" \

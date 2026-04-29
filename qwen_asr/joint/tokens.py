@@ -1,4 +1,4 @@
-# qwen_joint/tokenize_utils.py
+# qwen_asr/joint/tokens.py
 """CTC 词表/SentencePiece 相关的共享工具：训练 collator 和推理脚本都用。"""
 import json
 import os

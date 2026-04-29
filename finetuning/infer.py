@@ -8,7 +8,7 @@ from typing import Dict, List
 import torch
 from datetime import datetime
 
-from qwen_joint.joint_model import Qwen3ASRJointModel
+from qwen_asr.joint import Qwen3ASRJointModel
 
 def log(msg: str):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -61,17 +61,6 @@ def parse_args():
     # hotword 仅 joint 模式可用
     parser.add_argument("--hotword_file", default=None, help="热词文件，每行一个热词")
     parser.add_argument("--hotword_topk", type=int, default=10, help="召回热词数量")
-    # parser.add_argument(
-    #     "--retriever",
-    #     choices=["fuzz", "emb"],
-    #     default="fuzz",
-    #     help="热词检索方式",
-    # )
-    # parser.add_argument(
-    #     "--emb_model",
-    #     default="BAAI/bge-small-zh-v1.5",
-    #     help="embedding 检索器使用的模型名",
-    # )
     parser.add_argument(
         "--no_ctc_in_prompt",
         "--no_aux_in_prompt",
@@ -180,25 +169,12 @@ def batchify(items: List[Dict], batch_size: int):
         yield items[i: i + batch_size]
 
 
-# def make_hotword_retriever(args):
-#     """根据参数构造热词检索器。"""
-#     if not args.hotword_file:
-#         return None
-
-#     if args.retriever == "fuzz":
-#         from qwen_joint.hotword_rag import HotwordRetriever
-#         return HotwordRetriever.from_file(args.hotword_file)
-
-#     from qwen_joint.hotword_rag import EmbeddingHotwordRetriever
-#     with open(args.hotword_file, "r", encoding="utf-8") as f:
-#         hotwords = [line.strip() for line in f if line.strip()]
-#     return EmbeddingHotwordRetriever(hotwords, model_name=args.emb_model)
 def make_hotword_retriever(args):
     """构造热词检索器。未提供热词文件时返回 None。"""
     if not args.hotword_file:
         return None
 
-    from qwen_joint.hotword_rag import HotwordRetriever
+    from qwen_asr.joint import HotwordRetriever
     return HotwordRetriever.from_file(args.hotword_file)
 
 def extract_text_and_language(output):
