@@ -90,6 +90,17 @@ def parse_args():
         default=1,
         help="CTC/RNNT 辅助头 audio encoder micro-batch；1 最稳，调大可加速但可能影响结果",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="RNNT/joint 模式下使用 chunk-wise RNNT 流式粗识别。",
+    )
+    parser.add_argument("--stream_chunk_sec", type=float, default=0.64)
+    parser.add_argument("--stream_left_context_sec", type=float, default=0.64)
+    parser.add_argument("--stream_right_context_sec", type=float, default=0.07)
+    parser.add_argument("--stream_first_chunk_left_pad_sec", type=float, default=0.0)
+    parser.add_argument("--stream_window_batch_size", type=int, default=4)
+    parser.add_argument("--stream_window_encoder_batch_size", type=int, default=1)
     return parser.parse_args()
 
 
@@ -286,22 +297,58 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
     aux_loss_type = getattr(model, "aux_loss_type", None)
 
     if args.mode == "ctc":
-        raw_outputs = model.transcribe_ctc(
-            audios,
-            aux_encoder_batch_size=args.aux_encoder_batch_size,
-        )
+        if args.stream:
+            raw_outputs = model.transcribe_ctc_streaming(
+                audios,
+                chunk_sec=args.stream_chunk_sec,
+                left_context_sec=args.stream_left_context_sec,
+                right_context_sec=args.stream_right_context_sec,
+                first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
+                window_batch_size=args.stream_window_batch_size,
+                window_encoder_batch_size=args.stream_window_encoder_batch_size,
+            )
+        else:
+            raw_outputs = model.transcribe_ctc(
+                audios,
+                aux_encoder_batch_size=args.aux_encoder_batch_size,
+            )
     elif args.mode == "rnnt":
-        raw_outputs = model.transcribe_rnnt(
-            audios,
-            max_symbols_per_step=args.rnnt_max_symbols_per_step,
-            aux_encoder_batch_size=args.aux_encoder_batch_size,
-        )
+        if args.stream:
+            raw_outputs = model.transcribe_rnnt_streaming(
+                audios,
+                max_symbols_per_step=args.rnnt_max_symbols_per_step,
+                chunk_sec=args.stream_chunk_sec,
+                left_context_sec=args.stream_left_context_sec,
+                right_context_sec=args.stream_right_context_sec,
+                first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
+                window_batch_size=args.stream_window_batch_size,
+                window_encoder_batch_size=args.stream_window_encoder_batch_size,
+            )
+        else:
+            raw_outputs = model.transcribe_rnnt(
+                audios,
+                max_symbols_per_step=args.rnnt_max_symbols_per_step,
+                aux_encoder_batch_size=args.aux_encoder_batch_size,
+            )
     elif args.mode == "llm":
-        raw_outputs = model.transcribe_llm(
-            audios,
-            language=languages,
-            context=args.prompt,
-        )
+        if args.stream:
+            raw_outputs = model.transcribe_llm_streaming(
+                audios,
+                language=languages,
+                context=args.prompt,
+                chunk_sec=args.stream_chunk_sec,
+                left_context_sec=args.stream_left_context_sec,
+                right_context_sec=args.stream_right_context_sec,
+                first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
+                window_batch_size=args.stream_window_batch_size,
+                window_encoder_batch_size=args.stream_window_encoder_batch_size,
+            )
+        else:
+            raw_outputs = model.transcribe_llm(
+                audios,
+                language=languages,
+                context=args.prompt,
+            )
     else:
         raw_outputs = model.transcribe_joint(
             audios,
@@ -312,6 +359,13 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             inject_ctc_into_prompt=not args.no_ctc_in_prompt,
             aux_max_symbols_per_step=args.rnnt_max_symbols_per_step,
             aux_encoder_batch_size=args.aux_encoder_batch_size,
+            stream_aux=args.stream,
+            stream_chunk_sec=args.stream_chunk_sec,
+            stream_left_context_sec=args.stream_left_context_sec,
+            stream_right_context_sec=args.stream_right_context_sec,
+            stream_first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
+            stream_window_batch_size=args.stream_window_batch_size,
+            stream_window_encoder_batch_size=args.stream_window_encoder_batch_size,
         )
 
     raw_outputs = normalize_batch_outputs(raw_outputs, len(batch))
@@ -331,6 +385,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                     "audio": item["audio"],
                     "language": final_lang,
                     "mode": "joint",
+                    "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": llm_text,
                     "ctc_stream_text": raw_out.get("ctc_stream_text", ""),
@@ -347,6 +402,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                     "audio": item["audio"],
                     "language": final_lang or input_lang or "unknown",
                     "mode": "joint",
+                    "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": final_text,
                     "ctc_stream_text": "",
@@ -369,6 +425,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                 "audio": item["audio"],
                 "language": final_lang,
                 "mode": "llm",
+                "stream": bool(args.stream),
                 "text": final_text,
             }
 
@@ -379,6 +436,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                 "audio": item["audio"],
                 "language": final_lang or input_lang or "unknown",
                 "mode": args.mode,
+                "stream": bool(args.stream and args.mode in ("ctc", "rnnt")),
                 "aux_loss_type": aux_loss_type if args.mode in ("ctc", "rnnt") else None,
                 "text": final_text,
             }
@@ -524,6 +582,15 @@ def main():
     print(f"dtype: {args.dtype}")
     print(f"rnnt_max_symbols_per_step: {args.rnnt_max_symbols_per_step}")
     print(f"aux_encoder_batch_size: {args.aux_encoder_batch_size}")
+    print(f"stream: {args.stream}")
+    if args.stream:
+        print(
+            "stream_config: "
+            f"chunk={args.stream_chunk_sec}, left={args.stream_left_context_sec}, "
+            f"right={args.stream_right_context_sec}, first_left_pad={args.stream_first_chunk_left_pad_sec}, "
+            f"window_batch={args.stream_window_batch_size}, "
+            f"window_encoder_batch={args.stream_window_encoder_batch_size}"
+        )
     print(f"num_samples: {len(items)}")
     print("=" * 80)
 

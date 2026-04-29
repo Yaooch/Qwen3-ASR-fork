@@ -1,11 +1,12 @@
 # qwen_joint/joint_model.py
 import json
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from qwen_asr import Qwen3ASRModel
+from qwen_asr.inference.utils import parse_asr_output
 
 from .ctc import CTC
 from .rnnt import RNNT
@@ -36,6 +37,12 @@ class Qwen3ASRJointModel(nn.Module):
         ctc_only: bool = False,
         aux_loss_type: str = "ctc",
         aux_encoder_batch_size: int = 1,
+        aux_streaming_train: bool = False,
+        aux_stream_chunk_frames: int = 64,
+        aux_stream_left_context_frames: int = 64,
+        aux_stream_right_context_frames: int = 7,
+        aux_stream_random_left: bool = True,
+        aux_stream_window_batch_size: int = 4,
     ):
         super().__init__()
         self.qwen_model = qwen_model
@@ -50,6 +57,12 @@ class Qwen3ASRJointModel(nn.Module):
         self.ctc_only = ctc_only
         self.aux_loss_type = aux_loss_type
         self.aux_encoder_batch_size = aux_encoder_batch_size
+        self.aux_streaming_train = aux_streaming_train
+        self.aux_stream_chunk_frames = aux_stream_chunk_frames
+        self.aux_stream_left_context_frames = aux_stream_left_context_frames
+        self.aux_stream_right_context_frames = aux_stream_right_context_frames
+        self.aux_stream_random_left = aux_stream_random_left
+        self.aux_stream_window_batch_size = aux_stream_window_batch_size
 
         audio_config = qwen_model.thinker.audio_tower.config
         if ctc_position == "pre_proj":
@@ -117,6 +130,12 @@ class Qwen3ASRJointModel(nn.Module):
             ctc_only=ctc_only if ctc_only is not None else cfg.get("ctc_only", False),
             aux_loss_type=aux_loss_type,
             aux_encoder_batch_size=cfg.get("aux_encoder_batch_size", 1),
+            aux_streaming_train=cfg.get("aux_streaming_train", False),
+            aux_stream_chunk_frames=cfg.get("aux_stream_chunk_frames", 64),
+            aux_stream_left_context_frames=cfg.get("aux_stream_left_context_frames", 64),
+            aux_stream_right_context_frames=cfg.get("aux_stream_right_context_frames", 7),
+            aux_stream_random_left=cfg.get("aux_stream_random_left", True),
+            aux_stream_window_batch_size=cfg.get("aux_stream_window_batch_size", 4),
         )
 
         instance.processor = base.processor
@@ -166,6 +185,12 @@ class Qwen3ASRJointModel(nn.Module):
             "ctc_only": self.ctc_only,
             "aux_loss_type": self.aux_loss_type,
             "aux_encoder_batch_size": self.aux_encoder_batch_size,
+            "aux_streaming_train": self.aux_streaming_train,
+            "aux_stream_chunk_frames": self.aux_stream_chunk_frames,
+            "aux_stream_left_context_frames": self.aux_stream_left_context_frames,
+            "aux_stream_right_context_frames": self.aux_stream_right_context_frames,
+            "aux_stream_random_left": self.aux_stream_random_left,
+            "aux_stream_window_batch_size": self.aux_stream_window_batch_size,
             "vocab": self.vocab,
         }
         with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
@@ -290,6 +315,131 @@ class Qwen3ASRJointModel(nn.Module):
 
         raise ValueError(f"不支持的 aux_loss_type: {self.aux_loss_type}")
 
+    def _build_feature_stream_windows(
+        self,
+        input_features: torch.Tensor,
+        feat_lens: torch.Tensor,
+    ):
+        """Build feature-level streaming windows for aux loss training.
+
+        Each window contains a current chunk, a random amount of left context,
+        and a fixed right context. Only the current chunk frames are kept for
+        the final aux sequence.
+        """
+        windows = []
+        chunk_frames = max(1, int(self.aux_stream_chunk_frames))
+        max_left_frames = max(0, int(self.aux_stream_left_context_frames))
+        right_frames = max(0, int(self.aux_stream_right_context_frames))
+        random_left = bool(self.aux_stream_random_left)
+        device = input_features.device
+
+        for b in range(input_features.shape[0]):
+            total = int(feat_lens[b].item())
+            start = 0
+            while start < total:
+                end = min(total, start + chunk_frames)
+                allowed_left = min(max_left_frames, start)
+                if random_left and allowed_left > 0 and self.training:
+                    left = int(torch.randint(0, allowed_left + 1, (1,), device=device).item())
+                else:
+                    left = allowed_left
+                enc_start = start - left
+                enc_end = min(total, end + right_frames)
+                windows.append(
+                    {
+                        "sample_idx": b,
+                        "start": start,
+                        "end": end,
+                        "enc_start": enc_start,
+                        "features": input_features[b, :, enc_start:enc_end],
+                    }
+                )
+                start = end
+        return windows
+
+    def _pad_feature_windows(self, windows: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not windows:
+            raise RuntimeError("No feature windows were produced.")
+
+        batch_size = len(windows)
+        channels = windows[0]["features"].shape[0]
+        max_len = max(int(w["features"].shape[1]) for w in windows)
+        ref = windows[0]["features"]
+        padded = torch.zeros(batch_size, channels, max_len, dtype=ref.dtype, device=ref.device)
+        mask = torch.zeros(batch_size, max_len, dtype=torch.long, device=ref.device)
+        for i, item in enumerate(windows):
+            cur = item["features"]
+            cur_len = int(cur.shape[1])
+            padded[i, :, :cur_len] = cur
+            mask[i, :cur_len] = 1
+        return padded, mask
+
+    def _encode_aux_streaming_train_features(
+        self,
+        input_features: torch.Tensor,
+        feature_attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode aux features with streaming-style random left context for training."""
+        if feature_attention_mask is not None:
+            feat_lens = feature_attention_mask.sum(dim=1).long()
+        else:
+            feat_lens = torch.full(
+                (input_features.shape[0],),
+                input_features.shape[2],
+                dtype=torch.long,
+                device=input_features.device,
+            )
+
+        windows = self._build_feature_stream_windows(input_features, feat_lens)
+        per_sample_chunks = [[] for _ in range(input_features.shape[0])]
+        window_batch_size = max(1, int(self.aux_stream_window_batch_size))
+        device = input_features.device
+
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            window_features, window_mask = self._pad_feature_windows(batch_windows)
+            hs_pad, _, out_lens, _ = self._encode_audio_for_joint(
+                window_features,
+                window_mask,
+                need_llm_features=False,
+                encoder_batch_size=self.aux_encoder_batch_size,
+            )
+            hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+
+            for i, item in enumerate(batch_windows):
+                keep_start_frames = item["start"] - item["enc_start"]
+                keep_end_frames = item["end"] - item["enc_start"]
+                keep_start_idx = self._encoder_len_from_feature_len(keep_start_frames, device)
+                keep_end_idx = self._encoder_len_from_feature_len(keep_end_frames, device)
+                cur_len = int(out_lens[i].item())
+                keep_start_idx = max(0, min(keep_start_idx, cur_len))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, cur_len))
+                kept = hs_pad[i, keep_start_idx:keep_end_idx]
+                if kept.numel() > 0:
+                    per_sample_chunks[item["sample_idx"]].append(kept)
+
+        seqs = []
+        lens = []
+        for chunks in per_sample_chunks:
+            if not chunks:
+                raise RuntimeError("Streaming aux training produced an empty sample.")
+            seq = torch.cat(chunks, dim=0)
+            seqs.append(seq)
+            lens.append(seq.shape[0])
+
+        max_len = max(lens)
+        hs_out = torch.zeros(
+            len(seqs),
+            max_len,
+            self.encoder_output_size,
+            dtype=seqs[0].dtype,
+            device=input_features.device,
+        )
+        for i, seq in enumerate(seqs):
+            hs_out[i, : seq.shape[0]] = seq
+        out_lens = torch.tensor(lens, dtype=torch.long, device=input_features.device)
+        return hs_out, out_lens
+
     def forward(
         self,
         input_ids=None,
@@ -302,11 +452,25 @@ class Qwen3ASRJointModel(nn.Module):
         texts=None,
         **kwargs,
     ):
-        hs_pad, audio_features_for_llm, out_lens, _ = self._encode_audio_for_joint(
-            input_features,
-            feature_attention_mask,
-            need_llm_features=not self.ctc_only,
-        )
+        use_streaming_aux_train = bool(self.training and self.aux_streaming_train)
+        if use_streaming_aux_train:
+            hs_pad, out_lens = self._encode_aux_streaming_train_features(
+                input_features,
+                feature_attention_mask,
+            )
+            audio_features_for_llm = None
+            if not self.ctc_only:
+                _, audio_features_for_llm, _, _ = self._encode_audio_for_joint(
+                    input_features,
+                    feature_attention_mask,
+                    need_llm_features=True,
+                )
+        else:
+            hs_pad, audio_features_for_llm, out_lens, _ = self._encode_audio_for_joint(
+                input_features,
+                feature_attention_mask,
+                need_llm_features=not self.ctc_only,
+            )
 
         aux_loss = self._compute_aux_loss(hs_pad, out_lens, ctc_target_ids, ctc_target_lengths)
 
@@ -436,6 +600,308 @@ class Qwen3ASRJointModel(nn.Module):
             batch["feature_attention_mask"] = batch.pop("attention_mask")
         return batch
 
+    def _feature_len_for_num_samples(self, num_samples: int, cache: Optional[Dict[int, int]] = None) -> int:
+        """Feature extractor valid length for a waveform with this many samples."""
+        if num_samples <= 0:
+            return 0
+        num_samples = int(num_samples)
+        if cache is not None and num_samples in cache:
+            return cache[num_samples]
+
+        import numpy as np
+
+        feat = self.processor.feature_extractor(
+            np.zeros((num_samples,), dtype=np.float32),
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+        )
+        value = int(feat["attention_mask"].sum().item())
+        if cache is not None:
+            cache[num_samples] = value
+        return value
+
+    def _encoder_len_from_feature_len(self, feature_len: int, device: torch.device) -> int:
+        if feature_len <= 0:
+            return 0
+        x = torch.tensor([feature_len], dtype=torch.long, device=device)
+        return int(self._get_feat_extract_output_lengths(x)[0].item())
+
+    def _build_stream_windows(
+        self,
+        wav,
+        chunk_sec: float,
+        left_context_sec: float,
+        right_context_sec: float,
+        first_chunk_left_pad_sec: float,
+    ):
+        """Build current-chunk windows for streaming aux decoding."""
+        if chunk_sec <= 0:
+            raise ValueError(f"chunk_sec must be > 0, got {chunk_sec}")
+
+        import numpy as np
+
+        sr = 16000
+        total_samples = int(wav.shape[0])
+        chunk_samples = max(1, int(round(chunk_sec * sr)))
+        left_samples = max(0, int(round(left_context_sec * sr)))
+        right_samples = max(0, int(round(right_context_sec * sr)))
+        first_left_pad_samples = max(0, int(round(first_chunk_left_pad_sec * sr)))
+        if first_left_pad_samples >= chunk_samples:
+            raise ValueError(
+                "first_chunk_left_pad_sec must be smaller than chunk_sec, got "
+                f"{first_chunk_left_pad_sec} >= {chunk_sec}"
+            )
+
+        windows = []
+        start = 0
+        first_chunk = True
+        while start < total_samples:
+            cur_chunk_samples = chunk_samples
+            left_pad_samples = 0
+            if first_chunk and first_left_pad_samples > 0:
+                cur_chunk_samples = chunk_samples - first_left_pad_samples
+                left_pad_samples = first_left_pad_samples
+
+            end = min(total_samples, start + cur_chunk_samples)
+            enc_start = max(0, start - left_samples)
+            enc_end = min(total_samples, end + right_samples)
+            window_wav = wav[enc_start:enc_end]
+            if left_pad_samples > 0:
+                pad = np.zeros(left_pad_samples, dtype=window_wav.dtype)
+                window_wav = np.concatenate([pad, window_wav], axis=0)
+
+            windows.append((start, end, enc_start, enc_end, left_pad_samples, window_wav))
+            start = end
+            first_chunk = False
+        return windows
+
+    @torch.no_grad()
+    def _encode_aux_feature_windows(
+        self,
+        window_wavs: List,
+        encoder_batch_size: int = 1,
+    ) -> List[torch.Tensor]:
+        """Encode audio windows and return one aux-feature tensor per window."""
+        if not window_wavs:
+            return []
+
+        ref = next(self.qwen_model.parameters())
+        batch = self._build_ctc_feature_batch(window_wavs)
+        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
+
+        hs_pad, _, out_lens, _ = self._encode_audio_for_joint(
+            input_features,
+            feature_attention_mask,
+            need_llm_features=False,
+            encoder_batch_size=encoder_batch_size,
+        )
+        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+        return [hs_pad[i, : int(length)] for i, length in enumerate(out_lens.tolist())]
+
+    @torch.no_grad()
+    def _encode_joint_feature_windows(
+        self,
+        window_wavs: List,
+        encoder_batch_size: int = 1,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Encode audio windows and return aux + LLM features per window."""
+        if not window_wavs:
+            return [], []
+
+        ref = next(self.qwen_model.parameters())
+        batch = self._build_ctc_feature_batch(window_wavs)
+        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
+
+        hs_pad, llm_features, out_lens, _ = self._encode_audio_for_joint(
+            input_features,
+            feature_attention_mask,
+            need_llm_features=True,
+            encoder_batch_size=encoder_batch_size,
+        )
+        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+
+        aux_results = []
+        llm_results = []
+        offset = 0
+        for i, length in enumerate(out_lens.tolist()):
+            cur_len = int(length)
+            aux_results.append(hs_pad[i, :cur_len])
+            llm_results.append(llm_features[offset: offset + cur_len])
+            offset += cur_len
+        return aux_results, llm_results
+
+    @torch.no_grad()
+    def _build_streaming_aux_chunks(
+        self,
+        wav,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> List[torch.Tensor]:
+        """Encode overlap windows and keep only the newly arrived chunk frames."""
+        device = next(self.qwen_model.parameters()).device
+        windows = self._build_stream_windows(
+            wav,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+        )
+        if window_batch_size is None or window_batch_size <= 0:
+            window_batch_size = len(windows)
+
+        kept_chunks = []
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            window_features_batch = self._encode_aux_feature_windows(
+                [x[5] for x in batch_windows],
+                encoder_batch_size=window_encoder_batch_size,
+            )
+
+            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
+                batch_windows, window_features_batch
+            ):
+                keep_start_samples = left_pad_samples + start - enc_start
+                keep_end_samples = left_pad_samples + end - enc_start
+                keep_start_feat = self._feature_len_for_num_samples(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feature_len_for_num_samples(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._encoder_len_from_feature_len(keep_start_feat, device)
+                keep_end_idx = self._encoder_len_from_feature_len(keep_end_feat, device)
+
+                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
+                kept = window_features[keep_start_idx:keep_end_idx]
+                if kept.numel() > 0:
+                    kept_chunks.append(kept)
+
+        if not kept_chunks:
+            raise RuntimeError("No streaming auxiliary features were produced.")
+        return kept_chunks
+
+    @torch.no_grad()
+    def _build_streaming_llm_features(
+        self,
+        wav,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> torch.Tensor:
+        """Encode overlap windows and concatenate current-chunk LLM audio features."""
+        device = next(self.qwen_model.parameters()).device
+        windows = self._build_stream_windows(
+            wav,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+        )
+        if window_batch_size is None or window_batch_size <= 0:
+            window_batch_size = len(windows)
+
+        kept_chunks = []
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            _aux_features_batch, llm_features_batch = self._encode_joint_feature_windows(
+                [x[5] for x in batch_windows],
+                encoder_batch_size=window_encoder_batch_size,
+            )
+
+            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
+                batch_windows, llm_features_batch
+            ):
+                keep_start_samples = left_pad_samples + start - enc_start
+                keep_end_samples = left_pad_samples + end - enc_start
+                keep_start_feat = self._feature_len_for_num_samples(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feature_len_for_num_samples(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._encoder_len_from_feature_len(keep_start_feat, device)
+                keep_end_idx = self._encoder_len_from_feature_len(keep_end_feat, device)
+
+                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
+                kept = window_features[keep_start_idx:keep_end_idx]
+                if kept.numel() > 0:
+                    kept_chunks.append(kept)
+
+        if not kept_chunks:
+            raise RuntimeError("No streaming LLM audio features were produced.")
+        return torch.cat(kept_chunks, dim=0)
+
+    @torch.no_grad()
+    def _rnnt_streaming_greedy_decode(
+        self,
+        chunks: List[torch.Tensor],
+        max_symbols_per_step: int = 5,
+    ) -> List[int]:
+        """Stateful RNNT greedy decode. Predictor state is carried across chunks."""
+        if self.aux_loss_type != "rnnt":
+            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 rnnt。")
+        if max_symbols_per_step <= 0:
+            raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")
+
+        rnnt = self.rnnt
+        device = next(rnnt.parameters()).device
+        rnnt_dtype = next(rnnt.parameters()).dtype
+        state_dtype = rnnt.embed.weight.dtype
+        hidden_size = rnnt.pred_rnn.hidden_size
+        num_layers = rnnt.pred_rnn.num_layers
+
+        h = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
+        c = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
+
+        start_token = torch.full((1, 1), rnnt.blank_id, dtype=torch.long, device=device)
+        pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(start_token), (h, c))
+        pred = rnnt.pred_proj(pred_step[:, -1, :])
+
+        emitted = []
+        for chunk in chunks:
+            enc = rnnt.enc_proj(chunk.to(device=device, dtype=rnnt_dtype).unsqueeze(0))[0]
+            for t in range(enc.shape[0]):
+                symbols = 0
+                while symbols < max_symbols_per_step:
+                    joint = torch.tanh(enc[t].unsqueeze(0) + pred)
+                    next_id = int(rnnt.joiner(joint).argmax(dim=-1).item())
+                    if next_id == rnnt.blank_id:
+                        break
+
+                    emitted.append(next_id)
+                    token = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                    pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(token), (h, c))
+                    pred = rnnt.pred_proj(pred_step[:, -1, :])
+                    symbols += 1
+
+        return emitted
+
+    @torch.no_grad()
+    def _ctc_streaming_greedy_decode(self, chunks: List[torch.Tensor]) -> List[int]:
+        """Streaming CTC greedy decode with CTC collapse state carried across chunks."""
+        if self.aux_loss_type != "ctc":
+            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 ctc。")
+
+        emitted = []
+        prev_id = -1
+        for chunk in chunks:
+            hs = chunk.to(device=next(self.ctc.parameters()).device, dtype=next(self.ctc.parameters()).dtype)
+            log_probs = self.ctc.log_softmax(hs.unsqueeze(0))[0]
+            pred_ids = log_probs.argmax(dim=-1).tolist()
+            for idx in pred_ids:
+                if idx != self.ctc.blank_id and idx != prev_id:
+                    emitted.append(idx)
+                prev_id = idx
+        return emitted
+
     @torch.no_grad()
     def _aux_decode_from_audio(
         self,
@@ -507,8 +973,129 @@ class Qwen3ASRJointModel(nn.Module):
         )
 
     @torch.no_grad()
+    def _rnnt_streaming_decode_from_audio(
+        self,
+        audio,
+        max_symbols_per_step: int = 5,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+    ) -> List[str]:
+        """RNNT chunk-wise streaming decode.
+
+        This is a streaming-behavior inference path: each chunk only decodes
+        newly arrived encoder frames, while the RNNT predictor state is carried
+        across chunks. The encoder windows still include configured left/right
+        context and are recomputed per window for correctness and simplicity.
+        """
+        if self.aux_loss_type != "rnnt":
+            raise RuntimeError("当前 checkpoint 不是 RNNT 模式。")
+
+        import librosa
+        import numpy as np
+
+        audios = self._normalize_audio_to_list(audio)
+        waveform_list = []
+        for item in audios:
+            if isinstance(item, str):
+                waveform_list.append(librosa.load(item, sr=16000, mono=True)[0].astype(np.float32, copy=False))
+            elif isinstance(item, np.ndarray):
+                waveform_list.append(item.astype(np.float32, copy=False))
+            else:
+                raise TypeError(f"不支持的音频项类型：{type(item)}")
+
+        results = []
+        feature_len_cache: Dict[int, int] = {}
+        for wav in waveform_list:
+            chunks = self._build_streaming_aux_chunks(
+                wav,
+                chunk_sec=chunk_sec,
+                left_context_sec=left_context_sec,
+                right_context_sec=right_context_sec,
+                first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+                window_batch_size=window_batch_size,
+                window_encoder_batch_size=window_encoder_batch_size,
+                feature_len_cache=feature_len_cache,
+            )
+            ids = self._rnnt_streaming_greedy_decode(
+                chunks,
+                max_symbols_per_step=max_symbols_per_step,
+            )
+            results.append(ids_to_text(ids, self._id_to_token))
+        return results
+
+    @torch.no_grad()
+    def _ctc_streaming_decode_from_audio(
+        self,
+        audio,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+    ) -> List[str]:
+        if self.aux_loss_type != "ctc":
+            raise RuntimeError("当前 checkpoint 不是 CTC 模式。")
+
+        import librosa
+        import numpy as np
+
+        audios = self._normalize_audio_to_list(audio)
+        waveform_list = []
+        for item in audios:
+            if isinstance(item, str):
+                waveform_list.append(librosa.load(item, sr=16000, mono=True)[0].astype(np.float32, copy=False))
+            elif isinstance(item, np.ndarray):
+                waveform_list.append(item.astype(np.float32, copy=False))
+            else:
+                raise TypeError(f"不支持的音频项类型：{type(item)}")
+
+        results = []
+        feature_len_cache: Dict[int, int] = {}
+        for wav in waveform_list:
+            chunks = self._build_streaming_aux_chunks(
+                wav,
+                chunk_sec=chunk_sec,
+                left_context_sec=left_context_sec,
+                right_context_sec=right_context_sec,
+                first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+                window_batch_size=window_batch_size,
+                window_encoder_batch_size=window_encoder_batch_size,
+                feature_len_cache=feature_len_cache,
+            )
+            ids = self._ctc_streaming_greedy_decode(chunks)
+            results.append(ids_to_text(ids, self._id_to_token))
+        return results
+
+    @torch.no_grad()
     def transcribe_ctc(self, audio, aux_encoder_batch_size: int = 1) -> Union[str, List[str]]:
         results = self._ctc_decode_from_audio(audio, aux_encoder_batch_size=aux_encoder_batch_size)
+        return results[0] if isinstance(audio, str) else results
+
+    @torch.no_grad()
+    def transcribe_ctc_streaming(
+        self,
+        audio,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+    ) -> Union[str, List[str]]:
+        results = self._ctc_streaming_decode_from_audio(
+            audio,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+            window_batch_size=window_batch_size,
+            window_encoder_batch_size=window_encoder_batch_size,
+        )
         return results[0] if isinstance(audio, str) else results
 
     @torch.no_grad()
@@ -524,6 +1111,30 @@ class Qwen3ASRJointModel(nn.Module):
             max_symbols_per_step=max_symbols_per_step,
             rnnt_decode_strategy=rnnt_decode_strategy,
             aux_encoder_batch_size=aux_encoder_batch_size,
+        )
+        return results[0] if isinstance(audio, str) else results
+
+    @torch.no_grad()
+    def transcribe_rnnt_streaming(
+        self,
+        audio,
+        max_symbols_per_step: int = 5,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+    ) -> Union[str, List[str]]:
+        results = self._rnnt_streaming_decode_from_audio(
+            audio,
+            max_symbols_per_step=max_symbols_per_step,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+            window_batch_size=window_batch_size,
+            window_encoder_batch_size=window_encoder_batch_size,
         )
         return results[0] if isinstance(audio, str) else results
 
@@ -562,6 +1173,92 @@ class Qwen3ASRJointModel(nn.Module):
                 return [outputs]
             raise ValueError(f"底座输出数量不匹配：expect {batch_size}, got {len(outputs)}")
         return [outputs]
+
+    def _build_manual_audio_prompt(self, num_audio_tokens: int, context: str, language: Optional[str]) -> str:
+        if self._asr_wrapper is None:
+            raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
+        if num_audio_tokens <= 0:
+            raise ValueError(f"num_audio_tokens must be positive, got {num_audio_tokens}")
+
+        prompt = self._asr_wrapper._build_text_prompt(context=context or "", force_language=language)
+        audio_token = self.processor.audio_token
+        if audio_token not in prompt:
+            raise RuntimeError(f"Prompt does not contain audio token {audio_token!r}: {prompt!r}")
+        return prompt.replace(audio_token, audio_token * num_audio_tokens, 1)
+
+    @torch.no_grad()
+    def _generate_llm_from_audio_features(
+        self,
+        audio_features_list: List[torch.Tensor],
+        contexts: List[Optional[str]],
+        languages: List[Optional[str]],
+        max_new_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Optional[str]]]:
+        thinker = self.qwen_model.thinker
+        processor = self.processor
+        device = next(self.qwen_model.parameters()).device
+        dtype = next(thinker.parameters()).dtype
+
+        prompts = [
+            self._build_manual_audio_prompt(
+                num_audio_tokens=int(audio_features.shape[0]),
+                context=context or "",
+                language=language,
+            )
+            for audio_features, context, language in zip(audio_features_list, contexts, languages)
+        ]
+
+        old_padding_side = processor.tokenizer.padding_side
+        processor.tokenizer.padding_side = "left"
+        try:
+            tok = processor.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            )
+        finally:
+            processor.tokenizer.padding_side = old_padding_side
+
+        input_ids = tok["input_ids"].to(device)
+        attention_mask = tok["attention_mask"].to(device)
+        inputs_embeds = thinker.get_input_embeddings()(input_ids)
+        audio_mask = thinker.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
+
+        audio_features = torch.cat(
+            [x.to(device=device, dtype=dtype) for x in audio_features_list],
+            dim=0,
+        )
+        placeholder_count = int(audio_mask[..., 0].sum().item())
+        if placeholder_count != int(audio_features.shape[0]):
+            raise RuntimeError(
+                f"audio placeholder count mismatch: prompt={placeholder_count}, "
+                f"features={audio_features.shape[0]}"
+            )
+
+        inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+        if max_new_tokens is None:
+            max_new_tokens = getattr(self._asr_wrapper, "max_new_tokens", 512)
+
+        generated = self.qwen_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            max_new_tokens=max_new_tokens,
+        )
+        sequences = generated.sequences if hasattr(generated, "sequences") else generated
+        gen_ids = sequences[:, input_ids.shape[1]:]
+        raws = processor.batch_decode(
+            gen_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        results = []
+        for raw, language in zip(raws, languages):
+            parsed_language, text = parse_asr_output(raw, user_language=language)
+            results.append({"text": text, "language": parsed_language or language})
+        return results
 
     @torch.no_grad()
     def transcribe_llm(
@@ -603,6 +1300,69 @@ class Qwen3ASRJointModel(nn.Module):
 
         return results[0] if isinstance(audio, str) else results
 
+    @torch.no_grad()
+    def transcribe_llm_streaming(
+        self,
+        audio,
+        language: Optional[Union[str, List[str]]] = None,
+        context: Optional[Union[str, List[str]]] = None,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        max_new_tokens: Optional[int] = None,
+    ):
+        import librosa
+        import numpy as np
+
+        audios = self._normalize_audio_to_list(audio)
+        waveform_list = []
+        for item in audios:
+            if isinstance(item, str):
+                waveform_list.append(librosa.load(item, sr=16000, mono=True)[0].astype(np.float32, copy=False))
+            elif isinstance(item, np.ndarray):
+                waveform_list.append(item.astype(np.float32, copy=False))
+            else:
+                raise TypeError(f"不支持的音频项类型：{type(item)}")
+
+        if language is None:
+            languages = [None] * len(audios)
+        elif isinstance(language, str):
+            languages = [language] * len(audios)
+        else:
+            languages = language
+
+        if context is None:
+            contexts = [""] * len(audios)
+        elif isinstance(context, str):
+            contexts = [context] * len(audios)
+        else:
+            contexts = [c or "" for c in context]
+
+        feature_len_cache: Dict[int, int] = {}
+        audio_features_list = [
+            self._build_streaming_llm_features(
+                wav,
+                chunk_sec=chunk_sec,
+                left_context_sec=left_context_sec,
+                right_context_sec=right_context_sec,
+                first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+                window_batch_size=window_batch_size,
+                window_encoder_batch_size=window_encoder_batch_size,
+                feature_len_cache=feature_len_cache,
+            )
+            for wav in waveform_list
+        ]
+        results = self._generate_llm_from_audio_features(
+            audio_features_list,
+            contexts=contexts,
+            languages=languages,
+            max_new_tokens=max_new_tokens,
+        )
+        return results[0] if isinstance(audio, str) else results
+
     def _build_joint_context(
         self,
         aux_text: str,
@@ -637,6 +1397,13 @@ class Qwen3ASRJointModel(nn.Module):
         aux_max_symbols_per_step: int = 5,
         rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
+        stream_aux: bool = False,
+        stream_chunk_sec: float = 0.64,
+        stream_left_context_sec: float = 0.64,
+        stream_right_context_sec: float = 0.07,
+        stream_first_chunk_left_pad_sec: float = 0.0,
+        stream_window_batch_size: int = 4,
+        stream_window_encoder_batch_size: int = 1,
         **kwargs,
     ):
         if self._asr_wrapper is None:
@@ -650,12 +1417,35 @@ class Qwen3ASRJointModel(nn.Module):
         else:
             languages = language
 
-        aux_texts = self._aux_decode_from_audio(
-            audios,
-            max_symbols_per_step=aux_max_symbols_per_step,
-            rnnt_decode_strategy=rnnt_decode_strategy,
-            aux_encoder_batch_size=aux_encoder_batch_size,
-        )
+        if stream_aux and self.aux_loss_type in ("ctc", "rnnt"):
+            if self.aux_loss_type == "rnnt":
+                aux_texts = self._rnnt_streaming_decode_from_audio(
+                    audios,
+                    max_symbols_per_step=aux_max_symbols_per_step,
+                    chunk_sec=stream_chunk_sec,
+                    left_context_sec=stream_left_context_sec,
+                    right_context_sec=stream_right_context_sec,
+                    first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
+                    window_batch_size=stream_window_batch_size,
+                    window_encoder_batch_size=stream_window_encoder_batch_size,
+                )
+            else:
+                aux_texts = self._ctc_streaming_decode_from_audio(
+                    audios,
+                    chunk_sec=stream_chunk_sec,
+                    left_context_sec=stream_left_context_sec,
+                    right_context_sec=stream_right_context_sec,
+                    first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
+                    window_batch_size=stream_window_batch_size,
+                    window_encoder_batch_size=stream_window_encoder_batch_size,
+                )
+        else:
+            aux_texts = self._aux_decode_from_audio(
+                audios,
+                max_symbols_per_step=aux_max_symbols_per_step,
+                rnnt_decode_strategy=rnnt_decode_strategy,
+                aux_encoder_batch_size=aux_encoder_batch_size,
+            )
 
         contexts = []
         hotwords_list = []
@@ -670,13 +1460,27 @@ class Qwen3ASRJointModel(nn.Module):
             contexts.append(context)
             hotwords_list.append(hotwords)
 
-        raw_outputs = self._asr_wrapper.transcribe(
-            audios,
-            language=languages,
-            context=contexts,
-            **kwargs,
-        )
-        raw_outputs = self._normalize_transcribe_outputs(raw_outputs, len(audios))
+        if stream_aux:
+            raw_outputs = self.transcribe_llm_streaming(
+                audios,
+                language=languages,
+                context=contexts,
+                chunk_sec=stream_chunk_sec,
+                left_context_sec=stream_left_context_sec,
+                right_context_sec=stream_right_context_sec,
+                first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
+                window_batch_size=stream_window_batch_size,
+                window_encoder_batch_size=stream_window_encoder_batch_size,
+                max_new_tokens=kwargs.pop("max_new_tokens", None),
+            )
+        else:
+            raw_outputs = self._asr_wrapper.transcribe(
+                audios,
+                language=languages,
+                context=contexts,
+                **kwargs,
+            )
+            raw_outputs = self._normalize_transcribe_outputs(raw_outputs, len(audios))
 
         results = []
         for raw_out, lang, aux_text, hotwords, context in zip(
@@ -698,8 +1502,31 @@ class Qwen3ASRJointModel(nn.Module):
     @torch.no_grad()
     def transcribe(self, audio, mode: str = "joint", **kwargs):
         if mode == "llm":
+            if kwargs.get("stream", False):
+                return self.transcribe_llm_streaming(
+                    audio,
+                    language=kwargs.get("language", None),
+                    context=kwargs.get("context", kwargs.get("prompt", None)),
+                    chunk_sec=kwargs.get("stream_chunk_sec", 0.64),
+                    left_context_sec=kwargs.get("stream_left_context_sec", 0.64),
+                    right_context_sec=kwargs.get("stream_right_context_sec", 0.07),
+                    first_chunk_left_pad_sec=kwargs.get("stream_first_chunk_left_pad_sec", 0.0),
+                    window_batch_size=kwargs.get("stream_window_batch_size", 4),
+                    window_encoder_batch_size=kwargs.get("stream_window_encoder_batch_size", 1),
+                    max_new_tokens=kwargs.get("max_new_tokens", None),
+                )
             return self.transcribe_llm(audio, **kwargs)
         if mode == "ctc":
+            if kwargs.get("stream", False):
+                return self.transcribe_ctc_streaming(
+                    audio,
+                    chunk_sec=kwargs.get("stream_chunk_sec", 0.64),
+                    left_context_sec=kwargs.get("stream_left_context_sec", 0.64),
+                    right_context_sec=kwargs.get("stream_right_context_sec", 0.07),
+                    first_chunk_left_pad_sec=kwargs.get("stream_first_chunk_left_pad_sec", 0.0),
+                    window_batch_size=kwargs.get("stream_window_batch_size", 4),
+                    window_encoder_batch_size=kwargs.get("stream_window_encoder_batch_size", 1),
+                )
             return self.transcribe_ctc(
                 audio,
                 aux_encoder_batch_size=kwargs.get("aux_encoder_batch_size", 1),
@@ -709,6 +1536,17 @@ class Qwen3ASRJointModel(nn.Module):
                 "max_symbols_per_step",
                 kwargs.get("rnnt_max_symbols_per_step", 5),
             )
+            if kwargs.get("stream", False):
+                return self.transcribe_rnnt_streaming(
+                    audio,
+                    max_symbols_per_step=max_symbols_per_step,
+                    chunk_sec=kwargs.get("stream_chunk_sec", 0.64),
+                    left_context_sec=kwargs.get("stream_left_context_sec", 0.64),
+                    right_context_sec=kwargs.get("stream_right_context_sec", 0.07),
+                    first_chunk_left_pad_sec=kwargs.get("stream_first_chunk_left_pad_sec", 0.0),
+                    window_batch_size=kwargs.get("stream_window_batch_size", 4),
+                    window_encoder_batch_size=kwargs.get("stream_window_encoder_batch_size", 1),
+                )
             return self.transcribe_rnnt(
                 audio,
                 max_symbols_per_step=max_symbols_per_step,

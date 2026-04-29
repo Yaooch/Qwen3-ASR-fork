@@ -42,6 +42,12 @@ QWEN_LR=${QWEN_LR:-2e-5}
 AUX_LR=${AUX_LR:-1e-3}
 AUX_WEIGHT=${AUX_WEIGHT:-0.3}
 AUX_ENCODER_BATCH_SIZE=${AUX_ENCODER_BATCH_SIZE:-4}
+AUX_STREAMING_TRAIN=${AUX_STREAMING_TRAIN:-0}
+AUX_STREAM_CHUNK_FRAMES=${AUX_STREAM_CHUNK_FRAMES:-64}
+AUX_STREAM_LEFT_CONTEXT_FRAMES=${AUX_STREAM_LEFT_CONTEXT_FRAMES:-64}
+AUX_STREAM_RIGHT_CONTEXT_FRAMES=${AUX_STREAM_RIGHT_CONTEXT_FRAMES:-7}
+AUX_STREAM_RANDOM_LEFT=${AUX_STREAM_RANDOM_LEFT:-1}
+AUX_STREAM_WINDOW_BATCH_SIZE=${AUX_STREAM_WINDOW_BATCH_SIZE:-4}
 
 # post_proj 不需要关心 ctc_layer_idx；pre_proj 时才会使用该层号。
 CTC_POSITION=${CTC_POSITION:-pre_proj}
@@ -71,6 +77,12 @@ torchrun \
     --aux_loss_type "$AUX_LOSS_TYPE" \
     --aux_only "$AUX_ONLY" \
     --aux_encoder_batch_size "$AUX_ENCODER_BATCH_SIZE" \
+    --aux_streaming_train "$AUX_STREAMING_TRAIN" \
+    --aux_stream_chunk_frames "$AUX_STREAM_CHUNK_FRAMES" \
+    --aux_stream_left_context_frames "$AUX_STREAM_LEFT_CONTEXT_FRAMES" \
+    --aux_stream_right_context_frames "$AUX_STREAM_RIGHT_CONTEXT_FRAMES" \
+    --aux_stream_random_left "$AUX_STREAM_RANDOM_LEFT" \
+    --aux_stream_window_batch_size "$AUX_STREAM_WINDOW_BATCH_SIZE" \
     --ctc_position "$CTC_POSITION" \
     --ctc_layer_idx "$CTC_LAYER_IDX" \
     --save_steps "$SAVE_STEPS" \

@@ -26,10 +26,10 @@ set -euo pipefail
 
 CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-rnnt-2/checkpoint-13283"
 MODE="llm"
-INPUT_SCP="/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_wav.scp"
-REF_DIR="/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_text_classify"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint2_llm_2/mandarin"
-GPU_IDS="0,1,2,3,4,5,6,7"
+INPUT_SCP="/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_wav_2.scp"
+REF_DIR="/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_text_classify_2"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint2_llm_2/mandarin2"
+GPU_IDS="6,7"
 BATCH_SIZE=128
 DTYPE="bf16"
 LANGUAGE=""
@@ -38,8 +38,9 @@ PROMPT=""
 HOTWORD_FILE=""
 HOTWORD_TOPK=10
 NO_CTC_IN_PROMPT=0
-RNNT_MAX_SYMBOLS_PER_STEP=8
+RNNT_MAX_SYMBOLS_PER_STEP=3
 AUX_ENCODER_BATCH_SIZE=5
+STREAM=${STREAM:-1}
 
 WER_SCRIPT="/root/scripts/compute_asr_wer_with_slu.py"
 DOMAIN_PROMPT_FILE="${OUTPUT_DIR}/domain.txt"
@@ -72,6 +73,7 @@ usage() {
     echo "  --no_ctc_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt"
     echo "  --rnnt_max_symbols_per_step RNNT 每帧最多吐出的 token 数，调小可加速"
     echo "  --aux_encoder_batch_size CTC/RNNT audio encoder micro-batch，默认 1 最稳"
+    echo "  --stream              使用 chunk-wise encoder 流式路径；llm/joint 会拼接 chunk audio embeddings"
     echo "  --ref_dir             WER 参考文件路径"
     echo "  --domain_prompt_file  WER 脚本需要的 domain 文件"
     echo "  --wer_script          WER 脚本路径，默认 /root/scripts/compute_asr_wer_with_slu.sh"
@@ -135,6 +137,10 @@ while [[ $# -gt 0 ]]; do
         --aux_encoder_batch_size)
             AUX_ENCODER_BATCH_SIZE="$2"
             shift 2
+            ;;
+        --stream)
+            STREAM=1
+            shift 1
             ;;
         --ref_dir)
             REF_DIR="$2"
@@ -217,6 +223,10 @@ if [[ "${NO_CTC_IN_PROMPT}" -eq 1 ]]; then
     INFER_CMD+=(--no_ctc_in_prompt)
 fi
 
+if [[ "${STREAM}" -eq 1 ]]; then
+    INFER_CMD+=(--stream)
+fi
+
 echo "============================================================"
 echo "开始推理"
 echo "============================================================"
@@ -229,6 +239,7 @@ echo "Batch Size: ${BATCH_SIZE}"
 echo "精度: ${DTYPE}"
 echo "RNNT max_symbols_per_step: ${RNNT_MAX_SYMBOLS_PER_STEP}"
 echo "Aux encoder batch size: ${AUX_ENCODER_BATCH_SIZE}"
+echo "Stream: ${STREAM}"
 echo "============================================================"
 
 "${INFER_CMD[@]}"

@@ -386,6 +386,12 @@ class JointTrainer(Trainer):
             "ctc_only": base_model.ctc_only,
             "aux_loss_type": base_model.aux_loss_type,
             "aux_encoder_batch_size": base_model.aux_encoder_batch_size,
+            "aux_streaming_train": base_model.aux_streaming_train,
+            "aux_stream_chunk_frames": base_model.aux_stream_chunk_frames,
+            "aux_stream_left_context_frames": base_model.aux_stream_left_context_frames,
+            "aux_stream_right_context_frames": base_model.aux_stream_right_context_frames,
+            "aux_stream_random_left": base_model.aux_stream_random_left,
+            "aux_stream_window_batch_size": base_model.aux_stream_window_batch_size,
             "vocab": base_model.vocab,
         }
         with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
@@ -455,6 +461,12 @@ def parse_args():
     p.add_argument("--aux_loss_type", type=str, default="ctc", choices=["ctc", "rnnt"])
     p.add_argument("--aux_only", type=int, default=0, help="只训练 CTC/RNNT 辅助头，冻结 Qwen 并跳过 LLM forward")
     p.add_argument("--aux_encoder_batch_size", type=int, default=1, help="CTC/RNNT 辅助头 audio encoder micro-batch，1 最稳")
+    p.add_argument("--aux_streaming_train", type=int, default=0, help="训练 aux loss 时使用流式窗口：当前块 + 随机左上下文 + 右上下文")
+    p.add_argument("--aux_stream_chunk_frames", type=int, default=64, help="流式 aux 训练当前块长度，单位为 feature frames，64 约等于 640ms")
+    p.add_argument("--aux_stream_left_context_frames", type=int, default=64, help="流式 aux 训练最大左上下文，训练时会在 [0, max] 随机采样")
+    p.add_argument("--aux_stream_right_context_frames", type=int, default=7, help="流式 aux 训练右上下文，7 约等于 70ms")
+    p.add_argument("--aux_stream_random_left", type=int, default=1, help="是否随机采样左上下文长度；0 表示总是使用最大左上下文")
+    p.add_argument("--aux_stream_window_batch_size", type=int, default=4, help="流式 aux 训练时一次送入 encoder 的窗口数量")
     p.add_argument("--ctc_layer_idx", type=int, default=16)
     p.add_argument("--ctc_position", type=str, default="post_proj", choices=["pre_proj", "post_proj"])
     p.add_argument("--vocab_path", type=str, default="")
@@ -562,6 +574,12 @@ def main():
         ctc_only=(args_cli.aux_only == 1),
         aux_loss_type=args_cli.aux_loss_type,
         aux_encoder_batch_size=args_cli.aux_encoder_batch_size,
+        aux_streaming_train=(args_cli.aux_streaming_train == 1),
+        aux_stream_chunk_frames=args_cli.aux_stream_chunk_frames,
+        aux_stream_left_context_frames=args_cli.aux_stream_left_context_frames,
+        aux_stream_right_context_frames=args_cli.aux_stream_right_context_frames,
+        aux_stream_random_left=(args_cli.aux_stream_random_left == 1),
+        aux_stream_window_batch_size=args_cli.aux_stream_window_batch_size,
     )
 
     if args_cli.aux_only == 1:
