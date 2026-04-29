@@ -98,19 +98,6 @@ class RNNT(nn.Module):
         hs_lengths: torch.Tensor,
         max_symbols_per_step: int = 5,
     ):
-        return self.greedy_decode_cached(
-            hs_pad,
-            hs_lengths,
-            max_symbols_per_step=max_symbols_per_step,
-        )
-
-    @torch.no_grad()
-    def greedy_decode_cached(
-        self,
-        hs_pad: torch.Tensor,
-        hs_lengths: torch.Tensor,
-        max_symbols_per_step: int = 5,
-    ):
         """批量 greedy 解码，缓存 predictor 状态，避免重复跑整段历史。"""
         if max_symbols_per_step <= 0:
             raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")

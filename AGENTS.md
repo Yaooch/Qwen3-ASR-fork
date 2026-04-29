@@ -6,6 +6,9 @@
 
 ```text
 qwen_asr/joint/model.py       联合模型
+qwen_asr/joint/train_utils.py 流式训练窗口
+qwen_asr/joint/stream.py      流式窗口和 chunk 特征
+qwen_asr/joint/decode.py      推理入口
 qwen_asr/joint/ctc.py         CTC 辅助头
 qwen_asr/joint/rnnt.py        RNNT 辅助头
 qwen_asr/joint/tokens.py      词表工具
@@ -32,6 +35,9 @@ finetuning/eval.sh            推理 + WER
 ```bash
 python3 -m py_compile \
   qwen_asr/joint/model.py \
+  qwen_asr/joint/train_utils.py \
+  qwen_asr/joint/stream.py \
+  qwen_asr/joint/decode.py \
   qwen_asr/joint/ctc.py \
   qwen_asr/joint/rnnt.py \
   qwen_asr/joint/tokens.py \

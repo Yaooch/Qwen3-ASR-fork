@@ -29,6 +29,9 @@
 qwen_asr/
   joint/
     model.py      # 联合模型
+    train_utils.py # 流式训练窗口
+    stream.py     # 流式窗口和 chunk 特征
+    decode.py     # CTC/RNNT/LLM/joint 推理
     ctc.py        # CTC 辅助头
     rnnt.py       # RNNT 辅助头
     hotword.py    # 热词召回

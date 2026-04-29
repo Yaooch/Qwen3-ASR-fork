@@ -1,0 +1,336 @@
+# qwen_asr/joint/stream.py
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+
+class StreamMixin:
+    """流式窗口、音频特征和 chunk 拼接。"""
+
+    def _audio_list(self, audio) -> List:
+        if isinstance(audio, str):
+            return [audio]
+        if isinstance(audio, list):
+            return audio
+
+        import numpy as np
+        if isinstance(audio, np.ndarray):
+            return [audio]
+
+        raise TypeError(f"不支持的音频类型：{type(audio)}")
+
+    def _feature_batch(self, waveform_list: List):
+        feature_extractor = self.processor.feature_extractor
+        batch = feature_extractor(
+            waveform_list,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+        )
+        if "feature_attention_mask" not in batch and "attention_mask" in batch:
+            batch["feature_attention_mask"] = batch.pop("attention_mask")
+        return batch
+
+    def _feat_len(self, num_samples: int, cache: Optional[Dict[int, int]] = None) -> int:
+        """Feature extractor valid length for a waveform with this many samples."""
+        if num_samples <= 0:
+            return 0
+        num_samples = int(num_samples)
+        if cache is not None and num_samples in cache:
+            return cache[num_samples]
+
+        import numpy as np
+
+        feat = self.processor.feature_extractor(
+            np.zeros((num_samples,), dtype=np.float32),
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+        )
+        value = int(feat["attention_mask"].sum().item())
+        if cache is not None:
+            cache[num_samples] = value
+        return value
+
+    def _enc_len(self, feature_len: int, device: torch.device) -> int:
+        if feature_len <= 0:
+            return 0
+        x = torch.tensor([feature_len], dtype=torch.long, device=device)
+        return int(self._out_lens(x)[0].item())
+
+    def _windows(
+        self,
+        wav,
+        chunk_sec: float,
+        left_context_sec: float,
+        right_context_sec: float,
+        first_chunk_left_pad_sec: float,
+    ):
+        """Build current-chunk windows for streaming aux decoding."""
+        if chunk_sec <= 0:
+            raise ValueError(f"chunk_sec must be > 0, got {chunk_sec}")
+
+        import numpy as np
+
+        sr = 16000
+        total_samples = int(wav.shape[0])
+        chunk_samples = max(1, int(round(chunk_sec * sr)))
+        left_samples = max(0, int(round(left_context_sec * sr)))
+        right_samples = max(0, int(round(right_context_sec * sr)))
+        first_left_pad_samples = max(0, int(round(first_chunk_left_pad_sec * sr)))
+        if first_left_pad_samples >= chunk_samples:
+            raise ValueError(
+                "first_chunk_left_pad_sec must be smaller than chunk_sec, got "
+                f"{first_chunk_left_pad_sec} >= {chunk_sec}"
+            )
+
+        windows = []
+        start = 0
+        first_chunk = True
+        while start < total_samples:
+            cur_chunk_samples = chunk_samples
+            left_pad_samples = 0
+            if first_chunk and first_left_pad_samples > 0:
+                cur_chunk_samples = chunk_samples - first_left_pad_samples
+                left_pad_samples = first_left_pad_samples
+
+            end = min(total_samples, start + cur_chunk_samples)
+            enc_start = max(0, start - left_samples)
+            enc_end = min(total_samples, end + right_samples)
+            window_wav = wav[enc_start:enc_end]
+            if left_pad_samples > 0:
+                pad = np.zeros(left_pad_samples, dtype=window_wav.dtype)
+                window_wav = np.concatenate([pad, window_wav], axis=0)
+
+            windows.append((start, end, enc_start, enc_end, left_pad_samples, window_wav))
+            start = end
+            first_chunk = False
+        return windows
+
+    @torch.no_grad()
+    def _enc_aux_windows(
+        self,
+        window_wavs: List,
+        encoder_batch_size: int = 1,
+    ) -> List[torch.Tensor]:
+        """Encode audio windows and return one aux-feature tensor per window."""
+        if not window_wavs:
+            return []
+
+        ref = next(self.qwen_model.parameters())
+        batch = self._feature_batch(window_wavs)
+        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
+
+        hs_pad, _, out_lens, _ = self._enc_joint(
+            input_features,
+            feature_attention_mask,
+            need_llm_features=False,
+            encoder_batch_size=encoder_batch_size,
+        )
+        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+        return [hs_pad[i, : int(length)] for i, length in enumerate(out_lens.tolist())]
+
+    @torch.no_grad()
+    def _enc_joint_windows(
+        self,
+        window_wavs: List,
+        encoder_batch_size: int = 1,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Encode audio windows and return aux + LLM features per window."""
+        if not window_wavs:
+            return [], []
+
+        ref = next(self.qwen_model.parameters())
+        batch = self._feature_batch(window_wavs)
+        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
+
+        hs_pad, llm_features, out_lens, _ = self._enc_joint(
+            input_features,
+            feature_attention_mask,
+            need_llm_features=True,
+            encoder_batch_size=encoder_batch_size,
+        )
+        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+
+        aux_results = []
+        llm_results = []
+        offset = 0
+        for i, length in enumerate(out_lens.tolist()):
+            cur_len = int(length)
+            aux_results.append(hs_pad[i, :cur_len])
+            llm_results.append(llm_features[offset: offset + cur_len])
+            offset += cur_len
+        return aux_results, llm_results
+
+    @torch.no_grad()
+    def _stream_aux_chunks(
+        self,
+        wav,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> List[torch.Tensor]:
+        """Encode overlap windows and keep only the newly arrived chunk frames."""
+        device = next(self.qwen_model.parameters()).device
+        windows = self._windows(
+            wav,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+        )
+        if window_batch_size is None or window_batch_size <= 0:
+            window_batch_size = len(windows)
+
+        kept_chunks = []
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            window_features_batch = self._enc_aux_windows(
+                [x[5] for x in batch_windows],
+                encoder_batch_size=window_encoder_batch_size,
+            )
+
+            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
+                batch_windows, window_features_batch
+            ):
+                keep_start_samples = left_pad_samples + start - enc_start
+                keep_end_samples = left_pad_samples + end - enc_start
+                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._enc_len(keep_start_feat, device)
+                keep_end_idx = self._enc_len(keep_end_feat, device)
+
+                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
+                kept = window_features[keep_start_idx:keep_end_idx]
+                if kept.numel() > 0:
+                    kept_chunks.append(kept)
+
+        if not kept_chunks:
+            raise RuntimeError("No streaming auxiliary features were produced.")
+        return kept_chunks
+
+    @torch.no_grad()
+    def _stream_llm_feats(
+        self,
+        wav,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> torch.Tensor:
+        """Encode overlap windows and concatenate current-chunk LLM audio features."""
+        device = next(self.qwen_model.parameters()).device
+        windows = self._windows(
+            wav,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+        )
+        if window_batch_size is None or window_batch_size <= 0:
+            window_batch_size = len(windows)
+
+        kept_chunks = []
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            _aux_features_batch, llm_features_batch = self._enc_joint_windows(
+                [x[5] for x in batch_windows],
+                encoder_batch_size=window_encoder_batch_size,
+            )
+
+            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
+                batch_windows, llm_features_batch
+            ):
+                keep_start_samples = left_pad_samples + start - enc_start
+                keep_end_samples = left_pad_samples + end - enc_start
+                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._enc_len(keep_start_feat, device)
+                keep_end_idx = self._enc_len(keep_end_feat, device)
+
+                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
+                kept = window_features[keep_start_idx:keep_end_idx]
+                if kept.numel() > 0:
+                    kept_chunks.append(kept)
+
+        if not kept_chunks:
+            raise RuntimeError("No streaming LLM audio features were produced.")
+        return torch.cat(kept_chunks, dim=0)
+
+    @torch.no_grad()
+    def _rnnt_stream_decode(
+        self,
+        chunks: List[torch.Tensor],
+        max_symbols_per_step: int = 5,
+    ) -> List[int]:
+        """Stateful RNNT greedy decode. Predictor state is carried across chunks."""
+        if self.aux_loss_type != "rnnt":
+            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 rnnt。")
+        if max_symbols_per_step <= 0:
+            raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")
+
+        rnnt = self.rnnt
+        device = next(rnnt.parameters()).device
+        rnnt_dtype = next(rnnt.parameters()).dtype
+        state_dtype = rnnt.embed.weight.dtype
+        hidden_size = rnnt.pred_rnn.hidden_size
+        num_layers = rnnt.pred_rnn.num_layers
+
+        h = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
+        c = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
+
+        start_token = torch.full((1, 1), rnnt.blank_id, dtype=torch.long, device=device)
+        pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(start_token), (h, c))
+        pred = rnnt.pred_proj(pred_step[:, -1, :])
+
+        emitted = []
+        for chunk in chunks:
+            enc = rnnt.enc_proj(chunk.to(device=device, dtype=rnnt_dtype).unsqueeze(0))[0]
+            for t in range(enc.shape[0]):
+                symbols = 0
+                while symbols < max_symbols_per_step:
+                    joint = torch.tanh(enc[t].unsqueeze(0) + pred)
+                    next_id = int(rnnt.joiner(joint).argmax(dim=-1).item())
+                    if next_id == rnnt.blank_id:
+                        break
+
+                    emitted.append(next_id)
+                    token = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                    pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(token), (h, c))
+                    pred = rnnt.pred_proj(pred_step[:, -1, :])
+                    symbols += 1
+
+        return emitted
+
+    @torch.no_grad()
+    def _ctc_stream_decode(self, chunks: List[torch.Tensor]) -> List[int]:
+        """Streaming CTC greedy decode with CTC collapse state carried across chunks."""
+        if self.aux_loss_type != "ctc":
+            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 ctc。")
+
+        emitted = []
+        prev_id = -1
+        for chunk in chunks:
+            hs = chunk.to(device=next(self.ctc.parameters()).device, dtype=next(self.ctc.parameters()).dtype)
+            log_probs = self.ctc.log_softmax(hs.unsqueeze(0))[0]
+            pred_ids = log_probs.argmax(dim=-1).tolist()
+            for idx in pred_ids:
+                if idx != self.ctc.blank_id and idx != prev_id:
+                    emitted.append(idx)
+                prev_id = idx
+        return emitted
