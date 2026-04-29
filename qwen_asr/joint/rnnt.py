@@ -97,60 +97,12 @@ class RNNT(nn.Module):
         hs_pad: torch.Tensor,
         hs_lengths: torch.Tensor,
         max_symbols_per_step: int = 5,
-        decode_strategy: str = "cached",
     ):
-        if decode_strategy == "legacy":
-            return self.greedy_decode_legacy(
-                hs_pad,
-                hs_lengths,
-                max_symbols_per_step=max_symbols_per_step,
-            )
-        if decode_strategy == "cached":
-            return self.greedy_decode_cached(
-                hs_pad,
-                hs_lengths,
-                max_symbols_per_step=max_symbols_per_step,
-            )
-        raise ValueError(f"Unsupported RNNT decode_strategy: {decode_strategy}")
-
-    @torch.no_grad()
-    def greedy_decode_legacy(
-        self,
-        hs_pad: torch.Tensor,
-        hs_lengths: torch.Tensor,
-        max_symbols_per_step: int = 5,
-    ):
-        """Original RNNT greedy decode used by training-time eval."""
-        enc = self.enc_proj(hs_pad)
-        results = []
-
-        for b in range(enc.size(0)):
-            emitted = []
-            ys = [self.blank_id]
-            cur_len = int(hs_lengths[b].item())
-
-            for t in range(cur_len):
-                symbols = 0
-
-                while symbols < max_symbols_per_step:
-                    ys_tensor = torch.tensor([ys], dtype=torch.long, device=enc.device)
-                    pred = self.embed(ys_tensor)
-                    pred, _ = self.pred_rnn(pred)
-                    pred = self.pred_proj(pred)[:, -1, :]
-
-                    joint = torch.tanh(enc[b, t].unsqueeze(0) + pred)
-                    next_id = int(self.joiner(joint).argmax(dim=-1).item())
-
-                    if next_id == self.blank_id:
-                        break
-
-                    emitted.append(next_id)
-                    ys.append(next_id)
-                    symbols += 1
-
-            results.append(emitted)
-
-        return results
+        return self.greedy_decode_cached(
+            hs_pad,
+            hs_lengths,
+            max_symbols_per_step=max_symbols_per_step,
+        )
 
     @torch.no_grad()
     def greedy_decode_cached(
@@ -159,12 +111,7 @@ class RNNT(nn.Module):
         hs_lengths: torch.Tensor,
         max_symbols_per_step: int = 5,
     ):
-        """Batched RNNT greedy decode with cached predictor states.
-
-        The predictor state represents the emitted token history for each sample.
-        It is updated only when a non-blank token is emitted, so blank frames do
-        not repeatedly rerun the LSTM over the same history.
-        """
+        """批量 greedy 解码，缓存 predictor 状态，避免重复跑整段历史。"""
         if max_symbols_per_step <= 0:
             raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")
 

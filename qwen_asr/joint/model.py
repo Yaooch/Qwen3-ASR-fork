@@ -17,12 +17,8 @@ class Qwen3ASRJointModel(nn.Module):
     """Qwen3-ASR + CTC/RNNT 联合模型。
 
     aux_loss_type:
-    - ctc: 兼容原来的 CTC 方案
+    - ctc: 使用 CTC 作为辅助 ASR loss
     - rnnt: 使用 RNNT 作为辅助 ASR loss
-
-    ctc_position:
-    - pre_proj:  接在 audio encoder proj 前，维度 d_model
-    - post_proj: 接在 audio encoder proj 后，维度 output_dim
     """
 
     def __init__(
@@ -167,7 +163,7 @@ class Qwen3ASRJointModel(nn.Module):
         return instance
 
     def save_aux(self, output_dir: str) -> None:
-        """保存辅助头和配置。文件名保持 ctc_config.json，兼容旧流程。"""
+        """保存辅助头和配置。配置文件名沿用 ctc_config.json。"""
         os.makedirs(output_dir, exist_ok=True)
 
         if self.aux_loss_type == "ctc":
@@ -180,8 +176,6 @@ class Qwen3ASRJointModel(nn.Module):
             "encoder_output_size": self.encoder_output_size,
             "blank_id": self.blank_id,
             "ctc_weight": self.ctc_weight,
-            "ctc_layer_idx": self.ctc_layer_idx,
-            "ctc_position": self.ctc_position,
             "ctc_only": self.ctc_only,
             "aux_loss_type": self.aux_loss_type,
             "aux_encoder_batch_size": self.aux_encoder_batch_size,
@@ -195,10 +189,6 @@ class Qwen3ASRJointModel(nn.Module):
         }
         with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-    def save_ctc(self, output_dir: str) -> None:
-        """兼容旧训练代码的保存入口。"""
-        self.save_aux(output_dir)
 
     def _out_lens(self, input_lengths: torch.Tensor) -> torch.Tensor:
         leave = input_lengths % 100
@@ -547,10 +537,9 @@ class Qwen3ASRJointModel(nn.Module):
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
         max_symbols_per_step: int = 5,
-        rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: Optional[int] = None,
     ) -> List[str]:
-        """Decode the active auxiliary head from already-collated audio features."""
+        """用已整理好的音频特征做 CTC/RNNT 解码。"""
         ref = next(self.qwen_model.parameters())
         input_features = input_features.to(device=ref.device, dtype=ref.dtype)
         if feature_attention_mask is not None:
@@ -571,7 +560,6 @@ class Qwen3ASRJointModel(nn.Module):
                 hs_pad,
                 out_lens,
                 max_symbols_per_step=max_symbols_per_step,
-                decode_strategy=rnnt_decode_strategy,
             )
         else:
             raise ValueError(f"不支持的 aux_loss_type: {self.aux_loss_type}")
@@ -911,7 +899,6 @@ class Qwen3ASRJointModel(nn.Module):
         self,
         audio,
         max_symbols_per_step: int = 5,
-        rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
     ) -> List[str]:
         """辅助头推理：CTC/RNNT 共用入口。"""
@@ -947,7 +934,6 @@ class Qwen3ASRJointModel(nn.Module):
                     input_features,
                     feature_attention_mask,
                     max_symbols_per_step=max_symbols_per_step,
-                    rnnt_decode_strategy=rnnt_decode_strategy,
                     aux_encoder_batch_size=aux_encoder_batch_size,
                 )
             )
@@ -964,7 +950,6 @@ class Qwen3ASRJointModel(nn.Module):
         self,
         audio,
         max_symbols_per_step: int = 5,
-        rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
     ) -> List[str]:
         if self.aux_loss_type != "rnnt":
@@ -972,7 +957,6 @@ class Qwen3ASRJointModel(nn.Module):
         return self._aux_decode(
             audio,
             max_symbols_per_step=max_symbols_per_step,
-            rnnt_decode_strategy=rnnt_decode_strategy,
             aux_encoder_batch_size=aux_encoder_batch_size,
         )
 
@@ -1107,13 +1091,11 @@ class Qwen3ASRJointModel(nn.Module):
         self,
         audio,
         max_symbols_per_step: int = 5,
-        rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
     ) -> Union[str, List[str]]:
         results = self._rnnt_decode(
             audio,
             max_symbols_per_step=max_symbols_per_step,
-            rnnt_decode_strategy=rnnt_decode_strategy,
             aux_encoder_batch_size=aux_encoder_batch_size,
         )
         return results[0] if isinstance(audio, str) else results
@@ -1373,7 +1355,7 @@ class Qwen3ASRJointModel(nn.Module):
         prompt: Optional[str] = None,
         hotword_retriever=None,
         hotword_topk: int = 10,
-        inject_ctc_into_prompt: bool = True,
+        inject_aux: bool = True,
     ):
         hotwords = []
         if hotword_retriever is not None and aux_text:
@@ -1382,7 +1364,7 @@ class Qwen3ASRJointModel(nn.Module):
         parts = []
         if prompt:
             parts.append(prompt)
-        if inject_ctc_into_prompt and aux_text:
+        if inject_aux and aux_text:
             parts.append(f"参考粗识别结果：{aux_text}")
         if hotwords:
             parts.append("相关热词：" + "，".join(hotwords))
@@ -1397,9 +1379,8 @@ class Qwen3ASRJointModel(nn.Module):
         prompt: Optional[str] = None,
         hotword_retriever=None,
         hotword_topk: int = 10,
-        inject_ctc_into_prompt: bool = True,
+        inject_aux_into_prompt: bool = True,
         aux_max_symbols_per_step: int = 5,
-        rnnt_decode_strategy: str = "cached",
         aux_encoder_batch_size: int = 1,
         stream_aux: bool = False,
         stream_chunk_sec: float = 0.64,
@@ -1447,7 +1428,6 @@ class Qwen3ASRJointModel(nn.Module):
             aux_texts = self._aux_decode(
                 audios,
                 max_symbols_per_step=aux_max_symbols_per_step,
-                rnnt_decode_strategy=rnnt_decode_strategy,
                 aux_encoder_batch_size=aux_encoder_batch_size,
             )
 
@@ -1459,7 +1439,7 @@ class Qwen3ASRJointModel(nn.Module):
                 prompt=prompt,
                 hotword_retriever=hotword_retriever,
                 hotword_topk=hotword_topk,
-                inject_ctc_into_prompt=inject_ctc_into_prompt,
+                inject_aux=inject_aux_into_prompt,
             )
             contexts.append(context)
             hotwords_list.append(hotwords)
@@ -1492,7 +1472,6 @@ class Qwen3ASRJointModel(nn.Module):
         ):
             fields = self._asr_fields(raw_out)
             results.append({
-                "ctc_stream_text": aux_text,
                 "aux_stream_text": aux_text,
                 "llm_refined_text": fields["text"],
                 "text": fields["text"],
@@ -1554,7 +1533,6 @@ class Qwen3ASRJointModel(nn.Module):
             return self.transcribe_rnnt(
                 audio,
                 max_symbols_per_step=max_symbols_per_step,
-                rnnt_decode_strategy=kwargs.get("rnnt_decode_strategy", "cached"),
                 aux_encoder_batch_size=kwargs.get("aux_encoder_batch_size", 1),
             )
         if mode == "joint":

@@ -62,7 +62,6 @@ def parse_args():
     parser.add_argument("--hotword_file", default=None, help="热词文件，每行一个热词")
     parser.add_argument("--hotword_topk", type=int, default=10, help="召回热词数量")
     parser.add_argument(
-        "--no_ctc_in_prompt",
         "--no_aux_in_prompt",
         action="store_true",
         help="joint 模式下不把 CTC/RNNT 粗识别结果注入 prompt",
@@ -332,7 +331,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             prompt=args.prompt,
             hotword_retriever=hotword_retriever,
             hotword_topk=args.hotword_topk,
-            inject_ctc_into_prompt=not args.no_ctc_in_prompt,
+            inject_aux_into_prompt=not args.no_aux_in_prompt,
             aux_max_symbols_per_step=args.rnnt_max_symbols_per_step,
             aux_encoder_batch_size=args.aux_encoder_batch_size,
             stream_aux=args.stream,
@@ -364,8 +363,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                     "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": llm_text,
-                    "ctc_stream_text": raw_out.get("ctc_stream_text", ""),
-                    "aux_stream_text": raw_out.get("aux_stream_text") or raw_out.get("ctc_stream_text", ""),
+                    "aux_stream_text": raw_out.get("aux_stream_text", ""),
                     "llm_refined_text": llm_text,
                     "hotwords": raw_out.get("hotwords", []),
                     "prompt": raw_out.get("prompt"),
@@ -381,7 +379,6 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                     "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": final_text,
-                    "ctc_stream_text": "",
                     "aux_stream_text": "",
                     "llm_refined_text": final_text,
                     "hotwords": [],
@@ -444,12 +441,9 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
     dtype = get_torch_dtype(args.dtype)
 
     start_time = time.time()
-    log(f"[Worker {rank}] start, gpu_id={gpu_id}, device={device}, samples={len(shard)}")
-    log(f"[Worker {rank}] torch.cuda.device_count()={torch.cuda.device_count()}")
-    log(f"[Worker {rank}] current_device={torch.cuda.current_device()}")
-    log(f"[Worker {rank}] device_name={torch.cuda.get_device_name(gpu_id)}")
+    log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
-    log(f"[Worker {rank}] loading model")
+    log(f"进程{rank}加载模型")
     model = Qwen3ASRJointModel.from_pretrained(
         args.ckpt,
         dtype=dtype,
@@ -457,7 +451,7 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
     )
     model = model.to(device)
     model.eval()
-    log(f"[Worker {rank}] model loaded")
+    log(f"进程{rank}模型加载完成")
 
     aux_loss_type = getattr(model, "aux_loss_type", None)
     if args.mode in ("ctc", "rnnt") and aux_loss_type != args.mode:
@@ -473,7 +467,6 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
     all_records = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(batchify(shard, args.batch_size), 1):
-            # log(f"[Worker {rank}] processing batch {batch_idx}, size={len(batch)}")
             batch_records = run_batch_infer(
                 model=model,
                 batch=batch,
@@ -487,7 +480,7 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     elapsed = time.time() - start_time
-    log(f"[Worker {rank}] done, elapsed={elapsed:.2f}s, saved to {tmp_output_path}")
+    log(f"进程{rank}完成，用时 {elapsed:.2f}s")
 
 
 
@@ -549,25 +542,24 @@ def main():
     print("=" * 80)
     print("推理配置")
     print("=" * 80)
-    print(f"checkpoint: {args.ckpt}")
-    print(f"mode: {args.mode}")
-    print(f"input_scp: {args.input_scp}")
-    print(f"output_dir: {args.output_dir}")
-    print(f"gpu_ids: {gpu_ids}")
-    print(f"batch_size: {args.batch_size}")
-    print(f"dtype: {args.dtype}")
-    print(f"rnnt_max_symbols_per_step: {args.rnnt_max_symbols_per_step}")
-    print(f"aux_encoder_batch_size: {args.aux_encoder_batch_size}")
-    print(f"stream: {args.stream}")
+    print(f"模型：{args.ckpt}")
+    print(f"模式：{args.mode}")
+    print(f"输入：{args.input_scp}")
+    print(f"输出：{args.output_dir}")
+    print(f"GPU：{gpu_ids}")
+    print(f"批量：{args.batch_size}")
+    print(f"精度：{args.dtype}")
+    print(f"RNNT每帧上限：{args.rnnt_max_symbols_per_step}")
+    print(f"辅助编码批量：{args.aux_encoder_batch_size}")
+    print(f"流式：{int(args.stream)}")
     if args.stream:
         print(
-            "stream_config: "
+            "流式配置："
             f"chunk={args.stream_chunk_sec}, left={args.stream_left_context_sec}, "
-            f"right={args.stream_right_context_sec}, first_left_pad={args.stream_first_chunk_left_pad_sec}, "
-            f"window_batch={args.stream_window_batch_size}, "
-            f"window_encoder_batch={args.stream_window_encoder_batch_size}"
+            f"right={args.stream_right_context_sec}, first_pad={args.stream_first_chunk_left_pad_sec}, "
+            f"win_batch={args.stream_window_batch_size}, enc_batch={args.stream_window_encoder_batch_size}"
         )
-    print(f"num_samples: {len(items)}")
+    print(f"样本数：{len(items)}")
     print("=" * 80)
 
     if world_size == 1:
@@ -600,8 +592,8 @@ def main():
     print("=" * 80)
     print("推理完成")
     print("=" * 80)
-    print(f"results.txt: {results_txt}")
-    print(f"results_detail.jsonl: {detail_jsonl}")
+    print(f"结果：{results_txt}")
+    print(f"明细：{detail_jsonl}")
     print("=" * 80)
 
 

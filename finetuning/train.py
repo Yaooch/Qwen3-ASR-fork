@@ -71,11 +71,11 @@ def load_audio(path: str, sr: int = 16000, max_duration: float = 12.0):
         wav, _ = librosa.load(path, sr=sr, mono=True)
         duration = len(wav) / sr
         if duration > max_duration:
-            print(f"Warning: Audio too long ({duration:.1f}s > {max_duration}s), skipping: {path}")
+            print(f"音频过长，跳过：{path}")
             return None
         return wav
     except Exception as e:
-        print(f"Warning: Failed to load audio {path}: {e}")
+        print(f"音频读取失败，跳过：{path}，{e}")
         return None
 
 
@@ -242,9 +242,7 @@ class JointTrainer(Trainer):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         if self.args.process_index == 0:
-            print("\n[Optimizer] 已使用两组学习率:")
-            print(f"  - Qwen3-ASR LR: {self.qwen_lr}")
-            print(f"  - Aux Head LR:  {self.ctc_lr}\n")
+            print(f"学习率：Qwen={self.qwen_lr}，Aux={self.ctc_lr}")
         return self.optimizer
 
     def _prepare_inputs(self, inputs):
@@ -284,9 +282,8 @@ class JointTrainer(Trainer):
                     ref_processed = "".join(ref_pieces).replace("▁", " ").strip().lower()
 
                     if self.args.process_index == 0 and debug_samples < max_debug:
-                        print(f"\n[验证评估] 样本 {debug_samples}:")
-                        print(f"  预测文本({aux_name}): '{pred_text}'")
-                        print(f"  真实文本:      '{ref_processed}'")
+                        print(f"[验证样例{debug_samples}] {aux_name}: {pred_text}")
+                        print(f"[验证样例{debug_samples}] 参考: {ref_processed}")
                         debug_samples += 1
 
                     total_edits += editdistance.eval(pred_text, ref_processed)
@@ -303,7 +300,7 @@ class JointTrainer(Trainer):
 
         cer = total_edits / total_chars if total_chars > 0 else 0.0
         if self.args.process_index == 0:
-            print(f"\n[{aux_name} 评估] 全局 CER: {cer:.4f}\n")
+            print(f"{aux_name} 验证 CER：{cer:.4f}")
 
         metric_name = f"{metric_key_prefix}_{aux_loss_type}_cer"
         metrics[metric_name] = cer
@@ -316,7 +313,7 @@ class JointTrainer(Trainer):
         base_model = model.module if hasattr(model, "module") else model
 
         if self.args.process_index == 0:
-            print(f"[Resume] 从自定义 checkpoint 恢复模型权重：{resume_from_checkpoint}")
+            print(f"恢复训练：{resume_from_checkpoint}")
 
         self._load_qwen_base_weights(base_model.qwen_model, resume_from_checkpoint)
         self._load_aux_weights(base_model, resume_from_checkpoint)
@@ -325,7 +322,7 @@ class JointTrainer(Trainer):
             base_model.qwen_model.tie_weights()
 
         if self.args.process_index == 0:
-            print("[Resume] 模型权重恢复完成")
+            print("模型恢复完成")
 
     @staticmethod
     def _load_qwen_base_weights(qwen_model, ckpt_dir: str):
@@ -350,16 +347,16 @@ class JointTrainer(Trainer):
         aux_path = os.path.join(ckpt_dir, aux_name)
         if not os.path.exists(aux_path):
             if self.args.process_index == 0:
-                print(f"[Resume][警告] 未找到辅助头权重：{aux_path}")
+                print(f"未找到辅助头权重：{aux_path}")
             return
 
         missing, unexpected = module.load_state_dict(torch.load(aux_path, map_location="cpu"), strict=False)
         if self.args.process_index == 0:
-            print(f"[Resume] 已加载辅助头权重：{aux_path}")
+            print(f"已加载辅助头：{aux_path}")
             if missing:
-                print(f"[Resume][警告] missing keys: {missing}")
+                print(f"缺少参数：{missing}")
             if unexpected:
-                print(f"[Resume][警告] unexpected keys: {unexpected}")
+                print(f"多余参数：{unexpected}")
 
     def save_model(self, output_dir=None, _internal_call=False):
         if self.args.process_index != 0:
@@ -370,37 +367,12 @@ class JointTrainer(Trainer):
 
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.qwen_model.save_pretrained(output_dir, safe_serialization=True)
-
-        if base_model.aux_loss_type == "rnnt":
-            torch.save(base_model.rnnt.state_dict(), os.path.join(output_dir, "rnnt_head.pt"))
-        else:
-            torch.save(base_model.ctc.state_dict(), os.path.join(output_dir, "ctc_head.pt"))
-
-        aux_config = {
-            "vocab_size": base_model.vocab_size,
-            "encoder_output_size": base_model.encoder_output_size,
-            "blank_id": base_model.blank_id,
-            "ctc_weight": base_model.ctc_weight,
-            "ctc_layer_idx": base_model.ctc_layer_idx,
-            "ctc_position": base_model.ctc_position,
-            "ctc_only": base_model.ctc_only,
-            "aux_loss_type": base_model.aux_loss_type,
-            "aux_encoder_batch_size": base_model.aux_encoder_batch_size,
-            "aux_streaming_train": base_model.aux_streaming_train,
-            "aux_stream_chunk_frames": base_model.aux_stream_chunk_frames,
-            "aux_stream_left_context_frames": base_model.aux_stream_left_context_frames,
-            "aux_stream_right_context_frames": base_model.aux_stream_right_context_frames,
-            "aux_stream_random_left": base_model.aux_stream_random_left,
-            "aux_stream_window_batch_size": base_model.aux_stream_window_batch_size,
-            "vocab": base_model.vocab,
-        }
-        with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
-            json.dump(aux_config, f, indent=2, ensure_ascii=False)
+        base_model.save_aux(output_dir)
 
         old_joint = os.path.join(output_dir, "pytorch_model.bin")
         if os.path.exists(old_joint):
             os.remove(old_joint)
-            print(f"[Save] Removed old {old_joint}")
+            print(f"已删除旧权重文件：{old_joint}")
 
 
 def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
@@ -515,15 +487,15 @@ def main():
     import sentencepiece as spm
     from accelerate import PartialState
 
-    print(f"Loading SentencePiece model from {args_cli.sp_model_path}")
+    print(f"加载 SentencePiece：{args_cli.sp_model_path}")
     sp_model = spm.SentencePieceProcessor()
     sp_model.load(args_cli.sp_model_path)
 
-    print(f"Loading BPE Vocab from {args_cli.vocab_path}")
+    print(f"加载词表：{args_cli.vocab_path}")
     vocab = load_vocab(args_cli.vocab_path)
     assert vocab.get("<blank>") == 0, "vocab must have <blank>: 0"
     assert vocab.get("<unk>") == 1, "vocab must have <unk>: 1"
-    print(f"Vocab size: {len(vocab)}")
+    print(f"词表大小：{len(vocab)}")
 
     os.makedirs(args_cli.output_dir, exist_ok=True)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -556,10 +528,7 @@ def main():
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
         except TypeError:
-            print(
-                "[Warning] gradient_checkpointing_kwargs is not supported; "
-                "disable gradient checkpointing to avoid DDP reentrant checkpoint conflicts."
-            )
+            print("当前 transformers 不支持非重入 checkpoint，建议关闭 gradient checkpoint。")
 
     joint_model = Qwen3ASRJointModel(
         qwen_model=qwen_model,
@@ -567,8 +536,6 @@ def main():
         vocab=vocab,
         ctc_weight=args_cli.ctc_weight,
         blank_id=0,
-        ctc_layer_idx=None,
-        ctc_position="pre_proj",
         ctc_only=(args_cli.aux_only == 1),
         aux_loss_type=args_cli.aux_loss_type,
         aux_encoder_batch_size=args_cli.aux_encoder_batch_size,
@@ -585,8 +552,8 @@ def main():
         if local_rank == 0:
             trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in joint_model.parameters())
-            print("[Aux-only] Enabled: freeze Qwen, skip LLM forward, train auxiliary head only.")
-            print(f"[Aux-only] Trainable params: {trainable:,} / {total:,}")
+            print("Aux-only：只训练辅助头")
+            print(f"可训练参数：{trainable:,} / {total:,}")
 
     with PartialState().main_process_first():
         raw_ds = load_dataset(
@@ -661,7 +628,7 @@ def main():
 
     if resume_from:
         if trainer.args.process_index == 0:
-            print(f"[resume] resume_from_checkpoint = {resume_from}")
+            print(f"继续训练：{resume_from}")
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()

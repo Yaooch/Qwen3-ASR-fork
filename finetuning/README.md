@@ -1,27 +1,25 @@
-# Finetuning Entries
+# Finetuning 入口
 
-This directory now contains launch scripts and experiment entries only. Core
-CTC/RNNT model code lives in `qwen_asr/joint/`.
+这个目录只保留训练、推理和评估脚本。核心模型代码在 `qwen_asr/joint/`。
 
-## Files
+## 文件
 
 ```text
-train.py                    Joint LLM + CTC/RNNT training entry
-infer.py                    Batch inference entry
-train.sh                    Training launcher
-eval.sh                     Inference + WER launcher
-compute_pinyin.sh           Pinyin evaluation launcher
-compute_pinyin_similarity.py Compatibility wrapper
-qwen3_asr_sft.py            Original Qwen3-ASR SFT baseline
+train.py          联合训练入口
+infer.py          批量推理入口
+train.sh          训练启动脚本
+eval.sh           推理 + WER 脚本
+compute_pinyin.sh 拼音评估脚本
+qwen3_asr_sft.py  原始 SFT baseline
 ```
 
-## Train
+## 训练
 
 ```bash
 bash train.sh "0,1,2,3"
 ```
 
-Common overrides:
+常用配置：
 
 ```bash
 AUX_LOSS_TYPE=rnnt
@@ -31,7 +29,7 @@ GRAD_ACC=4
 bash train.sh "0,1,2,3"
 ```
 
-## Infer + WER
+## 推理
 
 ```bash
 bash eval.sh \
@@ -43,4 +41,4 @@ bash eval.sh \
   --gpu_ids 0,1
 ```
 
-Use `--stream` to enable chunk-wise streaming-style decoding.
+加 `--stream` 使用 chunk-wise 流式路径。

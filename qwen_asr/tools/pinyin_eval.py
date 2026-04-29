@@ -266,7 +266,7 @@ def read_refs(ref_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
                     continue
                 parts = line.split("\t")
                 if len(parts) < 2:
-                    print(f"[WARN] 跳过非法参考行 {path}:{line_no}: {line}", file=sys.stderr)
+                    print(f"跳过非法参考行：{path}:{line_no}", file=sys.stderr)
                     continue
                 utt_id = parts[0]
                 if len(parts) == 2:
@@ -301,7 +301,7 @@ def read_hyps_from_results(result_path: str) -> Dict[str, str]:
                 continue
             parts = line.split("\t")
             if len(parts) < 2:
-                print(f"[WARN] 跳过非法识别行 {result_path}:{line_no}: {line}", file=sys.stderr)
+                print(f"跳过非法识别行：{result_path}:{line_no}", file=sys.stderr)
                 continue
             hyps[parts[0]] = parts[1]
     return hyps
@@ -317,7 +317,7 @@ def read_hyps_from_detail(detail_path: str, hyp_field: str) -> Dict[str, str]:
             obj = json.loads(line)
             utt_id = obj.get("utt_id")
             if not utt_id:
-                print(f"[WARN] 跳过无 utt_id 明细行 {detail_path}:{line_no}", file=sys.stderr)
+                print(f"跳过无 utt_id 明细行：{detail_path}:{line_no}", file=sys.stderr)
                 continue
             hyps[utt_id] = str(obj.get(hyp_field) or "")
     return hyps
@@ -405,12 +405,12 @@ def main() -> None:
         )
 
     with open(args.output_path, "w", encoding="utf-8") as f:
-        print(f"ref_path: {args.ref_path}", file=f)
-        print(f"hyp_source: {hyp_source}", file=f)
-        print(f"style: {args.style}", file=f)
-        print(f"keep_non_chinese: {int(args.keep_non_chinese)}", file=f)
-        print(f"matched_utterances: {pair_count}", file=f)
-        print(f"missing_hypotheses: {missing}", file=f)
+        print(f"参考文件: {args.ref_path}", file=f)
+        print(f"识别结果: {hyp_source}", file=f)
+        print(f"拼音风格: {args.style}", file=f)
+        print(f"保留非中文: {int(args.keep_non_chinese)}", file=f)
+        print(f"匹配条数: {pair_count}", file=f)
+        print(f"缺失条数: {missing}", file=f)
         print("", file=f)
 
         for domain, stat in sorted(domain_stats.items()):
@@ -458,11 +458,11 @@ def main() -> None:
                 print("hyp_pinyin: " + " ".join(row["hyp_pinyin"]), file=f)
                 print("", file=f)
 
-    print(f"pinyin summary saved to: {args.output_path}")
+    print(f"拼音汇总：{args.output_path}")
     if args.detail_output_path:
-        print(f"pinyin detail saved to: {args.detail_output_path}")
+        print(f"拼音明细：{args.detail_output_path}")
     if args.badcase_path:
-        print(f"pinyin badcases saved to: {args.badcase_path}")
+        print(f"拼音 badcase：{args.badcase_path}")
 
 
 if __name__ == "__main__":

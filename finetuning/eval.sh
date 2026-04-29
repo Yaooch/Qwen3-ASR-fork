@@ -42,7 +42,7 @@ PROMPT=""
 # PROMPT="你是一个拥有超高精度的语音识别引擎。专属名词列表如下:[孙作为, 宋雪倩, 薛思皓, 应臻奕, 郭震, 户保坤, 岑吴镕, 王瑶池, 淮水竹亭, 白月梵星, 清华池]。请根据音频内容进行识别，当遇到音素类似的词汇时，必须优先匹配列表中的专属名词，而不是通用词汇。"
 HOTWORD_FILE=""
 HOTWORD_TOPK=10
-NO_CTC_IN_PROMPT=0
+NO_AUX_IN_PROMPT=0
 RNNT_MAX_SYMBOLS_PER_STEP=3
 AUX_ENCODER_BATCH_SIZE=5
 STREAM=${STREAM:-1}
@@ -75,7 +75,7 @@ usage() {
     echo "  --prompt              额外提示词，仅 llm / joint 模式有效"
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
-    echo "  --no_ctc_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt"
+    echo "  --no_aux_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt"
     echo "  --rnnt_max_symbols_per_step RNNT 每帧最多吐出的 token 数，调小可加速"
     echo "  --aux_encoder_batch_size CTC/RNNT audio encoder micro-batch，默认 1 最稳"
     echo "  --stream              使用 chunk-wise encoder 流式路径；llm/joint 会拼接 chunk audio embeddings"
@@ -131,8 +131,8 @@ while [[ $# -gt 0 ]]; do
             HOTWORD_TOPK="$2"
             shift 2
             ;;
-        --no_ctc_in_prompt)
-            NO_CTC_IN_PROMPT=1
+        --no_aux_in_prompt)
+            NO_AUX_IN_PROMPT=1
             shift 1
             ;;
         --rnnt_max_symbols_per_step)
@@ -224,8 +224,8 @@ if [[ -n "${HOTWORD_FILE}" ]]; then
     INFER_CMD+=(--hotword_topk "${HOTWORD_TOPK}")
 fi
 
-if [[ "${NO_CTC_IN_PROMPT}" -eq 1 ]]; then
-    INFER_CMD+=(--no_ctc_in_prompt)
+if [[ "${NO_AUX_IN_PROMPT}" -eq 1 ]]; then
+    INFER_CMD+=(--no_aux_in_prompt)
 fi
 
 if [[ "${STREAM}" -eq 1 ]]; then

@@ -1,56 +1,33 @@
-# Agent Notes
+# 开发说明
 
-This fork is a Qwen3-ASR joint CTC/RNNT streaming workspace. Treat it as an
-experimental ASR codebase with production-shaped entry points.
+这是 Qwen3-ASR 的联合 CTC/RNNT 流式实验版。
 
-## Main Goals
-
-- Keep Qwen3-ASR's original inference package usable.
-- Keep joint CTC/RNNT model code under `qwen_asr/joint/`.
-- Keep `finetuning/` as launch and experiment entry scripts only.
-- Avoid adding new debug scripts unless they are temporary and removed before handoff.
-
-## Important Paths
+## 重点路径
 
 ```text
-qwen_asr/joint/model.py       JointASR wrapper and train/infer logic
-qwen_asr/joint/ctc.py         CTC head
-qwen_asr/joint/rnnt.py        RNNT head
-qwen_asr/joint/tokens.py      Aux vocab helpers
-qwen_asr/joint/hotword.py     Hotword retrieval
-qwen_asr/tools/pinyin_eval.py Pinyin-level evaluation
-finetuning/train.py           Training entry
-finetuning/infer.py           Batch inference entry
-finetuning/train.sh           Training launcher
-finetuning/eval.sh            Inference + WER launcher
+qwen_asr/joint/model.py       联合模型
+qwen_asr/joint/ctc.py         CTC 辅助头
+qwen_asr/joint/rnnt.py        RNNT 辅助头
+qwen_asr/joint/tokens.py      词表工具
+qwen_asr/joint/hotword.py     热词召回
+qwen_asr/tools/pinyin_eval.py 拼音评估
+finetuning/train.py           训练入口
+finetuning/infer.py           推理入口
+finetuning/train.sh           训练脚本
+finetuning/eval.sh            推理 + WER
 ```
 
-## Current Design
+## 代码原则
 
-The auxiliary CTC/RNNT heads should attach after the audio encoder final
-`ln_post` and before `proj1/proj2`. Do not reintroduce shell-level
-`CTC_POSITION` or `CTC_LAYER_IDX` switches unless the user explicitly asks for
-historical experiments.
+- `finetuning/` 只放入口脚本，不放核心模型。
+- 核心联合模型放在 `qwen_asr/joint/`。
+- 函数名尽量短，具体逻辑用中文注释说明。
+- 打印输出使用简洁中文。
+- 不再新增历史实验开关。
+- RNNT 解码固定使用 cached greedy。
+- CTC/RNNT 新训练固定接在 `ln_post` 后、`proj1/proj2` 前。
 
-Streaming support is chunk-wise rather than a fully cached encoder:
-
-- CTC/RNNT stream decode uses per-chunk encoder windows.
-- RNNT carries predictor state across chunks.
-- CTC carries previous token id across chunks for collapse.
-- LLM stream mode concatenates chunk audio embeddings and runs final generation once.
-
-## Engineering Rules
-
-- Preserve checkpoint compatibility when practical.
-- Prefer short function names plus clear docstrings over very long names.
-- Keep scripts simple and explicit.
-- Do not restore deleted legacy standalone CTC scripts unless requested.
-- Before deleting files, check whether `finetuning/train.py`, `finetuning/infer.py`,
-  or shell launchers still reference them.
-
-## Validation
-
-After code changes, run:
+## 验证命令
 
 ```bash
 python3 -m py_compile \
