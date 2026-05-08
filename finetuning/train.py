@@ -66,12 +66,56 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return best_path
 
 
-def load_audio(path: str, sr: int = 16000, max_duration: float = 12.0):
+def load_aux_from_model_path(joint_model: Qwen3ASRJointModel, model_path: str, is_main: bool = True) -> bool:
+    """如果 model_path 是 joint checkpoint，就加载已经训练好的辅助头。"""
+    cfg_path = os.path.join(model_path, "ctc_config.json")
+    if not os.path.exists(cfg_path):
+        return False
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    ckpt_aux_type = cfg.get("aux_loss_type", "ctc")
+    cur_aux_type = getattr(joint_model, "aux_loss_type", "ctc")
+    if ckpt_aux_type != cur_aux_type:
+        raise ValueError(
+            f"MODEL_PATH 是 {ckpt_aux_type.upper()} checkpoint，"
+            f"但当前 --aux_loss_type={cur_aux_type}。请保持一致。"
+        )
+
+    ckpt_vocab_size = cfg.get("vocab_size")
+    if ckpt_vocab_size is not None and ckpt_vocab_size != joint_model.vocab_size:
+        raise ValueError(
+            f"MODEL_PATH 辅助头词表大小={ckpt_vocab_size}，"
+            f"当前词表大小={joint_model.vocab_size}。请使用同一份 vocab。"
+        )
+
+    if cur_aux_type == "rnnt":
+        aux_name, module = "rnnt_head.pt", joint_model.rnnt
+    else:
+        aux_name, module = "ctc_head.pt", joint_model.ctc
+
+    aux_path = os.path.join(model_path, aux_name)
+    if not os.path.exists(aux_path):
+        raise FileNotFoundError(f"MODEL_PATH 是 joint checkpoint，但未找到辅助头：{aux_path}")
+
+    missing, unexpected = module.load_state_dict(torch.load(aux_path, map_location="cpu"), strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"辅助头结构和 checkpoint 不一致：missing={missing}, unexpected={unexpected}"
+        )
+
+    if is_main:
+        print(f"已从 MODEL_PATH 加载辅助头：{aux_path}")
+    return True
+
+
+def load_audio(path: str, sr: int = 16000, max_duration: float = 20.0):
     try:
         wav, _ = librosa.load(path, sr=sr, mono=True)
         duration = len(wav) / sr
         if duration > max_duration:
-            print(f"音频过长，跳过：{path}")
+            print(f"音频{duration}s过长，跳过：{path}")
             return None
         return wav
     except Exception as e:
@@ -207,6 +251,8 @@ class JointTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.ctc_lr = ctc_lr
         self.qwen_lr = qwen_lr
+        self._loss_log_sums = {}
+        self._loss_log_count = 0
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -226,15 +272,16 @@ class JointTrainer(Trainer):
                 or name.startswith("module.rnnt.")
             )
             lr = self.ctc_lr if is_aux_head else self.qwen_lr
+            group_name = "aux" if is_aux_head else "qwen"
             weight_decay = self.args.weight_decay if name in decay_parameters else 0.0
 
             for group in optimizer_grouped_parameters:
-                if group["lr"] == lr and group["weight_decay"] == weight_decay:
+                if group["name"] == group_name and group["lr"] == lr and group["weight_decay"] == weight_decay:
                     group["params"].append(param)
                     break
             else:
                 optimizer_grouped_parameters.append(
-                    {"params": [param], "lr": lr, "weight_decay": weight_decay}
+                    {"params": [param], "lr": lr, "weight_decay": weight_decay, "name": group_name}
                 )
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
@@ -244,6 +291,64 @@ class JointTrainer(Trainer):
         if self.args.process_index == 0:
             print(f"学习率：Qwen={self.qwen_lr}，Aux={self.ctc_lr}")
         return self.optimizer
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if isinstance(outputs, dict) and model.training:
+            self._loss_log_sums["loss"] = self._loss_log_sums.get("loss", 0.0) + float(
+                loss.detach().float().item()
+            )
+            for key in ("llm_loss", "ctc_loss", "rnnt_loss"):
+                value = outputs.get(key)
+                if torch.is_tensor(value):
+                    self._loss_log_sums[key] = self._loss_log_sums.get(key, 0.0) + float(
+                        value.detach().float().item()
+                    )
+            self._loss_log_count += 1
+
+        return (loss, outputs) if return_outputs else loss
+
+    def _group_lr(self, name: str):
+        if self.optimizer is None:
+            return None
+        for group in self.optimizer.param_groups:
+            if group.get("name") == name:
+                return group["lr"]
+        return None
+
+    def log(self, logs, *args, **kwargs):
+        if self._loss_log_count > 0 and "loss" in logs:
+            avg_logs = {
+                key: value / self._loss_log_count
+                for key, value in self._loss_log_sums.items()
+            }
+            ordered_logs = {}
+            for key in ("loss", "llm_loss", "ctc_loss", "rnnt_loss"):
+                if key in avg_logs:
+                    ordered_logs[key] = avg_logs[key]
+                elif key in logs:
+                    ordered_logs[key] = logs[key]
+
+            if "grad_norm" in logs:
+                ordered_logs["grad_norm"] = logs["grad_norm"]
+
+            qwen_lr = self._group_lr("qwen")
+            aux_lr = self._group_lr("aux")
+            if qwen_lr is not None:
+                ordered_logs["qwen_lr"] = qwen_lr
+            if aux_lr is not None:
+                ordered_logs["aux_lr"] = aux_lr
+
+            for key, value in logs.items():
+                if key not in ordered_logs and key != "learning_rate":
+                    ordered_logs[key] = value
+            logs = ordered_logs
+            self._loss_log_sums = {}
+            self._loss_log_count = 0
+
+        return super().log(logs, *args, **kwargs)
 
     def _prepare_inputs(self, inputs):
         if inputs is None:
@@ -317,6 +422,7 @@ class JointTrainer(Trainer):
 
         self._load_qwen_base_weights(base_model.qwen_model, resume_from_checkpoint)
         self._load_aux_weights(base_model, resume_from_checkpoint)
+        sync_audio_window_config(base_model.qwen_model)
 
         if hasattr(base_model.qwen_model, "tie_weights"):
             base_model.qwen_model.tie_weights()
@@ -366,6 +472,7 @@ class JointTrainer(Trainer):
         os.makedirs(output_dir, exist_ok=True)
 
         base_model = self.model.module if hasattr(self.model, "module") else self.model
+        sync_audio_window_config(base_model.qwen_model)
         base_model.qwen_model.save_pretrained(output_dir, safe_serialization=True)
         base_model.save_aux(output_dir)
 
@@ -420,6 +527,28 @@ def enable_aux_only_training(joint_model: Qwen3ASRJointModel) -> None:
         param.requires_grad = True
 
 
+def sync_audio_window_config(qwen_model, n_window: Optional[int] = None, n_window_infer: Optional[int] = None):
+    """同步 audio tower 的运行参数和保存用 config。"""
+    audio_tower = qwen_model.thinker.audio_tower
+    audio_config = qwen_model.config.thinker_config.audio_config
+
+    if n_window is not None and n_window > 0:
+        audio_tower.n_window = n_window
+        audio_tower.config.n_window = n_window
+        audio_config.n_window = n_window
+
+    if n_window_infer is not None and n_window_infer > 0:
+        audio_tower.n_window_infer = n_window_infer
+        audio_tower.config.n_window_infer = n_window_infer
+        audio_config.n_window_infer = n_window_infer
+
+    audio_tower.config.n_window = audio_tower.n_window
+    audio_tower.config.n_window_infer = audio_tower.n_window_infer
+    audio_config.n_window = audio_tower.n_window
+    audio_config.n_window_infer = audio_tower.n_window_infer
+    return audio_tower
+
+
 def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR Joint Finetuning")
 
@@ -439,6 +568,8 @@ def parse_args():
     p.add_argument("--aux_stream_right_context_frames", type=int, default=7, help="流式 aux 训练右上下文，7 约等于 70ms")
     p.add_argument("--aux_stream_random_left", type=int, default=1, help="是否随机采样左上下文长度；0 表示总是使用最大左上下文")
     p.add_argument("--aux_stream_window_batch_size", type=int, default=4, help="流式 aux 训练时一次送入 encoder 的窗口数量")
+    p.add_argument("--audio_n_window", type=int, default=0, help="Qwen audio encoder conv 前切块参数；0 表示沿用 checkpoint")
+    p.add_argument("--audio_n_window_infer", type=int, default=0, help="Qwen audio encoder attention block 参数；0 表示沿用 checkpoint")
     p.add_argument("--vocab_path", type=str, default="")
     p.add_argument("--sp_model_path", type=str, default=None)
 
@@ -477,6 +608,9 @@ def load_vocab(vocab_path: str):
 
 def main():
     args_cli = parse_args()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main = local_rank == 0
+
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required.")
     if not args_cli.vocab_path:
@@ -487,19 +621,21 @@ def main():
     import sentencepiece as spm
     from accelerate import PartialState
 
-    print(f"加载 SentencePiece：{args_cli.sp_model_path}")
+    if is_main:
+        print(f"加载 SentencePiece：{args_cli.sp_model_path}")
     sp_model = spm.SentencePieceProcessor()
     sp_model.load(args_cli.sp_model_path)
 
-    print(f"加载词表：{args_cli.vocab_path}")
+    if is_main:
+        print(f"加载词表：{args_cli.vocab_path}")
     vocab = load_vocab(args_cli.vocab_path)
     assert vocab.get("<blank>") == 0, "vocab must have <blank>: 0"
     assert vocab.get("<unk>") == 1, "vocab must have <unk>: 1"
-    print(f"词表大小：{len(vocab)}")
+    if is_main:
+        print(f"词表大小：{len(vocab)}")
 
     os.makedirs(args_cli.output_dir, exist_ok=True)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if local_rank == 0:
+    if is_main:
         with open(os.path.join(args_cli.output_dir, "ctc_vocab.json"), "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args_cli.output_dir, "sp_model_config.json"), "w", encoding="utf-8") as f:
@@ -517,6 +653,19 @@ def main():
     qwen_model = asr_wrapper.model
     processor = asr_wrapper.processor
 
+    audio_tower = sync_audio_window_config(
+        qwen_model,
+        n_window=args_cli.audio_n_window if args_cli.audio_n_window > 0 else None,
+        n_window_infer=args_cli.audio_n_window_infer if args_cli.audio_n_window_infer > 0 else None,
+    )
+
+    if audio_tower.n_window_infer < audio_tower.n_window * 2:
+        raise ValueError("audio_n_window_infer 必须 >= audio_n_window * 2")
+    if is_main:
+        print(f"Audio 窗口：n_window={audio_tower.n_window}，n_window_infer={audio_tower.n_window_infer}")
+        if audio_tower.n_window_infer % (audio_tower.n_window * 2) != 0:
+            print("注意：n_window_infer 不是 n_window*2 的整数倍，实际 block 会向下取整。")
+
     patch_outer_forward(qwen_model)
     qwen_model.generation_config = GenerationConfig.from_model_config(qwen_model.config)
     if hasattr(qwen_model, "gradient_checkpointing_enable"):
@@ -528,7 +677,8 @@ def main():
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
         except TypeError:
-            print("当前 transformers 不支持非重入 checkpoint，建议关闭 gradient checkpoint。")
+            if is_main:
+                print("当前 transformers 不支持非重入 checkpoint，建议关闭 gradient checkpoint。")
 
     joint_model = Qwen3ASRJointModel(
         qwen_model=qwen_model,
@@ -546,6 +696,7 @@ def main():
         aux_stream_random_left=(args_cli.aux_stream_random_left == 1),
         aux_stream_window_batch_size=args_cli.aux_stream_window_batch_size,
     )
+    load_aux_from_model_path(joint_model, args_cli.model_path, is_main=is_main)
 
     if args_cli.aux_only == 1:
         enable_aux_only_training(joint_model)

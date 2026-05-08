@@ -115,6 +115,16 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             cfg = json.load(f)
 
         aux_loss_type = cfg.get("aux_loss_type", "ctc")
+        audio_tower = base.model.thinker.audio_tower
+        audio_config = base.model.config.thinker_config.audio_config
+        if cfg.get("audio_n_window", 0) > 0:
+            audio_tower.n_window = cfg["audio_n_window"]
+            audio_tower.config.n_window = cfg["audio_n_window"]
+            audio_config.n_window = cfg["audio_n_window"]
+        if cfg.get("audio_n_window_infer", 0) > 0:
+            audio_tower.n_window_infer = cfg["audio_n_window_infer"]
+            audio_tower.config.n_window_infer = cfg["audio_n_window_infer"]
+            audio_config.n_window_infer = cfg["audio_n_window_infer"]
 
         instance = cls(
             qwen_model=base.model,
@@ -186,8 +196,13 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             "aux_stream_right_context_frames": self.aux_stream_right_context_frames,
             "aux_stream_random_left": self.aux_stream_random_left,
             "aux_stream_window_batch_size": self.aux_stream_window_batch_size,
+            "audio_n_window": self.qwen_model.thinker.audio_tower.n_window,
+            "audio_n_window_infer": self.qwen_model.thinker.audio_tower.n_window_infer,
             "vocab": self.vocab,
         }
+        if self.aux_loss_type == "ctc":
+            cfg["ctc_dropout"] = self.ctc.dropout
+            cfg["ctc_bottleneck_dim"] = self.ctc.bottleneck_dim
         with open(os.path.join(output_dir, "ctc_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 

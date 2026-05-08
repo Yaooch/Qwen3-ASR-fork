@@ -8,6 +8,7 @@ from typing import Dict, List
 import torch
 from datetime import datetime
 
+from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
 
 def log(msg: str):
@@ -61,6 +62,12 @@ def parse_args():
     # hotword 仅 joint 模式可用
     parser.add_argument("--hotword_file", default=None, help="热词文件，每行一个热词")
     parser.add_argument("--hotword_topk", type=int, default=10, help="召回热词数量")
+    parser.add_argument(
+        "--hotword_pinyin_style",
+        choices=["normal", "tone3"],
+        default="normal",
+        help="热词拼音召回风格：normal 不带调，tone3 数字声调",
+    )
     parser.add_argument(
         "--no_aux_in_prompt",
         action="store_true",
@@ -174,7 +181,10 @@ def make_hotword_retriever(args):
         return None
 
     from qwen_asr.joint import HotwordRetriever
-    return HotwordRetriever.from_file(args.hotword_file)
+    return HotwordRetriever.from_file(
+        args.hotword_file,
+        pinyin_style=args.hotword_pinyin_style,
+    )
 
 def extract_text_and_language(output):
     """从模型输出里尽量提取 text 和 language。
@@ -265,6 +275,11 @@ def normalize_batch_outputs(outputs, batch_size: int):
     return [outputs]
 
 
+def is_joint_checkpoint(model_path: str) -> bool:
+    """判断是否为带 CTC/RNNT 辅助头的联合 checkpoint。"""
+    return os.path.exists(os.path.join(model_path, "ctc_config.json"))
+
+
 def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
     """对一个 batch 执行推理，并返回结构化结果。"""
     audios = [x["audio"] for x in batch]
@@ -306,23 +321,32 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                 aux_encoder_batch_size=args.aux_encoder_batch_size,
             )
     elif args.mode == "llm":
-        if args.stream:
-            raw_outputs = model.transcribe_llm_streaming(
-                audios,
-                language=languages,
-                context=args.prompt,
-                chunk_sec=args.stream_chunk_sec,
-                left_context_sec=args.stream_left_context_sec,
-                right_context_sec=args.stream_right_context_sec,
-                first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
-                window_batch_size=args.stream_window_batch_size,
-                window_encoder_batch_size=args.stream_window_encoder_batch_size,
-            )
+        if hasattr(model, "transcribe_llm"):
+            if args.stream:
+                raw_outputs = model.transcribe_llm_streaming(
+                    audios,
+                    language=languages,
+                    context=args.prompt,
+                    chunk_sec=args.stream_chunk_sec,
+                    left_context_sec=args.stream_left_context_sec,
+                    right_context_sec=args.stream_right_context_sec,
+                    first_chunk_left_pad_sec=args.stream_first_chunk_left_pad_sec,
+                    window_batch_size=args.stream_window_batch_size,
+                    window_encoder_batch_size=args.stream_window_encoder_batch_size,
+                )
+            else:
+                raw_outputs = model.transcribe_llm(
+                    audios,
+                    language=languages,
+                    context=args.prompt,
+                )
         else:
-            raw_outputs = model.transcribe_llm(
+            if args.stream:
+                raise RuntimeError("原始 Qwen3-ASR 模型暂不支持当前脚本的 --stream llm 推理。")
+            raw_outputs = model.transcribe(
                 audios,
                 language=languages,
-                context=args.prompt,
+                context=args.prompt or "",
             )
     else:
         raw_outputs = model.transcribe_joint(
@@ -444,13 +468,32 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
     log(f"进程{rank}加载模型")
-    model = Qwen3ASRJointModel.from_pretrained(
-        args.ckpt,
-        dtype=dtype,
-        device_map=None,
-    )
-    model = model.to(device)
-    model.eval()
+    if is_joint_checkpoint(args.ckpt):
+        model = Qwen3ASRJointModel.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+        )
+        model = model.to(device)
+        model.eval()
+    else:
+        if args.mode != "llm":
+            raise RuntimeError(
+                "当前模型目录不是联合 checkpoint，缺少 ctc_config.json。"
+                "原始 Qwen3-ASR 只支持 --mode llm；ctc/rnnt/joint 需要训练后的联合模型。"
+            )
+        if args.stream:
+            raise RuntimeError("原始 Qwen3-ASR 模型暂不支持当前脚本的 --stream llm 推理。")
+
+        model = Qwen3ASRModel.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            max_inference_batch_size=args.batch_size,
+        )
+        model.model = model.model.to(device)
+        model.model.eval()
+        model.device = torch.device(device)
     log(f"进程{rank}模型加载完成")
 
     aux_loss_type = getattr(model, "aux_loss_type", None)

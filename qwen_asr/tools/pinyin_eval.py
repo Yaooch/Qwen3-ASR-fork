@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep_non_chinese",
         action="store_true",
-        help="Keep ASCII words/digits as tokens. Default only evaluates Chinese pinyin tokens.",
+        help="Keep ASCII words/digits as tokens. Pure non-Chinese text keeps ASCII tokens automatically.",
     )
     parser.add_argument(
         "--topk_badcases",
@@ -170,12 +170,13 @@ def text_to_tokens(
     text = normalize_text(text, case_sensitive=case_sensitive)
     tokens: List[str] = []
     ascii_buf: List[str] = []
+    keep_ascii = keep_non_chinese or not any(is_chinese_char(ch) for ch in text)
 
     def flush_ascii() -> None:
         if not ascii_buf:
             return
         chunk = "".join(ascii_buf)
-        if keep_non_chinese and ASCII_WORD_RE.fullmatch(chunk):
+        if keep_ascii and ASCII_WORD_RE.fullmatch(chunk):
             tokens.append(chunk)
         ascii_buf.clear()
 
@@ -264,8 +265,13 @@ def read_refs(ref_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
                 line = line.rstrip("\n")
                 if not line.strip():
                     continue
-                parts = line.split("\t")
-                if len(parts) < 2:
+                tab_parts = line.split("\t")
+                ws_parts = line.split(maxsplit=1)
+                if len(tab_parts) >= 2:
+                    parts = tab_parts
+                elif len(ws_parts) >= 2:
+                    parts = ws_parts
+                else:
                     print(f"跳过非法参考行：{path}:{line_no}", file=sys.stderr)
                     continue
                 utt_id = parts[0]

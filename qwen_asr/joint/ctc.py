@@ -5,35 +5,27 @@ import torch.nn.functional as F
 
 
 class CTCAdapter(nn.Module):
-    """给 CTC 分支使用的小型残差适配层。
+    """CTC 分支的轻量残差适配层。
 
-    设计目的：
-    - 尽量不强行改动共享 encoder 的表示空间
-    - 让 CTC 分支自己学习一小段“表征修正”
-    - 比纯线性头更有表达能力，但参数量仍然可控
-
-    结构：
-        x -> Linear -> SiLU -> Dropout -> Linear
-        -> Residual Add -> LayerNorm
+    输入已经过 audio tower 的 ln_post，这里不再做时序卷积，避免流式
+    chunk 边界引入补零伪影。MLP 只负责把共享特征轻量转到 CTC 空间。
     """
 
-    def __init__(self, dim: int, dropout: float = 0.1):
+    def __init__(self, dim: int, dropout: float = 0.1, hidden_mult: int = 2):
         super().__init__()
-        self.fc1 = nn.Linear(dim, dim)
-        self.act = nn.SiLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(dim, dim)
+        hidden_dim = dim * hidden_mult
         self.norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+        self.scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = x + residual
-        x = self.norm(x)
-        return x
+        return x + self.scale * self.ffn(self.norm(x))
 
 
 class CTC(nn.Module):
@@ -58,10 +50,17 @@ class CTC(nn.Module):
         encoder_output_size: int,
         blank_id: int = 0,
         dropout: float = 0.1,
+        bottleneck_dim: int = 1024,
     ):
         super().__init__()
+        self.dropout = dropout
+        self.bottleneck_dim = bottleneck_dim
         self.adapter = CTCAdapter(encoder_output_size, dropout=dropout)
-        self.ctc_lo = nn.Linear(encoder_output_size, odim)
+        self.ctc_lo = nn.Sequential(
+            nn.Linear(encoder_output_size, bottleneck_dim),
+            nn.SiLU(),
+            nn.Linear(bottleneck_dim, odim),
+        )
         self.blank_id = blank_id
         self.ctc_loss = nn.CTCLoss(blank=blank_id, zero_infinity=True)
 
