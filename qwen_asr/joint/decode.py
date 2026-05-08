@@ -307,6 +307,41 @@ class DecodeMixin:
 
         return {"text": str(obj), "language": None}
 
+    def _waveforms(self, audios):
+        """读取音频为 16k mono waveform。"""
+        import librosa
+        import numpy as np
+
+        waveform_list = []
+        for item in audios:
+            if isinstance(item, str):
+                waveform_list.append(librosa.load(item, sr=16000, mono=True)[0].astype(np.float32, copy=False))
+            elif isinstance(item, np.ndarray):
+                waveform_list.append(item.astype(np.float32, copy=False))
+            else:
+                raise TypeError(f"不支持的音频项类型：{type(item)}")
+        return waveform_list
+
+    def _decode_aux_hs(
+        self,
+        hs_pad: torch.Tensor,
+        out_lens: torch.Tensor,
+        max_symbols_per_step: int = 5,
+    ) -> List[str]:
+        """从已编码的 aux 特征解出 CTC/RNNT 文本。"""
+        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
+        if self.aux_loss_type == "ctc":
+            pred_ids_batch = self.ctc.greedy_decode(hs_pad, out_lens)
+        elif self.aux_loss_type == "rnnt":
+            pred_ids_batch = self.rnnt.greedy_decode(
+                hs_pad,
+                out_lens,
+                max_symbols_per_step=max_symbols_per_step,
+            )
+        else:
+            raise ValueError(f"不支持的 aux_loss_type: {self.aux_loss_type}")
+        return [ids_to_text(ids, self._id_to_token) for ids in pred_ids_batch]
+
     def _norm_outputs(self, outputs, batch_size: int):
         if isinstance(outputs, list):
             if len(outputs) == batch_size:
@@ -535,7 +570,7 @@ class DecodeMixin:
         prompt: Optional[str] = None,
         hotword_retriever=None,
         hotword_topk: int = 10,
-        inject_aux_into_prompt: bool = True,
+        inject_aux_into_prompt: bool = False,
         aux_max_symbols_per_step: int = 5,
         aux_encoder_batch_size: int = 1,
         stream_aux: bool = False,
@@ -558,34 +593,59 @@ class DecodeMixin:
         else:
             languages = language
 
-        if stream_aux and self.aux_loss_type in ("ctc", "rnnt"):
-            if self.aux_loss_type == "rnnt":
-                aux_texts = self._rnnt_stream(
-                    audios,
-                    max_symbols_per_step=aux_max_symbols_per_step,
+        if stream_aux:
+            waveform_list = self._waveforms(audios)
+            feature_len_cache: Dict[int, int] = {}
+            aux_texts = []
+            audio_features_list = []
+            for wav in waveform_list:
+                aux_chunks, llm_features = self._stream_joint_feats(
+                    wav,
                     chunk_sec=stream_chunk_sec,
                     left_context_sec=stream_left_context_sec,
                     right_context_sec=stream_right_context_sec,
                     first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
                     window_batch_size=stream_window_batch_size,
                     window_encoder_batch_size=stream_window_encoder_batch_size,
+                    feature_len_cache=feature_len_cache,
                 )
-            else:
-                aux_texts = self._ctc_stream(
-                    audios,
-                    chunk_sec=stream_chunk_sec,
-                    left_context_sec=stream_left_context_sec,
-                    right_context_sec=stream_right_context_sec,
-                    first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
-                    window_batch_size=stream_window_batch_size,
-                    window_encoder_batch_size=stream_window_encoder_batch_size,
-                )
+                if self.aux_loss_type == "rnnt":
+                    ids = self._rnnt_stream_decode(
+                        aux_chunks,
+                        max_symbols_per_step=aux_max_symbols_per_step,
+                    )
+                elif self.aux_loss_type == "ctc":
+                    ids = self._ctc_stream_decode(aux_chunks)
+                else:
+                    raise ValueError(f"不支持的 aux_loss_type: {self.aux_loss_type}")
+                aux_texts.append(ids_to_text(ids, self._id_to_token))
+                audio_features_list.append(llm_features)
         else:
-            aux_texts = self._aux_decode(
-                audios,
-                max_symbols_per_step=aux_max_symbols_per_step,
-                aux_encoder_batch_size=aux_encoder_batch_size,
+            waveform_list = self._waveforms(audios)
+            ref = next(self.qwen_model.parameters())
+            batch = self._feature_batch(waveform_list)
+            input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+            feature_attention_mask = batch.get("feature_attention_mask", None)
+            if feature_attention_mask is not None:
+                feature_attention_mask = feature_attention_mask.to(device=ref.device)
+
+            hs_pad, llm_features, out_lens, _ = self._enc_joint(
+                input_features,
+                feature_attention_mask,
+                need_llm_features=True,
+                encoder_batch_size=aux_encoder_batch_size,
             )
+            aux_texts = self._decode_aux_hs(
+                hs_pad,
+                out_lens,
+                max_symbols_per_step=aux_max_symbols_per_step,
+            )
+            audio_features_list = []
+            offset = 0
+            for length in out_lens.tolist():
+                cur_len = int(length)
+                audio_features_list.append(llm_features[offset: offset + cur_len])
+                offset += cur_len
 
         contexts = []
         hotwords_list = []
@@ -600,36 +660,26 @@ class DecodeMixin:
             contexts.append(context)
             hotwords_list.append(hotwords)
 
-        if stream_aux:
-            raw_outputs = self.transcribe_llm_streaming(
-                audios,
-                language=languages,
-                context=contexts,
-                chunk_sec=stream_chunk_sec,
-                left_context_sec=stream_left_context_sec,
-                right_context_sec=stream_right_context_sec,
-                first_chunk_left_pad_sec=stream_first_chunk_left_pad_sec,
-                window_batch_size=stream_window_batch_size,
-                window_encoder_batch_size=stream_window_encoder_batch_size,
-                max_new_tokens=kwargs.pop("max_new_tokens", None),
-            )
-        else:
-            raw_outputs = self._asr_wrapper.transcribe(
-                audios,
-                language=languages,
-                context=contexts,
-                **kwargs,
-            )
-            raw_outputs = self._norm_outputs(raw_outputs, len(audios))
+        raw_outputs = self._gen_llm_feats(
+            audio_features_list,
+            contexts=contexts,
+            languages=languages,
+            max_new_tokens=kwargs.pop("max_new_tokens", None),
+        )
+        raw_outputs = self._norm_outputs(raw_outputs, len(audios))
 
         results = []
         for raw_out, lang, aux_text, hotwords, context in zip(
             raw_outputs, languages, aux_texts, hotwords_list, contexts
         ):
             fields = self._asr_fields(raw_out)
+            aux_key = "ctc_text" if self.aux_loss_type == "ctc" else "rnnt_text"
             results.append({
+                aux_key: aux_text,
+                "aux_text": aux_text,
                 "aux_stream_text": aux_text,
                 "llm_refined_text": fields["text"],
+                "llm_text": fields["text"],
                 "text": fields["text"],
                 "language": fields["language"] or lang,
                 "hotwords": hotwords,

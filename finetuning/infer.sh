@@ -11,10 +11,20 @@ cd "${SCRIPT_DIR}"
 #
 # 功能：
 # 1. 调用 infer.py 做推理
-# 2. 输出 results.txt 和 results_detail.jsonl
+# 2. 输出 results_ctc.txt / results_rnnt.txt / results_llm.txt 和 details/results_detail.jsonl
 # 3. 按 stage 调用 compute_asr_wer_with_slu.py 计算 WER
 # 4. 按 stage 调用 qwen_asr.tools.pinyin_eval 计算拼音相似度
 # --------------------------------------------------
+
+# 1、/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow(普通话回流测试集， 识别加语种)
+# 2、/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/{wav.scp,text} (回流粤语测试集，识别加语种)
+# 3、/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/{wav2.scp, text2} (回流四川测试集，识别加语种)
+# 4、 /cfs/data/private/hubk/aishell_shard/chinese_test/{wav.scp,text}  (开源普通话测试集，识别加语种)
+# 5、/cfs/data/private/hubk/asr_data/wenetspeech_yue/{2000.scp,2000.txt} （开源粤语测试集，识别加语种）
+# 6、/cfs/data/private/hubk/asr_data/wenetspeech_sichuan/{10000.scp,10000.txt} (开源四川话测试集，识别加语种)
+# 7、/cfs/data/private/hubk/asr_test_set/POI_ENTITY/{wav.scp,text}  (导航实体测试集，识别)
+# 8、/cfs/data/private/hubk/asr_test_set/MEDIA_ENTITY/{wav.scp,text}  （媒体实体测试集，识别）
+# 9、开放领域，测试集调研3个测试集(新闻、娱乐、美食、体育、军事、科技、汽车、法律、医疗、教育等)，摸一下开放领域效果(识别)
 
 # 测试集:
 # 川语:
@@ -42,11 +52,11 @@ cd "${SCRIPT_DIR}"
 
 CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
 # CKPT="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
-STAGE="wer,pinyin"
+STAGE="all"
 MODE="ctc"
-INPUT_SCP="/cfs/data/private/hubk/aishell_shard/chinese_test/wav.scp"
-REF_DIR="/cfs/data/private/hubk/aishell_shard/chinese_test/text"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14/aishell/stream_64_132"
+INPUT_SCP="/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav2.scp"
+REF_DIR="/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text2"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14/chuan/stream_64_132"
 GPU_IDS="0,1,2,3,4,5,6,7"
 BATCH_SIZE=128
 DTYPE="bf16"
@@ -57,7 +67,8 @@ PROMPT=""
 HOTWORD_FILE=""
 HOTWORD_TOPK=10
 HOTWORD_PINYIN_STYLE="normal"
-NO_AUX_IN_PROMPT=0
+NO_AUX_IN_PROMPT=1
+AUX_IN_PROMPT=0
 RNNT_MAX_SYMBOLS_PER_STEP=3
 AUX_ENCODER_BATCH_SIZE=5
 STREAM=${STREAM:-1}
@@ -69,11 +80,12 @@ STREAM_WINDOW_BATCH_SIZE=${STREAM_WINDOW_BATCH_SIZE:-16}
 STREAM_WINDOW_ENCODER_BATCH_SIZE=${STREAM_WINDOW_ENCODER_BATCH_SIZE:-4}
 
 WER_SCRIPT="/root/scripts/compute_asr_wer_with_slu.py"
+DETAILS_DIR="${OUTPUT_DIR}/details"
 DOMAIN_PROMPT_FILE="${OUTPUT_DIR}/domain.txt"
-WER_TXT_PATH="${OUTPUT_DIR}/wer.txt"
+WER_TXT_PATH="${DETAILS_DIR}/wer.txt"
 PINYIN_OUTPUT_PATH="${OUTPUT_DIR}/pinyin_similarity.txt"
-PINYIN_DETAIL_PATH="${OUTPUT_DIR}/pinyin_detail.jsonl"
-PINYIN_BADCASE_PATH="${OUTPUT_DIR}/pinyin_badcases.txt"
+PINYIN_DETAIL_PATH="${DETAILS_DIR}/pinyin_detail.jsonl"
+PINYIN_BADCASE_PATH="${DETAILS_DIR}/pinyin_badcases.txt"
 PINYIN_STYLE="tone3"
 PINYIN_KEEP_NON_CHINESE=0
 PINYIN_TOPK_BADCASES=100
@@ -110,7 +122,8 @@ usage() {
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
-    echo "  --no_aux_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt"
+    echo "  --no_aux_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt，默认开启"
+    echo "  --aux_in_prompt       joint 模式下把 CTC/RNNT 结果注入 prompt"
     echo "  --rnnt_max_symbols_per_step RNNT 每帧最多吐出的 token 数，调小可加速"
     echo "  --aux_encoder_batch_size CTC/RNNT audio encoder micro-batch，默认 1 最稳"
     echo "  --stream              使用 chunk-wise encoder 流式路径；llm/joint 会拼接 chunk audio embeddings"
@@ -192,6 +205,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no_aux_in_prompt)
             NO_AUX_IN_PROMPT=1
+            AUX_IN_PROMPT=0
+            shift 1
+            ;;
+        --aux_in_prompt)
+            AUX_IN_PROMPT=1
+            NO_AUX_IN_PROMPT=0
             shift 1
             ;;
         --rnnt_max_symbols_per_step)
@@ -286,7 +305,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-WER_TXT_PATH="${OUTPUT_DIR}/wer.txt"
+DETAILS_DIR="${OUTPUT_DIR}/details"
+WER_TXT_PATH="${DETAILS_DIR}/wer.txt"
 if [[ "${DOMAIN_PROMPT_FILE_SET}" -eq 0 ]]; then
     DOMAIN_PROMPT_FILE="${OUTPUT_DIR}/domain.txt"
 fi
@@ -294,10 +314,10 @@ if [[ "${PINYIN_OUTPUT_PATH_SET}" -eq 0 ]]; then
     PINYIN_OUTPUT_PATH="${OUTPUT_DIR}/pinyin_similarity.txt"
 fi
 if [[ "${PINYIN_DETAIL_PATH_SET}" -eq 0 ]]; then
-    PINYIN_DETAIL_PATH="${OUTPUT_DIR}/pinyin_detail.jsonl"
+    PINYIN_DETAIL_PATH="${DETAILS_DIR}/pinyin_detail.jsonl"
 fi
 if [[ "${PINYIN_BADCASE_PATH_SET}" -eq 0 ]]; then
-    PINYIN_BADCASE_PATH="${OUTPUT_DIR}/pinyin_badcases.txt"
+    PINYIN_BADCASE_PATH="${DETAILS_DIR}/pinyin_badcases.txt"
 fi
 
 RUN_INFER=0
@@ -368,7 +388,7 @@ if [[ "${RUN_WER}" -eq 1 && -z "${DOMAIN_PROMPT_FILE}" ]]; then
     exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${DETAILS_DIR}"
 
 INFER_CMD=(
     "${PYTHON_BIN}" infer.py
@@ -406,12 +426,26 @@ fi
 if [[ "${NO_AUX_IN_PROMPT}" -eq 1 ]]; then
     INFER_CMD+=(--no_aux_in_prompt)
 fi
+if [[ "${AUX_IN_PROMPT}" -eq 1 ]]; then
+    INFER_CMD+=(--aux_in_prompt)
+fi
 
 if [[ "${STREAM}" -eq 1 ]]; then
     INFER_CMD+=(--stream)
 fi
 
-RESULT_PATH="${OUTPUT_DIR}/results.txt"
+collect_result_targets() {
+    RESULT_TARGETS=()
+    if [[ -f "${OUTPUT_DIR}/results_ctc.txt" ]]; then
+        RESULT_TARGETS+=("ctc:${OUTPUT_DIR}/results_ctc.txt")
+    fi
+    if [[ -f "${OUTPUT_DIR}/results_rnnt.txt" ]]; then
+        RESULT_TARGETS+=("rnnt:${OUTPUT_DIR}/results_rnnt.txt")
+    fi
+    if [[ -f "${OUTPUT_DIR}/results_llm.txt" ]]; then
+        RESULT_TARGETS+=("llm:${OUTPUT_DIR}/results_llm.txt")
+    fi
+}
 
 if [[ "${RUN_INFER}" -eq 1 ]]; then
     echo "============================================================"
@@ -437,10 +471,12 @@ if [[ "${RUN_INFER}" -eq 1 ]]; then
     "${INFER_CMD[@]}"
 fi
 
+collect_result_targets
+
 if [[ "${RUN_WER}" -eq 1 || "${RUN_PINYIN}" -eq 1 ]]; then
-if [[ ! -f "${RESULT_PATH}" ]]; then
-    echo "错误：未找到推理结果文件 ${RESULT_PATH}"
-    echo "如果只跑评测，请先确认 output_dir 下已有 results.txt，或使用 --stage infer,wer"
+if [[ "${#RESULT_TARGETS[@]}" -eq 0 ]]; then
+    echo "错误：未找到推理结果文件 ${OUTPUT_DIR}/results_ctc.txt、results_rnnt.txt 或 results_llm.txt"
+    echo "如果只跑评测，请先确认 output_dir 下已有 results_*.txt，或使用 --stage infer,wer"
     exit 1
 fi
 fi
@@ -450,13 +486,20 @@ echo "============================================================"
 echo "开始计算 WER"
 echo "============================================================"
 
-"${PYTHON_BIN}" "${WER_SCRIPT}" \
-    --char=1 \
-    --v=1 \
-    "${REF_DIR}" \
-    "${RESULT_PATH}" \
-    "${DOMAIN_PROMPT_FILE}" \
-    > "${WER_TXT_PATH}"
+for target in "${RESULT_TARGETS[@]}"; do
+    suffix="${target%%:*}"
+    result_path="${target#*:}"
+    domain_path="${OUTPUT_DIR}/domain_${suffix}.txt"
+    wer_path="${DETAILS_DIR}/wer_${suffix}.txt"
+    echo "WER[${suffix}]: ${result_path}"
+    "${PYTHON_BIN}" "${WER_SCRIPT}" \
+        --char=1 \
+        --v=1 \
+        "${REF_DIR}" \
+        "${result_path}" \
+        "${domain_path}" \
+        > "${wer_path}"
+done
 fi
 
 if [[ "${RUN_PINYIN}" -eq 1 ]]; then
@@ -464,34 +507,47 @@ if [[ "${RUN_PINYIN}" -eq 1 ]]; then
     echo "开始计算拼音评估"
     echo "============================================================"
 
-    PINYIN_CMD=(
-        "${PYTHON_BIN}" "${PROJECT_ROOT}/qwen_asr/tools/pinyin_eval.py"
-        --ref_path "${REF_DIR}"
-        --result_path "${RESULT_PATH}"
-        --output_path "${PINYIN_OUTPUT_PATH}"
-        --detail_output_path "${PINYIN_DETAIL_PATH}"
-        --badcase_path "${PINYIN_BADCASE_PATH}"
-        --style "${PINYIN_STYLE}"
-        --topk_badcases "${PINYIN_TOPK_BADCASES}"
-    )
+    for target in "${RESULT_TARGETS[@]}"; do
+        suffix="${target%%:*}"
+        result_path="${target#*:}"
+        if [[ "${suffix}" != "ctc" && "${suffix}" != "rnnt" ]]; then
+            continue
+        fi
+        echo "拼音评估[${suffix}]: ${result_path}"
+        PINYIN_CMD=(
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/qwen_asr/tools/pinyin_eval.py"
+            --ref_path "${REF_DIR}"
+            --result_path "${result_path}"
+            --output_path "${OUTPUT_DIR}/pinyin_similarity_${suffix}.txt"
+            --detail_output_path "${DETAILS_DIR}/pinyin_detail_${suffix}.jsonl"
+            --badcase_path "${DETAILS_DIR}/pinyin_badcases_${suffix}.txt"
+            --style "${PINYIN_STYLE}"
+            --topk_badcases "${PINYIN_TOPK_BADCASES}"
+        )
 
-    if [[ "${PINYIN_KEEP_NON_CHINESE}" -eq 1 ]]; then
-        PINYIN_CMD+=(--keep_non_chinese)
-    fi
+        if [[ "${PINYIN_KEEP_NON_CHINESE}" -eq 1 ]]; then
+            PINYIN_CMD+=(--keep_non_chinese)
+        fi
 
-    "${PINYIN_CMD[@]}"
+        "${PINYIN_CMD[@]}"
+    done
 fi
 
 echo "============================================================"
 echo "执行完成"
 echo "============================================================"
 echo "Stage: ${STAGE}"
-echo "明细文件: ${OUTPUT_DIR}/results_detail.jsonl"
+echo "明细目录: ${DETAILS_DIR}"
+echo "明细文件: ${DETAILS_DIR}/results_detail.jsonl"
 echo "参考文件: ${REF_DIR}"
-echo "WER明细文件: ${WER_TXT_PATH}"
-echo "识别结果: ${RESULT_PATH}"
-echo "Domain文件: ${DOMAIN_PROMPT_FILE}"
-echo "拼音汇总: ${PINYIN_OUTPUT_PATH}"
-echo "拼音明细: ${PINYIN_DETAIL_PATH}"
-echo "拼音Badcase: ${PINYIN_BADCASE_PATH}"
+for target in "${RESULT_TARGETS[@]}"; do
+    suffix="${target%%:*}"
+    result_path="${target#*:}"
+    echo "识别结果[${suffix}]: ${result_path}"
+done
+echo "WER文件: ${DETAILS_DIR}/wer_*.txt"
+echo "Domain文件: ${OUTPUT_DIR}/domain_*.txt"
+echo "拼音汇总: ${OUTPUT_DIR}/pinyin_similarity_*.txt"
+echo "拼音明细: ${DETAILS_DIR}/pinyin_detail_*.jsonl"
+echo "拼音Badcase: ${DETAILS_DIR}/pinyin_badcases_*.txt"
 echo "============================================================"

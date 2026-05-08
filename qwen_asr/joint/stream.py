@@ -273,6 +273,74 @@ class StreamMixin:
         return torch.cat(kept_chunks, dim=0)
 
     @torch.no_grad()
+    def _stream_joint_feats(
+        self,
+        wav,
+        chunk_sec: float = 0.64,
+        left_context_sec: float = 0.64,
+        right_context_sec: float = 0.07,
+        first_chunk_left_pad_sec: float = 0.0,
+        window_batch_size: int = 4,
+        window_encoder_batch_size: int = 1,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """流式窗口只跑一次 encoder，同时保留 aux chunk 和 LLM 特征。"""
+        device = next(self.qwen_model.parameters()).device
+        windows = self._windows(
+            wav,
+            chunk_sec=chunk_sec,
+            left_context_sec=left_context_sec,
+            right_context_sec=right_context_sec,
+            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+        )
+        if window_batch_size is None or window_batch_size <= 0:
+            window_batch_size = len(windows)
+
+        aux_chunks = []
+        llm_chunks = []
+        for batch_start in range(0, len(windows), window_batch_size):
+            batch_windows = windows[batch_start: batch_start + window_batch_size]
+            aux_features_batch, llm_features_batch = self._enc_joint_windows(
+                [x[5] for x in batch_windows],
+                encoder_batch_size=window_encoder_batch_size,
+            )
+
+            for (
+                start,
+                end,
+                enc_start,
+                _enc_end,
+                left_pad_samples,
+                _,
+            ), aux_features, llm_features in zip(
+                batch_windows,
+                aux_features_batch,
+                llm_features_batch,
+            ):
+                keep_start_samples = left_pad_samples + start - enc_start
+                keep_end_samples = left_pad_samples + end - enc_start
+                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+                keep_start_idx = self._enc_len(keep_start_feat, device)
+                keep_end_idx = self._enc_len(keep_end_feat, device)
+
+                keep_start_idx = max(0, min(keep_start_idx, aux_features.shape[0]))
+                keep_end_idx = max(keep_start_idx, min(keep_end_idx, aux_features.shape[0]))
+
+                aux_kept = aux_features[keep_start_idx:keep_end_idx]
+                llm_kept = llm_features[keep_start_idx:keep_end_idx]
+                if aux_kept.numel() > 0:
+                    aux_chunks.append(aux_kept)
+                if llm_kept.numel() > 0:
+                    llm_chunks.append(llm_kept)
+
+        if not aux_chunks:
+            raise RuntimeError("No streaming auxiliary features were produced.")
+        if not llm_chunks:
+            raise RuntimeError("No streaming LLM audio features were produced.")
+        return aux_chunks, torch.cat(llm_chunks, dim=0)
+
+    @torch.no_grad()
     def _rnnt_stream_decode(
         self,
         chunks: List[torch.Tensor],

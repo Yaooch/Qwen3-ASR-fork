@@ -71,7 +71,12 @@ def parse_args():
     parser.add_argument(
         "--no_aux_in_prompt",
         action="store_true",
-        help="joint 模式下不把 CTC/RNNT 粗识别结果注入 prompt",
+        help="joint 模式下不把 CTC/RNNT 粗识别结果注入 prompt。当前默认就是不注入，保留该参数兼容旧脚本。",
+    )
+    parser.add_argument(
+        "--aux_in_prompt",
+        action="store_true",
+        help="joint 模式下把 CTC/RNNT 粗识别结果注入 prompt。",
     )
     parser.add_argument(
         "--rnnt_max_symbols_per_step",
@@ -355,7 +360,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             prompt=args.prompt,
             hotword_retriever=hotword_retriever,
             hotword_topk=args.hotword_topk,
-            inject_aux_into_prompt=not args.no_aux_in_prompt,
+            inject_aux_into_prompt=bool(args.aux_in_prompt and not args.no_aux_in_prompt),
             aux_max_symbols_per_step=args.rnnt_max_symbols_per_step,
             aux_encoder_batch_size=args.aux_encoder_batch_size,
             stream_aux=args.stream,
@@ -377,17 +382,24 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             if isinstance(raw_out, dict):
                 # text/llm_refined_text 已经是纯文本，language 应该直接从 raw_out["language"] 里拿
                 llm_text = raw_out.get("llm_refined_text") or raw_out.get("text") or ""
+                aux_text = raw_out.get("aux_text") or raw_out.get("aux_stream_text", "")
                 final_lang = raw_out.get("language") or input_lang or "unknown"
 
                 record = {
                     "utt_id": item["utt_id"],
                     "audio": item["audio"],
+                    "input_language": input_lang,
                     "language": final_lang,
+                    "llm_language": final_lang,
                     "mode": "joint",
                     "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": llm_text,
-                    "aux_stream_text": raw_out.get("aux_stream_text", ""),
+                    "aux_text": aux_text,
+                    "aux_stream_text": aux_text,
+                    "ctc_text": raw_out.get("ctc_text", aux_text if aux_loss_type == "ctc" else ""),
+                    "rnnt_text": raw_out.get("rnnt_text", aux_text if aux_loss_type == "rnnt" else ""),
+                    "llm_text": llm_text,
                     "llm_refined_text": llm_text,
                     "hotwords": raw_out.get("hotwords", []),
                     "prompt": raw_out.get("prompt"),
@@ -398,12 +410,18 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                 record = {
                     "utt_id": item["utt_id"],
                     "audio": item["audio"],
+                    "input_language": input_lang,
                     "language": final_lang or input_lang or "unknown",
+                    "llm_language": final_lang or input_lang or "unknown",
                     "mode": "joint",
                     "stream": bool(args.stream),
                     "aux_loss_type": aux_loss_type,
                     "text": final_text,
+                    "aux_text": "",
                     "aux_stream_text": "",
+                    "ctc_text": "",
+                    "rnnt_text": "",
+                    "llm_text": final_text,
                     "llm_refined_text": final_text,
                     "hotwords": [],
                     "prompt": None,
@@ -420,22 +438,30 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             record = {
                 "utt_id": item["utt_id"],
                 "audio": item["audio"],
+                "input_language": input_lang,
                 "language": final_lang,
+                "llm_language": final_lang,
                 "mode": "llm",
                 "stream": bool(args.stream),
                 "text": final_text,
+                "llm_text": final_text,
             }
 
         else:
             final_text, final_lang = extract_text_and_language(raw_out)
+            final_lang = final_lang or input_lang or "unknown"
             record = {
                 "utt_id": item["utt_id"],
                 "audio": item["audio"],
-                "language": final_lang or input_lang or "unknown",
+                "input_language": input_lang,
+                "language": final_lang,
                 "mode": args.mode,
                 "stream": bool(args.stream and args.mode in ("ctc", "rnnt")),
                 "aux_loss_type": aux_loss_type if args.mode in ("ctc", "rnnt") else None,
                 "text": final_text,
+                "aux_text": final_text if args.mode in ("ctc", "rnnt") else "",
+                "ctc_text": final_text if args.mode == "ctc" else "",
+                "rnnt_text": final_text if args.mode == "rnnt" else "",
             }
 
 
@@ -527,12 +553,41 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
 
 
 
+def result_specs(records: List[Dict]):
+    """根据实际记录决定需要写哪些结果文件。"""
+    specs = []
+    has_llm = any(
+        r.get("mode") in ("llm", "joint") or "llm_text" in r or "llm_refined_text" in r
+        for r in records
+    )
+    has_ctc = any(
+        r.get("mode") == "ctc" or r.get("aux_loss_type") == "ctc" or bool(r.get("ctc_text"))
+        for r in records
+    )
+    has_rnnt = any(
+        r.get("mode") == "rnnt" or r.get("aux_loss_type") == "rnnt" or bool(r.get("rnnt_text"))
+        for r in records
+    )
+
+    if has_ctc:
+        specs.append(("ctc", "results_ctc.txt", "ctc_text"))
+    if has_rnnt:
+        specs.append(("rnnt", "results_rnnt.txt", "rnnt_text"))
+    if has_llm:
+        specs.append(("llm", "results_llm.txt", "llm_text"))
+
+    if not specs:
+        specs.append(("text", "results_text.txt", "text"))
+    return specs
+
+
 def merge_outputs(tmp_files: List[str], output_dir: str):
     """合并各个 worker 的中间结果，并输出最终文件。"""
     os.makedirs(output_dir, exist_ok=True)
+    details_dir = os.path.join(output_dir, "details")
+    os.makedirs(details_dir, exist_ok=True)
 
-    results_txt = os.path.join(output_dir, "results.txt")
-    detail_jsonl = os.path.join(output_dir, "results_detail.jsonl")
+    detail_jsonl = os.path.join(details_dir, "results_detail.jsonl")
 
     all_records = []
     for path in tmp_files:
@@ -547,22 +602,35 @@ def merge_outputs(tmp_files: List[str], output_dir: str):
     # 为了输出稳定，按 utt_id 排序
     all_records.sort(key=lambda x: x["utt_id"])
 
-    with open(results_txt, "w", encoding="utf-8") as f_txt, \
-         open(detail_jsonl, "w", encoding="utf-8") as f_detail:
-        for record in all_records:
-            # results.txt 只保留 id + 文本 + 语种，供后续 WER 脚本使用
-            f_txt.write(
-                f'{record["utt_id"]}\t{record["text"]}\t{record["language"]}\n'
-            )
-            # 明细文件保留完整信息
-            f_detail.write(json.dumps(record, ensure_ascii=False) + "\n")
+    result_paths = {}
+    result_files = []
+    for name, filename, field in result_specs(all_records):
+        path = os.path.join(output_dir, filename)
+        result_paths[name] = path
+        result_files.append((name, field, open(path, "w", encoding="utf-8")))
+
+    try:
+        with open(detail_jsonl, "w", encoding="utf-8") as f_detail:
+            for record in all_records:
+                for _name, field, f_txt in result_files:
+                    text = record.get(field)
+                    if text is None and field == "llm_text":
+                        text = record.get("llm_refined_text")
+                    if text is None:
+                        text = record.get("text", "")
+                    language = record.get("language") or record.get("input_language") or "unknown"
+                    f_txt.write(f'{record["utt_id"]}\t{text or ""}\t{language}\n')
+                f_detail.write(json.dumps(record, ensure_ascii=False) + "\n")
+    finally:
+        for _name, _field, f_txt in result_files:
+            f_txt.close()
 
     # 清理中间文件
     for path in tmp_files:
         if os.path.exists(path):
             os.remove(path)
 
-    return results_txt, detail_jsonl
+    return result_paths, detail_jsonl
 
 
 def main():
@@ -630,12 +698,13 @@ def main():
             if p.exitcode != 0:
                 raise RuntimeError(f"子进程失败，exitcode={p.exitcode}")
 
-    results_txt, detail_jsonl = merge_outputs(tmp_files, args.output_dir)
+    result_paths, detail_jsonl = merge_outputs(tmp_files, args.output_dir)
 
     print("=" * 80)
     print("推理完成")
     print("=" * 80)
-    print(f"结果：{results_txt}")
+    for name, path in result_paths.items():
+        print(f"结果[{name}]：{path}")
     print(f"明细：{detail_jsonl}")
     print("=" * 80)
 
