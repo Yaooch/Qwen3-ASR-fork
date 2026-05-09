@@ -67,7 +67,7 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
 
 def load_aux_from_model_path(joint_model: Qwen3ASRJointModel, model_path: str, is_main: bool = True) -> bool:
-    """如果 model_path 是 joint checkpoint，就加载已经训练好的辅助头。"""
+    """如果 model_path 是同类型 joint checkpoint，就加载已经训练好的辅助头。"""
     cfg_path = os.path.join(model_path, "ctc_config.json")
     if not os.path.exists(cfg_path):
         return False
@@ -78,10 +78,12 @@ def load_aux_from_model_path(joint_model: Qwen3ASRJointModel, model_path: str, i
     ckpt_aux_type = cfg.get("aux_loss_type", "ctc")
     cur_aux_type = getattr(joint_model, "aux_loss_type", "ctc")
     if ckpt_aux_type != cur_aux_type:
-        raise ValueError(
-            f"MODEL_PATH 是 {ckpt_aux_type.upper()} checkpoint，"
-            f"但当前 --aux_loss_type={cur_aux_type}。请保持一致。"
-        )
+        if is_main:
+            print(
+                f"MODEL_PATH 是 {ckpt_aux_type.upper()} checkpoint，"
+                f"当前训练 {cur_aux_type.upper()}：跳过旧辅助头，使用新初始化辅助头。"
+            )
+        return False
 
     ckpt_vocab_size = cfg.get("vocab_size")
     if ckpt_vocab_size is not None and ckpt_vocab_size != joint_model.vocab_size:
@@ -516,13 +518,23 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         return control
 
 
-def enable_aux_only_training(joint_model: Qwen3ASRJointModel) -> None:
-    """Warm up only the CTC/RNNT head with frozen Qwen features."""
+def enable_aux_only_training(joint_model: Qwen3ASRJointModel, train_encoder: bool = False) -> None:
+    """只使用辅助 loss；可选择同时训练 audio encoder。"""
     joint_model.ctc_only = True
     joint_model.ctc_weight = 1.0
 
     for param in joint_model.qwen_model.parameters():
         param.requires_grad = False
+    if train_encoder:
+        audio_tower = joint_model.qwen_model.thinker.audio_tower
+        for param in audio_tower.parameters():
+            param.requires_grad = True
+        # Aux 特征固定取 ln_post 后、proj1/proj2 前；LLM adapter 不参与训练。
+        for name in ("proj1", "proj2"):
+            module = getattr(audio_tower, name, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad = False
     for param in joint_model.aux_head.parameters():
         param.requires_grad = True
 
@@ -560,7 +572,8 @@ def parse_args():
     p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--ctc_weight", type=float, default=0.3, help="辅助 loss 权重")
     p.add_argument("--aux_loss_type", type=str, default="ctc", choices=["ctc", "rnnt"])
-    p.add_argument("--aux_only", type=int, default=0, help="只训练 CTC/RNNT 辅助头，冻结 Qwen 并跳过 LLM forward")
+    p.add_argument("--aux_only", type=int, default=0, help="只使用 CTC/RNNT loss，跳过 LLM forward")
+    p.add_argument("--aux_train_encoder", type=int, default=0, help="aux_only 时同时训练 audio encoder；0 表示只训练辅助头")
     p.add_argument("--aux_encoder_batch_size", type=int, default=1, help="CTC/RNNT 辅助头 audio encoder micro-batch，1 最稳")
     p.add_argument("--aux_streaming_train", type=int, default=0, help="训练 aux loss 时使用流式窗口：当前块 + 随机左上下文 + 右上下文")
     p.add_argument("--aux_stream_chunk_frames", type=int, default=64, help="流式 aux 训练当前块长度，单位为 feature frames，64 约等于 640ms")
@@ -699,11 +712,14 @@ def main():
     load_aux_from_model_path(joint_model, args_cli.model_path, is_main=is_main)
 
     if args_cli.aux_only == 1:
-        enable_aux_only_training(joint_model)
+        enable_aux_only_training(joint_model, train_encoder=(args_cli.aux_train_encoder == 1))
         if local_rank == 0:
             trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in joint_model.parameters())
-            print("Aux-only：只训练辅助头")
+            if args_cli.aux_train_encoder == 1:
+                print("Aux-only：训练 Encoder + 辅助头，跳过 LLM loss")
+            else:
+                print("Aux-only：只训练辅助头")
             print(f"可训练参数：{trainable:,} / {total:,}")
 
     with PartialState().main_process_first():

@@ -69,16 +69,6 @@ def parse_args():
         help="热词拼音召回风格：normal 不带调，tone3 数字声调",
     )
     parser.add_argument(
-        "--no_aux_in_prompt",
-        action="store_true",
-        help="joint 模式下不把 CTC/RNNT 粗识别结果注入 prompt。当前默认就是不注入，保留该参数兼容旧脚本。",
-    )
-    parser.add_argument(
-        "--aux_in_prompt",
-        action="store_true",
-        help="joint 模式下把 CTC/RNNT 粗识别结果注入 prompt。",
-    )
-    parser.add_argument(
         "--rnnt_max_symbols_per_step",
         type=int,
         default=5,
@@ -360,7 +350,6 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
             prompt=args.prompt,
             hotword_retriever=hotword_retriever,
             hotword_topk=args.hotword_topk,
-            inject_aux_into_prompt=bool(args.aux_in_prompt and not args.no_aux_in_prompt),
             aux_max_symbols_per_step=args.rnnt_max_symbols_per_step,
             aux_encoder_batch_size=args.aux_encoder_batch_size,
             stream_aux=args.stream,
@@ -402,6 +391,7 @@ def run_batch_infer(model, batch: List[Dict], args, hotword_retriever=None):
                     "llm_text": llm_text,
                     "llm_refined_text": llm_text,
                     "hotwords": raw_out.get("hotwords", []),
+                    "context": raw_out.get("context"),
                     "prompt": raw_out.get("prompt"),
                 }
 

@@ -14,9 +14,11 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 DTYPE="${DTYPE:-bf16}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OUT_PREFIX="${OUT_PREFIX:-/cfs/data/private/WangYaoChi/test_out}"
+SKIP_DONE="${SKIP_DONE:-1}"
 
 RNNT_MAX_SYMBOLS_PER_STEP="${RNNT_MAX_SYMBOLS_PER_STEP:-3}"
-AUX_ENCODER_BATCH_SIZE="${AUX_ENCODER_BATCH_SIZE:-5}"
+AUX_ENCODER_BATCH_SIZE="${AUX_ENCODER_BATCH_SIZE:-4}"
+STREAM="${STREAM:-1}"
 STREAM_CHUNK_SEC="${STREAM_CHUNK_SEC:-0.64}"
 STREAM_LEFT_CONTEXT_SEC="${STREAM_LEFT_CONTEXT_SEC:-1.32}"
 STREAM_RIGHT_CONTEXT_SEC="${STREAM_RIGHT_CONTEXT_SEC:-0.07}"
@@ -33,12 +35,13 @@ RESULT_SUMMARY_PATH="${EXP_DIR}/result.txt"
 # 字段：dataset_name|scp_path|text_path|language
 # language 可取：Mandarin / Cantonese / Sichuanese / English / None
 DATASETS=(
-    "mandarin|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_wav_2.scp|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_text_classify_2|Mandarin"
+    "mandarin2|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_wav_2.scp|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_text_classify_2|Chinese"
     "yue|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav.scp|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text|Cantonese"
     "chuan|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav2.scp|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text2|Sichuanese"
-    "aishell|/cfs/data/private/hubk/aishell_shard/chinese_test/wav.scp|/cfs/data/private/hubk/aishell_shard/chinese_test/text|Mandarin"
+    "aishell|/cfs/data/private/hubk/aishell_shard/chinese_test/wav.scp|/cfs/data/private/hubk/aishell_shard/chinese_test/text|Chinese"
+    "aishell2|/cfs/data/private/WangYaoChi/open_datasets/aishell2/AISHELL-DEV-TEST-SET/Mic/test/wav.scp|/cfs/data/private/WangYaoChi/open_datasets/aishell2/AISHELL-DEV-TEST-SET/Mic/test/trans.txt|Chinese"
     "ws_yue|/cfs/data/private/hubk/asr_data/wenetspeech_yue/2000.scp|/cfs/data/private/hubk/asr_data/wenetspeech_yue/2000.txt|Cantonese"
-    "ws_chuan|/cfs/data/private/hubk/asr_data/wenetspeech_sichuan/10000.scp|/cfs/data/private/hubk/asr_data/wenetspeech_sichuan/10000.txt|Sichuanese"
+    # "ws_chuan|/cfs/data/private/hubk/asr_data/wenetspeech_sichuan/10000.scp|/cfs/data/private/hubk/asr_data/wenetspeech_sichuan/10000.txt|Sichuanese"
     "navi|/cfs/data/private/hubk/asr_test_set/POI_ENTITY/wav.scp|/cfs/data/private/hubk/asr_test_set/POI_ENTITY/text|None"
     "media|/cfs/data/private/hubk/asr_test_set/MEDIA_ENTITY/wav.scp|/cfs/data/private/hubk/asr_test_set/MEDIA_ENTITY/text|None"
 )
@@ -125,7 +128,12 @@ PY
 
 write_summary() {
     mkdir -p "${EXP_DIR}"
-    printf "dataset_name\tllm_wer\tllm_sar\tllm_lid\tctc_wer\tctc_sar\tctc_per\trnnt_wer\trnnt_sar\trnnt_per\n" > "${RESULT_SUMMARY_PATH}"
+    local tmp_summary
+    local target_tmp
+    tmp_summary="$(mktemp "/tmp/infer_all_result.XXXXXX")"
+    target_tmp="${RESULT_SUMMARY_PATH}.$$.$RANDOM.tmp"
+
+    printf "dataset_name\tllm_wer\tllm_sar\tllm_lid\tctc_wer\tctc_sar\tctc_per\trnnt_wer\trnnt_sar\trnnt_per\n" > "${tmp_summary}"
 
     for item in "${DATASETS[@]}"; do
         IFS='|' read -r dataset_name _scp_path _text_path _language <<< "${item}"
@@ -153,8 +161,85 @@ write_summary() {
             "${rnnt_wer}" \
             "${rnnt_sar}" \
             "${rnnt_per}" \
-            >> "${RESULT_SUMMARY_PATH}"
+            >> "${tmp_summary}"
     done
+
+    cp "${tmp_summary}" "${target_tmp}"
+    mv -f "${target_tmp}" "${RESULT_SUMMARY_PATH}"
+    rm -f "${tmp_summary}"
+}
+
+dataset_done() {
+    local output_dir="$1"
+    local language="$2"
+    local details_dir="${output_dir}/details"
+
+    case "${MODE}" in
+        llm)
+            [[ -f "${output_dir}/results_llm.txt" ]] || return 1
+            [[ -f "${output_dir}/domain_llm.txt" ]] || return 1
+            if [[ "${language}" != "None" && -n "${language}" ]]; then
+                [[ -f "${details_dir}/language_llm.txt" ]] || return 1
+            fi
+            ;;
+        ctc)
+            [[ -f "${output_dir}/results_ctc.txt" ]] || return 1
+            [[ -f "${output_dir}/domain_ctc.txt" ]] || return 1
+            [[ -f "${output_dir}/pinyin_similarity_ctc.txt" ]] || return 1
+            ;;
+        rnnt)
+            [[ -f "${output_dir}/results_rnnt.txt" ]] || return 1
+            [[ -f "${output_dir}/domain_rnnt.txt" ]] || return 1
+            [[ -f "${output_dir}/pinyin_similarity_rnnt.txt" ]] || return 1
+            ;;
+        joint)
+            [[ -f "${details_dir}/results_detail.jsonl" ]] || return 1
+            [[ -f "${output_dir}/results_llm.txt" ]] || return 1
+            [[ -f "${output_dir}/domain_llm.txt" ]] || return 1
+            if [[ "${language}" != "None" && -n "${language}" ]]; then
+                [[ -f "${details_dir}/language_llm.txt" ]] || return 1
+            fi
+            if [[ -f "${output_dir}/results_ctc.txt" ]]; then
+                [[ -f "${output_dir}/domain_ctc.txt" ]] || return 1
+                [[ -f "${output_dir}/pinyin_similarity_ctc.txt" ]] || return 1
+            elif [[ -f "${output_dir}/results_rnnt.txt" ]]; then
+                [[ -f "${output_dir}/domain_rnnt.txt" ]] || return 1
+                [[ -f "${output_dir}/pinyin_similarity_rnnt.txt" ]] || return 1
+            else
+                return 1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+dataset_needs_lid() {
+    local output_dir="$1"
+    local language="$2"
+    if [[ "${language}" == "None" || -z "${language}" ]]; then
+        return 1
+    fi
+    [[ -f "${output_dir}/results_llm.txt" ]] || return 1
+    [[ ! -f "${output_dir}/details/language_llm.txt" ]]
+}
+
+compute_lid_if_needed() {
+    local output_dir="$1"
+    local language="$2"
+    local details_dir="${output_dir}/details"
+
+    if dataset_needs_lid "${output_dir}" "${language}"; then
+        mkdir -p "${details_dir}"
+        language_acc \
+            "${output_dir}/results_llm.txt" \
+            "${language}" \
+            "${details_dir}/language_llm.txt"
+        echo "语种识别率: ${details_dir}/language_llm.txt"
+    fi
 }
 
 for item in "${DATASETS[@]}"; do
@@ -169,6 +254,14 @@ for item in "${DATASETS[@]}"; do
     echo "语种: ${language}"
     echo "输出: ${output_dir}"
     echo "============================================================"
+
+    if [[ "${SKIP_DONE}" -eq 1 ]] && dataset_done "${output_dir}" "${language}"; then
+        echo "已完成，跳过: ${dataset_name}"
+        compute_lid_if_needed "${output_dir}" "${language}"
+        write_summary
+        echo "当前汇总结果: ${RESULT_SUMMARY_PATH}"
+        continue
+    fi
 
     cmd=(
         bash infer.sh
@@ -185,32 +278,25 @@ for item in "${DATASETS[@]}"; do
         --wer_script "${WER_SCRIPT}"
         --rnnt_max_symbols_per_step "${RNNT_MAX_SYMBOLS_PER_STEP}"
         --aux_encoder_batch_size "${AUX_ENCODER_BATCH_SIZE}"
-        --stream
         --stream_chunk_sec "${STREAM_CHUNK_SEC}"
         --stream_left_context_sec "${STREAM_LEFT_CONTEXT_SEC}"
         --stream_right_context_sec "${STREAM_RIGHT_CONTEXT_SEC}"
         --stream_first_chunk_left_pad_sec "${STREAM_FIRST_CHUNK_LEFT_PAD_SEC}"
         --stream_window_batch_size "${STREAM_WINDOW_BATCH_SIZE}"
         --stream_window_encoder_batch_size "${STREAM_WINDOW_ENCODER_BATCH_SIZE}"
-        --no_aux_in_prompt
         --pinyin_style "${PINYIN_STYLE}"
         --pinyin_topk_badcases "${PINYIN_TOPK_BADCASES}"
     )
 
-    if [[ "${language}" != "None" && -n "${language}" ]]; then
-        cmd+=(--language "${language}")
+    if [[ "${STREAM}" -eq 1 ]]; then
+        cmd+=(--stream)
+    else
+        cmd+=(--no_stream)
     fi
 
     "${cmd[@]}"
 
-    if [[ "${language}" != "None" && -f "${output_dir}/results_llm.txt" ]]; then
-        mkdir -p "${details_dir}"
-        language_acc \
-            "${output_dir}/results_llm.txt" \
-            "${language}" \
-            "${details_dir}/language_llm.txt"
-        echo "语种识别率: ${details_dir}/language_llm.txt"
-    fi
+    compute_lid_if_needed "${output_dir}" "${language}"
 
     write_summary
     echo "当前汇总结果: ${RESULT_SUMMARY_PATH}"

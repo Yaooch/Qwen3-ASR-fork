@@ -5,6 +5,42 @@ from difflib import SequenceMatcher
 from typing import List, Optional
 
 
+NEAR_INITIALS = {
+    "b": {"p"},
+    "p": {"b"},
+    "d": {"t"},
+    "t": {"d"},
+    "g": {"k"},
+    "k": {"g"},
+    "z": {"zh", "c"},
+    "zh": {"z", "ch"},
+    "c": {"ch", "z"},
+    "ch": {"c", "zh"},
+    "s": {"sh"},
+    "sh": {"s"},
+    "l": {"n", "r"},
+    "n": {"l"},
+    "r": {"l"},
+    "f": {"h"},
+    "h": {"f"},
+}
+
+NEAR_FINALS = {
+    "en": {"eng"},
+    "eng": {"en"},
+    "in": {"ing"},
+    "ing": {"in"},
+    "an": {"ang"},
+    "ang": {"an"},
+    "uan": {"uang"},
+    "uang": {"uan"},
+    "ian": {"iang"},
+    "iang": {"ian"},
+    "ong": {"eng"},
+    "eng": {"en", "ong"},
+}
+
+
 @dataclass
 class HotwordEntry:
     word: str
@@ -137,20 +173,96 @@ class HotwordRetriever:
         tone_score = self._ratio(entry.tone_py, tone_py)
         initial_score = self._ratio(entry.initials, initials)
         final_score = self._ratio(entry.finals, finals)
+        aligned_score = self._aligned_score(entry, py, initials, finals)
         length_penalty = abs(len(entry.py) - len(py)) * 0.08
 
         score = (
-            0.65 * py_score
-            + 0.20 * tone_score
-            + 0.10 * initial_score
-            + 0.05 * final_score
+            0.45 * py_score
+            + 0.15 * tone_score
+            + 0.15 * initial_score
+            + 0.10 * final_score
+            + 0.15 * aligned_score
             - length_penalty
         )
         if entry.py == py:
             score += 0.06
         if entry.tone_py == tone_py:
             score += 0.03
+        score = max(score, self._short_name_score(entry, py, initials, finals) - length_penalty)
         return min(1.0, max(0.0, score))
+
+    def _aligned_score(
+        self,
+        entry: HotwordEntry,
+        py: List[str],
+        initials: List[str],
+        finals: List[str],
+    ) -> float:
+        if len(entry.py) != len(py) or not py:
+            return 0.0
+        scores = []
+        for h_py, q_py, h_i, q_i, h_f, q_f in zip(
+            entry.py, py, entry.initials, initials, entry.finals, finals
+        ):
+            scores.append(self._syllable_score(h_py, q_py, h_i, q_i, h_f, q_f))
+        return sum(scores) / len(scores)
+
+    def _short_name_score(
+        self,
+        entry: HotwordEntry,
+        py: List[str],
+        initials: List[str],
+        finals: List[str],
+    ) -> float:
+        h_len = len(entry.py)
+        q_len = len(py)
+        if h_len not in (3, 4) or q_len < h_len - 1 or q_len >= h_len:
+            return 0.0
+
+        # 人名常见错误是姓或中间一字被吞掉，保留名的音节仍然很准。
+        candidates = []
+        for start in range(0, h_len - q_len + 1):
+            end = start + q_len
+            sub = HotwordEntry(
+                word=entry.word,
+                py=entry.py[start:end],
+                tone_py=entry.tone_py[start:end],
+                initials=entry.initials[start:end],
+                finals=entry.finals[start:end],
+            )
+            candidates.append(self._aligned_score(sub, py, initials, finals))
+        best = max(candidates) if candidates else 0.0
+        if h_len == 3 and q_len == 2:
+            return best * 0.92
+        return best * 0.86
+
+    def _syllable_score(
+        self,
+        h_py: str,
+        q_py: str,
+        h_initial: str,
+        q_initial: str,
+        h_final: str,
+        q_final: str,
+    ) -> float:
+        if h_py == q_py:
+            return 1.0
+        initial_same = h_initial == q_initial
+        final_same = h_final == q_final
+        initial_near = q_initial in NEAR_INITIALS.get(h_initial, set())
+        final_near = q_final in NEAR_FINALS.get(h_final, set())
+
+        if initial_same and final_near:
+            return 0.88
+        if initial_near and final_same:
+            return 0.86
+        if initial_near and final_near:
+            return 0.78
+        if final_same:
+            return 0.72
+        if initial_same:
+            return 0.62
+        return SequenceMatcher(None, h_py, q_py).ratio() * 0.65
 
     def _entry(self, word: str) -> HotwordEntry:
         return HotwordEntry(
@@ -197,12 +309,12 @@ class HotwordRetriever:
         if length <= 1:
             return 0.99
         if length <= 2:
-            return 0.96
+            return 0.86
         if length <= 4:
-            return 0.88
-        if length <= 8:
             return 0.80
-        return 0.74
+        if length <= 8:
+            return 0.76
+        return 0.70
 
     def _parse_style(self, style_cls, style_name: str):
         if style_name == "normal":

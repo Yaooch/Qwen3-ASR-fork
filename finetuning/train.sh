@@ -25,11 +25,11 @@ export CUDA_VISIBLE_DEVICES=$GPU_IDS
 export OMP_NUM_THREADS=4
 
 # ==================== 路径与数据 ====================
-# MODEL_PATH="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
-MODEL_PATH="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
+MODEL_PATH="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
+# MODEL_PATH="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
 TRAIN_FILE="/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
 EVAL_FILE="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-1"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-15"
 
 VOCAB_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/lang_char_large_yue.txt"
 SP_MODEL_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"
@@ -38,15 +38,17 @@ SP_MODEL_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dic
 # 实际总 batch = BATCH_SIZE * GRAD_ACC * NUM_GPUS
 BATCH_SIZE=${BATCH_SIZE:-32}
 GRAD_ACC=${GRAD_ACC:-4}
-EPOCHS=${EPOCHS:-1}
+EPOCHS=${EPOCHS:-2}
 
-# aux_loss_type 可选 ctc / rnnt。RNNT 显存更高，建议先把 BATCH_SIZE 调小。
+# 辅助损失类型：ctc / rnnt。RNNT 更占显存。
 AUX_LOSS_TYPE=${AUX_LOSS_TYPE:-ctc}
-# Aux-only warmup: freeze Qwen, skip LLM forward, train only the auxiliary head.
-AUX_ONLY=${AUX_ONLY:-0}
+# 只使用辅助损失，跳过 LLM forward。
+AUX_ONLY=${AUX_ONLY:-1}
+# AUX_ONLY=1 时，是否同时训练 audio encoder。
+AUX_TRAIN_ENCODER=${AUX_TRAIN_ENCODER:-1}
 
 QWEN_LR=${QWEN_LR:-2e-5}
-AUX_LR=${AUX_LR:-5e-4}
+AUX_LR=${AUX_LR:-2e-3}
 AUX_WEIGHT=${AUX_WEIGHT:-0.1}
 AUX_ENCODER_BATCH_SIZE=${AUX_ENCODER_BATCH_SIZE:-4}
 AUX_STREAMING_TRAIN=${AUX_STREAMING_TRAIN:-0}
@@ -81,6 +83,7 @@ torchrun \
     --ctc_weight "$AUX_WEIGHT" \
     --aux_loss_type "$AUX_LOSS_TYPE" \
     --aux_only "$AUX_ONLY" \
+    --aux_train_encoder "$AUX_TRAIN_ENCODER" \
     --aux_encoder_batch_size "$AUX_ENCODER_BATCH_SIZE" \
     --aux_streaming_train "$AUX_STREAMING_TRAIN" \
     --aux_stream_chunk_frames "$AUX_STREAM_CHUNK_FRAMES" \

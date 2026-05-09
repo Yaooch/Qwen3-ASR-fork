@@ -53,10 +53,10 @@ cd "${SCRIPT_DIR}"
 CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
 # CKPT="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 STAGE="all"
-MODE="ctc"
-INPUT_SCP="/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav2.scp"
-REF_DIR="/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text2"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14/chuan/stream_64_132"
+MODE="joint"
+INPUT_SCP="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/wav.scp"
+REF_DIR="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/text"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14/hotword_aishell/ctc_no_hotword"
 GPU_IDS="0,1,2,3,4,5,6,7"
 BATCH_SIZE=128
 DTYPE="bf16"
@@ -65,10 +65,8 @@ LANGUAGE=""
 PROMPT=""
 # PROMPT="你是一个拥有超高精度的语音识别引擎。专属名词列表如下:[孙作为, 宋雪倩, 薛思皓, 郭震, 户保坤, 岑吴镕, 王瑶池, 应臻奕, 淮水竹亭, 白月梵星, 清华池]。请根据音频内容进行识别，当遇到音素类似的词汇时，必须优先匹配列表中的专属名词，而不是通用词汇。"
 HOTWORD_FILE=""
-HOTWORD_TOPK=10
+HOTWORD_TOPK=5
 HOTWORD_PINYIN_STYLE="normal"
-NO_AUX_IN_PROMPT=1
-AUX_IN_PROMPT=0
 RNNT_MAX_SYMBOLS_PER_STEP=3
 AUX_ENCODER_BATCH_SIZE=5
 STREAM=${STREAM:-1}
@@ -122,8 +120,6 @@ usage() {
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
-    echo "  --no_aux_in_prompt    joint 模式下不把 CTC/RNNT 结果注入 prompt，默认开启"
-    echo "  --aux_in_prompt       joint 模式下把 CTC/RNNT 结果注入 prompt"
     echo "  --rnnt_max_symbols_per_step RNNT 每帧最多吐出的 token 数，调小可加速"
     echo "  --aux_encoder_batch_size CTC/RNNT audio encoder micro-batch，默认 1 最稳"
     echo "  --stream              使用 chunk-wise encoder 流式路径；llm/joint 会拼接 chunk audio embeddings"
@@ -202,16 +198,6 @@ while [[ $# -gt 0 ]]; do
         --hotword_pinyin_style)
             HOTWORD_PINYIN_STYLE="$2"
             shift 2
-            ;;
-        --no_aux_in_prompt)
-            NO_AUX_IN_PROMPT=1
-            AUX_IN_PROMPT=0
-            shift 1
-            ;;
-        --aux_in_prompt)
-            AUX_IN_PROMPT=1
-            NO_AUX_IN_PROMPT=0
-            shift 1
             ;;
         --rnnt_max_symbols_per_step)
             RNNT_MAX_SYMBOLS_PER_STEP="$2"
@@ -421,13 +407,6 @@ if [[ -n "${HOTWORD_FILE}" ]]; then
     INFER_CMD+=(--hotword_file "${HOTWORD_FILE}")
     INFER_CMD+=(--hotword_topk "${HOTWORD_TOPK}")
     INFER_CMD+=(--hotword_pinyin_style "${HOTWORD_PINYIN_STYLE}")
-fi
-
-if [[ "${NO_AUX_IN_PROMPT}" -eq 1 ]]; then
-    INFER_CMD+=(--no_aux_in_prompt)
-fi
-if [[ "${AUX_IN_PROMPT}" -eq 1 ]]; then
-    INFER_CMD+=(--aux_in_prompt)
 fi
 
 if [[ "${STREAM}" -eq 1 ]]; then

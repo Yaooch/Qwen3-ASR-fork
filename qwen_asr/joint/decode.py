@@ -546,8 +546,11 @@ class DecodeMixin:
         prompt: Optional[str] = None,
         hotword_retriever=None,
         hotword_topk: int = 10,
-        inject_aux: bool = True,
     ):
+        """构造 joint LLM 上下文。
+
+        粗识别结果只用于热词检索，不再直接注入 prompt。
+        """
         hotwords = []
         if hotword_retriever is not None and aux_text:
             hotwords = hotword_retriever.retrieve(aux_text, topk=hotword_topk)
@@ -555,10 +558,8 @@ class DecodeMixin:
         parts = []
         if prompt:
             parts.append(prompt)
-        if inject_aux and aux_text:
-            parts.append(f"参考粗识别结果：{aux_text}")
         if hotwords:
-            parts.append("相关热词：" + "，".join(hotwords))
+            parts.append("相关热词：[" + "，".join(hotwords) + "]" )
 
         return ("\n".join(parts) if parts else None), hotwords
 
@@ -570,7 +571,6 @@ class DecodeMixin:
         prompt: Optional[str] = None,
         hotword_retriever=None,
         hotword_topk: int = 10,
-        inject_aux_into_prompt: bool = False,
         aux_max_symbols_per_step: int = 5,
         aux_encoder_batch_size: int = 1,
         stream_aux: bool = False,
@@ -655,7 +655,6 @@ class DecodeMixin:
                 prompt=prompt,
                 hotword_retriever=hotword_retriever,
                 hotword_topk=hotword_topk,
-                inject_aux=inject_aux_into_prompt,
             )
             contexts.append(context)
             hotwords_list.append(hotwords)
@@ -683,6 +682,7 @@ class DecodeMixin:
                 "text": fields["text"],
                 "language": fields["language"] or lang,
                 "hotwords": hotwords,
+                "context": context,
                 "prompt": context,
             })
 
