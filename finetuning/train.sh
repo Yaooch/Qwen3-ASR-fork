@@ -25,30 +25,31 @@ export CUDA_VISIBLE_DEVICES=$GPU_IDS
 export OMP_NUM_THREADS=4
 
 # ==================== 路径与数据 ====================
-MODEL_PATH="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
-# MODEL_PATH="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
-TRAIN_FILE="/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
-EVAL_FILE="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-15"
+# MODEL_PATH=${MODEL_PATH:-"/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"}
+MODEL_PATH="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
+TRAIN_FILE=${TRAIN_FILE:-"/cfs/data/private/WangYaoChi/train_data/all/train_contextasr.jsonl"}
+EVAL_FILE=${EVAL_FILE:-"/cfs/data/private/WangYaoChi/train_data/all/eval_contextasr.jsonl"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword"}
 
 VOCAB_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/lang_char_large_yue.txt"
 SP_MODEL_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"
 
 # ==================== 训练参数 ====================
 # 实际总 batch = BATCH_SIZE * GRAD_ACC * NUM_GPUS
-BATCH_SIZE=${BATCH_SIZE:-32}
+BATCH_SIZE=${BATCH_SIZE:-8}
 GRAD_ACC=${GRAD_ACC:-4}
-EPOCHS=${EPOCHS:-2}
+EPOCHS=${EPOCHS:-3}
 
 # 辅助损失类型：ctc / rnnt。RNNT 更占显存。
 AUX_LOSS_TYPE=${AUX_LOSS_TYPE:-ctc}
-# 只使用辅助损失，跳过 LLM forward。
-AUX_ONLY=${AUX_ONLY:-1}
-# AUX_ONLY=1 时，是否同时训练 audio encoder。
-AUX_TRAIN_ENCODER=${AUX_TRAIN_ENCODER:-1}
+# 训练模式：joint / aux_only / llm_only
+TRAIN_MODE=${TRAIN_MODE:-llm_only}
+# train_mode=aux_only 时，是否同时训练 audio encoder。
+AUX_TRAIN_ENCODER=${AUX_TRAIN_ENCODER:-0}
 
-QWEN_LR=${QWEN_LR:-2e-5}
+QWEN_LR=${QWEN_LR:-1e-5}
 AUX_LR=${AUX_LR:-2e-3}
+# train_mode=llm_only 时不计算辅助 loss，此值会被忽略。
 AUX_WEIGHT=${AUX_WEIGHT:-0.1}
 AUX_ENCODER_BATCH_SIZE=${AUX_ENCODER_BATCH_SIZE:-4}
 AUX_STREAMING_TRAIN=${AUX_STREAMING_TRAIN:-0}
@@ -60,7 +61,7 @@ AUX_STREAM_WINDOW_BATCH_SIZE=${AUX_STREAM_WINDOW_BATCH_SIZE:-32}
 AUDIO_N_WINDOW=${AUDIO_N_WINDOW:-0}
 AUDIO_N_WINDOW_INFER=${AUDIO_N_WINDOW_INFER:-200}
 
-SAVE_STEPS=${SAVE_STEPS:-1000}
+SAVE_STEPS=${SAVE_STEPS:-100}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MASTER_PORT=$(shuf -n 1 -i 20000-65000)
 
@@ -81,8 +82,8 @@ torchrun \
     --ctc_lr "$AUX_LR" \
     --epochs "$EPOCHS" \
     --ctc_weight "$AUX_WEIGHT" \
+    --train_mode "$TRAIN_MODE" \
     --aux_loss_type "$AUX_LOSS_TYPE" \
-    --aux_only "$AUX_ONLY" \
     --aux_train_encoder "$AUX_TRAIN_ENCODER" \
     --aux_encoder_batch_size "$AUX_ENCODER_BATCH_SIZE" \
     --aux_streaming_train "$AUX_STREAMING_TRAIN" \

@@ -112,7 +112,7 @@ def load_aux_from_model_path(joint_model: Qwen3ASRJointModel, model_path: str, i
     return True
 
 
-def load_audio(path: str, sr: int = 16000, max_duration: float = 20.0):
+def load_audio(path: str, sr: int = 16000, max_duration: float = 100.0):
     try:
         wav, _ = librosa.load(path, sr=sr, mono=True)
         duration = len(wav) / sr
@@ -366,6 +366,11 @@ class JointTrainer(Trainer):
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
         base_model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(base_model, "train_mode", "joint") == "llm_only":
+            if self.args.process_index == 0:
+                print("LLM-only：跳过辅助头 CER 验证")
+            return metrics
+
         aux_loss_type = getattr(base_model, "aux_loss_type", "ctc")
         aux_name = aux_loss_type.upper()
 
@@ -515,11 +520,18 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         if not os.path.isdir(ckpt_dir):
             ckpt_dir = kwargs.get("checkpoint", ckpt_dir)
         copy_required_hf_files_for_qwen_asr(self.base_model_path, ckpt_dir)
+        model = kwargs.get("model")
+        if model is not None:
+            base_model = model.module if hasattr(model, "module") else model
+            if hasattr(base_model, "save_aux"):
+                sync_audio_window_config(base_model.qwen_model)
+                base_model.save_aux(ckpt_dir)
         return control
 
 
 def enable_aux_only_training(joint_model: Qwen3ASRJointModel, train_encoder: bool = False) -> None:
     """只使用辅助 loss；可选择同时训练 audio encoder。"""
+    joint_model.train_mode = "aux_only"
     joint_model.ctc_only = True
     joint_model.ctc_weight = 1.0
 
@@ -537,6 +549,23 @@ def enable_aux_only_training(joint_model: Qwen3ASRJointModel, train_encoder: boo
                     param.requires_grad = False
     for param in joint_model.aux_head.parameters():
         param.requires_grad = True
+
+
+def enable_llm_only_training(joint_model: Qwen3ASRJointModel) -> None:
+    """只使用 LLM loss；冻结 audio encoder 和辅助头。"""
+    joint_model.train_mode = "llm_only"
+    joint_model.ctc_only = False
+    joint_model.ctc_weight = 0.0
+
+    for param in joint_model.qwen_model.parameters():
+        param.requires_grad = True
+
+    audio_tower = joint_model.qwen_model.thinker.audio_tower
+    for param in audio_tower.parameters():
+        param.requires_grad = False
+
+    for param in joint_model.aux_head.parameters():
+        param.requires_grad = False
 
 
 def sync_audio_window_config(qwen_model, n_window: Optional[int] = None, n_window_infer: Optional[int] = None):
@@ -570,9 +599,9 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-joint-out")
 
     p.add_argument("--sr", type=int, default=16000)
-    p.add_argument("--ctc_weight", type=float, default=0.3, help="辅助 loss 权重")
+    p.add_argument("--ctc_weight", type=float, default=0.3, help="辅助 loss 权重；train_mode=llm_only 时忽略")
+    p.add_argument("--train_mode", type=str, default="joint", choices=["joint", "aux_only", "llm_only"], help="训练模式")
     p.add_argument("--aux_loss_type", type=str, default="ctc", choices=["ctc", "rnnt"])
-    p.add_argument("--aux_only", type=int, default=0, help="只使用 CTC/RNNT loss，跳过 LLM forward")
     p.add_argument("--aux_train_encoder", type=int, default=0, help="aux_only 时同时训练 audio encoder；0 表示只训练辅助头")
     p.add_argument("--aux_encoder_batch_size", type=int, default=1, help="CTC/RNNT 辅助头 audio encoder micro-batch，1 最稳")
     p.add_argument("--aux_streaming_train", type=int, default=0, help="训练 aux loss 时使用流式窗口：当前块 + 随机左上下文 + 右上下文")
@@ -623,6 +652,7 @@ def main():
     args_cli = parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main = local_rank == 0
+    train_mode = args_cli.train_mode
 
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required.")
@@ -697,9 +727,10 @@ def main():
         qwen_model=qwen_model,
         vocab_size=len(vocab),
         vocab=vocab,
-        ctc_weight=args_cli.ctc_weight,
+        ctc_weight=0.0 if train_mode == "llm_only" else args_cli.ctc_weight,
         blank_id=0,
-        ctc_only=(args_cli.aux_only == 1),
+        ctc_only=(train_mode == "aux_only"),
+        train_mode=train_mode,
         aux_loss_type=args_cli.aux_loss_type,
         aux_encoder_batch_size=args_cli.aux_encoder_batch_size,
         aux_streaming_train=(args_cli.aux_streaming_train == 1),
@@ -709,9 +740,14 @@ def main():
         aux_stream_random_left=(args_cli.aux_stream_random_left == 1),
         aux_stream_window_batch_size=args_cli.aux_stream_window_batch_size,
     )
-    load_aux_from_model_path(joint_model, args_cli.model_path, is_main=is_main)
+    loaded_aux = load_aux_from_model_path(joint_model, args_cli.model_path, is_main=is_main)
+    if train_mode == "llm_only" and not loaded_aux:
+        raise RuntimeError(
+            "train_mode=llm_only 会冻结辅助头，必须从已有联合 checkpoint 启动。"
+            "请把 --model_path 指向包含 ctc_config.json 和 ctc_head.pt/rnnt_head.pt 的目录。"
+        )
 
-    if args_cli.aux_only == 1:
+    if train_mode == "aux_only":
         enable_aux_only_training(joint_model, train_encoder=(args_cli.aux_train_encoder == 1))
         if local_rank == 0:
             trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
@@ -720,6 +756,13 @@ def main():
                 print("Aux-only：训练 Encoder + 辅助头，跳过 LLM loss")
             else:
                 print("Aux-only：只训练辅助头")
+            print(f"可训练参数：{trainable:,} / {total:,}")
+    elif train_mode == "llm_only":
+        enable_llm_only_training(joint_model)
+        if local_rank == 0:
+            trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in joint_model.parameters())
+            print("LLM-only：冻结 Audio Encoder + 辅助头，只训练 LLM")
             print(f"可训练参数：{trainable:,} / {total:,}")
 
     with PartialState().main_process_first():
@@ -799,6 +842,8 @@ def main():
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()
+
+    trainer.save_model(training_args.output_dir)
 
 
 if __name__ == "__main__":

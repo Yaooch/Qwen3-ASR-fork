@@ -50,13 +50,14 @@ cd "${SCRIPT_DIR}"
 # /cfs/data/private/hubk/asr_test_set/hotWords_test_set/wav.scp
 # /cfs/data/private/hubk/asr_test_set/hotWords_test_set/text
 
-CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
+# CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
+CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword/checkpoint-342"
 # CKPT="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 STAGE="all"
 MODE="joint"
-INPUT_SCP="/cfs/data/private/hubk/asr_test_set/hotWords_test_set/wav.scp"
-REF_DIR="/cfs/data/private/hubk/asr_test_set/hotWords_test_set/text"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14/hotword_hubk/ctc_no_hotword"
+INPUT_SCP="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/wav.scp"
+REF_DIR="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/text"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword/hotword_aishell/ctc_no_hotword"
 GPU_IDS="0,1,2,3"
 BATCH_SIZE=128
 DTYPE="bf16"

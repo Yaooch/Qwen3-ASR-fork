@@ -32,6 +32,7 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
         ctc_layer_idx: Optional[int] = None,
         ctc_position: str = "pre_proj",
         ctc_only: bool = False,
+        train_mode: str = "joint",
         aux_loss_type: str = "ctc",
         aux_encoder_batch_size: int = 1,
         aux_streaming_train: bool = False,
@@ -52,6 +53,7 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
         self.ctc_layer_idx = ctc_layer_idx
         self.ctc_position = ctc_position
         self.ctc_only = ctc_only
+        self.train_mode = train_mode
         self.aux_loss_type = aux_loss_type
         self.aux_encoder_batch_size = aux_encoder_batch_size
         self.aux_streaming_train = aux_streaming_train
@@ -135,6 +137,7 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             ctc_layer_idx=cfg.get("ctc_layer_idx", None),
             ctc_position=cfg.get("ctc_position", "pre_proj"),
             ctc_only=ctc_only if ctc_only is not None else cfg.get("ctc_only", False),
+            train_mode=cfg.get("train_mode", "joint"),
             aux_loss_type=aux_loss_type,
             aux_encoder_batch_size=cfg.get("aux_encoder_batch_size", 1),
             aux_streaming_train=cfg.get("aux_streaming_train", False),
@@ -188,6 +191,7 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             "blank_id": self.blank_id,
             "ctc_weight": self.ctc_weight,
             "ctc_only": self.ctc_only,
+            "train_mode": self.train_mode,
             "aux_loss_type": self.aux_loss_type,
             "aux_encoder_batch_size": self.aux_encoder_batch_size,
             "aux_streaming_train": self.aux_streaming_train,
@@ -337,7 +341,9 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
         texts=None,
         **kwargs,
     ):
-        use_streaming_aux_train = bool(self.training and self.aux_streaming_train)
+        use_streaming_aux_train = bool(
+            self.training and self.aux_streaming_train and self.train_mode != "llm_only"
+        )
         if use_streaming_aux_train:
             hs_pad, out_lens = self._enc_train_stream(
                 input_features,
@@ -357,7 +363,11 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
                 need_llm_features=not self.ctc_only,
             )
 
-        aux_loss = self._aux_loss(hs_pad, out_lens, ctc_target_ids, ctc_target_lengths)
+        compute_aux = self.ctc_only or self.train_mode != "llm_only"
+        if compute_aux:
+            aux_loss = self._aux_loss(hs_pad, out_lens, ctc_target_ids, ctc_target_lengths)
+        else:
+            aux_loss = torch.zeros((), device=input_features.device, dtype=hs_pad.dtype)
 
         if self.ctc_only:
             llm_loss = torch.zeros_like(aux_loss)
@@ -384,7 +394,11 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             labels=labels,
         )
         llm_loss = llm_out.loss
-        loss = (1.0 - self.ctc_weight) * llm_loss + self.ctc_weight * aux_loss
+        if compute_aux:
+            loss = (1.0 - self.ctc_weight) * llm_loss + self.ctc_weight * aux_loss
+        else:
+            aux_loss = torch.zeros_like(llm_loss)
+            loss = llm_loss
 
         outputs = {
             "loss": loss,
@@ -392,9 +406,9 @@ class Qwen3ASRJointModel(TrainMixin, StreamMixin, DecodeMixin, nn.Module):
             "aux_loss": aux_loss,
             "output_lengths": out_lens,
         }
-        if self.aux_loss_type == "ctc":
+        if compute_aux and self.aux_loss_type == "ctc":
             outputs["ctc_loss"] = aux_loss
             outputs["log_probs"] = self.ctc.log_softmax(hs_pad)
-        else:
+        elif compute_aux:
             outputs["rnnt_loss"] = aux_loss
         return outputs
