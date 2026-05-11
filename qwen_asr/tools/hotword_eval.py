@@ -53,6 +53,7 @@ class Counts:
     correction_retrieved: int = 0
     correction_success: int = 0
     correction_success_after_retrieval: int = 0
+    correction_regressions: int = 0
     retrieved_total: int = 0
     retrieved_true: int = 0
     retrieved_false: int = 0
@@ -452,12 +453,13 @@ def evaluate(args: argparse.Namespace) -> Tuple[Counts, List[dict], Dict[str, Li
             counts.top5_hits += int(rank is not None and rank <= 5)
             counts.top10_hits += int(rank is not None and rank <= 10)
 
-            if not aux_hit:
+            if not baseline_hit:
                 counts.correction_candidates += 1
                 counts.correction_retrieved += int(retrieval_hit)
                 counts.correction_success += int(final_hit)
                 counts.correction_success_after_retrieval += int(retrieval_hit and final_hit)
-            if not aux_hit and retrieval_hit and final_hit:
+            counts.correction_regressions += int(baseline_hit and not final_hit)
+            if not baseline_hit and retrieval_hit and final_hit:
                 corrected += 1
 
             aux_hits += int(aux_hit)
@@ -470,7 +472,8 @@ def evaluate(args: argparse.Namespace) -> Tuple[Counts, List[dict], Dict[str, Li
                 "retrieval_rank": rank,
                 "retrieval_hit": retrieval_hit,
                 "final_hit": final_hit,
-                "corrected": bool((not aux_hit) and retrieval_hit and final_hit),
+                "corrected": bool((not baseline_hit) and retrieval_hit and final_hit),
+                "regressed": bool(baseline_hit and not final_hit),
             })
 
         ref_compact, ref_hotword_mask = hotword_mask(ref_text, target_set, args.case_sensitive)
@@ -570,24 +573,28 @@ def write_summary(path: str, counts: Counts, missing: int, missing_baseline: int
         print(f"误召回数：{counts.retrieved_false}", file=f)
         print("", file=f)
         print("识别：", file=f)
-        print(f"辅助头热词识别率：{percent(counts.aux_hit_instances, counts.target_instances)}", file=f)
         if has_baseline:
             print(f"baseline LLM 热词识别率：{percent(counts.baseline_hit_instances, counts.target_instances)}", file=f)
+        else:
+            print(f"对比文本热词识别率：{percent(counts.baseline_hit_instances, counts.target_instances)}", file=f)
         print(f"最终热词识别率：{percent(counts.final_hit_instances, counts.target_instances)}", file=f)
         print(f"召回后识别率：{ratio_text(recognized_after_retrieval)}", file=f)
         print("", file=f)
         print("纠错：", file=f)
-        print(f"可纠错热词数：{counts.correction_candidates}", file=f)
-        print(f"可纠错热词召回率：{percent(counts.correction_retrieved, counts.correction_candidates)}", file=f)
-        print(f"整体纠错成功率：{percent(counts.correction_success, counts.correction_candidates)}", file=f)
-        print(f"召回后纠错成功率：{ratio_text(correction_after_retrieval)}", file=f)
+        base_name = "baseline LLM" if has_baseline else "对比文本"
+        print(f"{base_name} 未识别热词数：{counts.correction_candidates}", file=f)
+        print(f"{base_name} 未识别热词召回率：{percent(counts.correction_retrieved, counts.correction_candidates)}", file=f)
+        print(f"相对 {base_name} 新增修对数：{counts.correction_success}", file=f)
+        print(f"相对 {base_name} 整体纠错成功率：{percent(counts.correction_success, counts.correction_candidates)}", file=f)
+        print(f"相对 {base_name} 召回后纠错成功率：{ratio_text(correction_after_retrieval)}", file=f)
+        print(f"相对 {base_name} 热词改坏数：{counts.correction_regressions}", file=f)
+        print(f"相对 {base_name} 热词净增数：{counts.correction_success - counts.correction_regressions}", file=f)
         print("", file=f)
         print("风险：", file=f)
         print(f"无热词样本误召回样本数：{counts.no_target_retrieved_samples}", file=f)
         print(f"误注入识别热词数：{counts.false_final_hotwords}", file=f)
         print(f"无热词样本误注入识别样本数：{counts.no_target_false_final_samples}", file=f)
         print(f"非热词退化样本数：{counts.nonhot_degraded_samples}", file=f)
-        base_name = "baseline LLM" if has_baseline else "辅助头"
         print(f"{base_name}非热词 CER：{ratio_text(counts.baseline_nonhot.cer)}", file=f)
         print(f"最终非热词 CER：{ratio_text(counts.final_nonhot.cer)}", file=f)
 
@@ -604,24 +611,42 @@ def write_detail(path: Optional[str], rows: Sequence[dict]) -> None:
 def write_badcases(path: Optional[str], badcases: Dict[str, List[dict]], topk: int) -> None:
     if not path:
         return
+
+    def show(label: str, value) -> None:
+        text = str(value)
+        text = text.replace("\n", "\n" + " " * 24)
+        print(f"{label:<22}: {text}", file=f)
+
+    def yn(value: bool) -> str:
+        return "Y" if value else "N"
+
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for name, rows in badcases.items():
-            print(f"[{name}] count={len(rows)}", file=f)
+            print(f"=============== {name} count={len(rows)} ===============", file=f)
             for row in rows[:topk]:
-                print(f"utt_id: {row['utt_id']}", file=f)
-                print(f"target: {','.join(row['target_hotwords'])}", file=f)
-                print(f"retrieved: {','.join(row['retrieved'])}", file=f)
-                print(f"false_retrieved: {','.join(row['false_retrieved'])}", file=f)
-                print(f"false_final_hotwords: {','.join(row['false_final_hotwords'])}", file=f)
-                print(f"baseline_nonhot_cer: {row['baseline_nonhot_cer']:.4f}", file=f)
-                print(f"final_nonhot_cer: {row['final_nonhot_cer']:.4f}", file=f)
-                print(f"ref: {row['ref_norm']}", file=f)
-                print(f"aux: {row['aux_norm']}", file=f)
-                print(f"baseline: {row['baseline_norm']}", file=f)
-                print(f"final: {row['final_norm']}", file=f)
+                target_detail = []
+                for target in row["targets"]:
+                    rank = target["retrieval_rank"] if target["retrieval_rank"] is not None else "-"
+                    target_detail.append(
+                        f"{target['word']}(aux={yn(target['aux_hit'])},base={yn(target['baseline_hit'])},"
+                        f"rank={rank},final={yn(target['final_hit'])},fix={yn(target['corrected'])},"
+                        f"bad={yn(target.get('regressed', False))})"
+                    )
+                show("utt_id", row["utt_id"])
+                show("target", ",".join(row["target_hotwords"]))
+                show("target_detail", " ".join(target_detail))
+                show("retrieved", ",".join(row["retrieved"]))
+                show("false_retrieved", ",".join(row["false_retrieved"]))
+                show("false_final_hotwords", ",".join(row["false_final_hotwords"]))
+                show("baseline_nonhot_cer", f"{row['baseline_nonhot_cer']:.4f}")
+                show("final_nonhot_cer", f"{row['final_nonhot_cer']:.4f}")
+                show("ref", row["ref_norm"])
+                show("aux", row["aux_norm"])
+                show("baseline", row["baseline_norm"])
+                show("final", row["final_norm"])
                 if row.get("prompt"):
-                    print(f"prompt: {row['prompt']}", file=f)
+                    show("prompt", row["prompt"])
                 print("", file=f)
             print("", file=f)
 

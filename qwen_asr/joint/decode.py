@@ -559,7 +559,7 @@ class DecodeMixin:
         if prompt:
             parts.append(prompt)
         if hotwords:
-            parts.append("相关热词：[" + "，".join(hotwords) + "]" )
+            parts.append("专属名词列表如下：[" + "，".join(hotwords) + "]" )
 
         return ("\n".join(parts) if parts else None), hotwords
 
