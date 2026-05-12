@@ -96,8 +96,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hotword_file",
-        required=True,
+        default="",
         help="热词文件，每行一个热词。",
+    )
+    parser.add_argument(
+        "--utt_hotword_path",
+        default="",
+        help="可选：逐条目标热词文件，每行：utt_id<TAB>热词1,热词2,...。优先于 --hotword_file 匹配。",
     )
     parser.add_argument(
         "--output_path",
@@ -207,6 +212,8 @@ def read_refs(path: str) -> Dict[str, str]:
 
 
 def read_hotwords(path: str) -> List[str]:
+    if not path:
+        return []
     words = []
     seen = set()
     with open(path, "r", encoding="utf-8") as f:
@@ -219,6 +226,22 @@ def read_hotwords(path: str) -> List[str]:
             seen.add(word)
             words.append(word)
     return words
+
+
+def read_utt_hotwords(path: str) -> Dict[str, List[str]]:
+    if not path:
+        return {}
+    rows: Dict[str, List[str]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            rows[parts[0]] = field_hotwords({"hotwords": parts[1]}, "hotwords")
+    return rows
 
 
 def read_details(path: str) -> Dict[str, dict]:
@@ -256,6 +279,16 @@ def target_instances(ref_text: str, hotwords: Sequence[str], case_sensitive: boo
     for word in hotwords:
         norm_word = compact(word, case_sensitive=case_sensitive)
         for _ in range(count_occurrences(ref, norm_word)):
+            out.append(word)
+    return out
+
+
+def annotated_targets(hotwords: Sequence[str], ref_text: str, case_sensitive: bool) -> List[str]:
+    ref = compact(ref_text, case_sensitive=case_sensitive)
+    out = []
+    for word in hotwords:
+        norm_word = compact(word, case_sensitive=case_sensitive)
+        if norm_word and norm_word in ref:
             out.append(word)
     return out
 
@@ -305,6 +338,13 @@ def edit_distance_counts(
     m = len(hyp)
     if exclude_ref_mask is None:
         exclude_ref_mask = [False] * n
+
+    try:
+        from rapidfuzz.distance import Levenshtein
+        return edit_distance_counts_fast(ref, hyp, exclude_ref_mask, Levenshtein)
+    except ImportError:
+        pass
+
     dp = [[0] * (m + 1) for _ in range(n + 1)]
     bt = [[""] * (m + 1) for _ in range(n + 1)]
 
@@ -352,6 +392,58 @@ def edit_distance_counts(
     return result
 
 
+def edit_distance_counts_fast(
+    ref: Sequence[str],
+    hyp: Sequence[str],
+    exclude_ref_mask: Sequence[bool],
+    levenshtein,
+) -> EditResult:
+    result = EditResult(n=sum(1 for x in exclude_ref_mask if not x))
+    ref_text = "".join(ref)
+    hyp_text = "".join(hyp)
+
+    for op in levenshtein.opcodes(ref_text, hyp_text):
+        src_len = op.src_end - op.src_start
+        dest_len = op.dest_end - op.dest_start
+        if op.tag == "equal":
+            for pos in range(op.src_start, op.src_end):
+                if not exclude_ref_mask[pos]:
+                    result.cor += 1
+        elif op.tag == "delete":
+            for pos in range(op.src_start, op.src_end):
+                if not exclude_ref_mask[pos]:
+                    result.dele += 1
+        elif op.tag == "insert":
+            near_excluded = (
+                (op.src_start > 0 and exclude_ref_mask[op.src_start - 1])
+                or (op.src_start < len(ref) and exclude_ref_mask[op.src_start])
+            )
+            if not near_excluded:
+                result.ins += dest_len
+        elif op.tag == "replace":
+            pair_len = min(src_len, dest_len)
+            for offset in range(pair_len):
+                pos = op.src_start + offset
+                if not exclude_ref_mask[pos]:
+                    result.sub += 1
+
+            for pos in range(op.src_start + pair_len, op.src_end):
+                if not exclude_ref_mask[pos]:
+                    result.dele += 1
+
+            extra_ins = dest_len - pair_len
+            if extra_ins > 0:
+                near_pos = op.src_end
+                near_excluded = (
+                    (near_pos > 0 and exclude_ref_mask[near_pos - 1])
+                    or (near_pos < len(ref) and exclude_ref_mask[near_pos])
+                )
+                if not near_excluded:
+                    result.ins += extra_ins
+
+    return result
+
+
 def field_text(obj: dict, field: str) -> str:
     return str(obj.get(field) or "")
 
@@ -361,7 +453,7 @@ def field_hotwords(obj: dict, field: str) -> List[str]:
     if isinstance(val, list):
         return [str(x) for x in val if str(x)]
     if isinstance(val, str):
-        return [x.strip() for x in re.split(r"[,，\s]+", val) if x.strip()]
+        return [x.strip() for x in re.split(r"[,，]+", val) if x.strip()]
     return []
 
 
@@ -378,6 +470,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[Counts, List[dict], Dict[str, Li
     details = read_details(args.detail_path)
     baseline_details = read_details(args.baseline_detail_path) if args.baseline_detail_path else {}
     hotwords = read_hotwords(args.hotword_file)
+    utt_hotwords = read_utt_hotwords(args.utt_hotword_path)
     counts = Counts()
     detail_rows: List[dict] = []
     badcases = {
@@ -405,7 +498,10 @@ def evaluate(args: argparse.Namespace) -> Tuple[Counts, List[dict], Dict[str, Li
         baseline_text = field_text(base_obj, args.baseline_field) if base_obj is not None else aux_text
         retrieved = field_hotwords(obj, args.hotwords_field)
         prompt = obj.get("prompt")
-        targets = target_instances(ref_text, hotwords, args.case_sensitive)
+        if utt_hotwords:
+            targets = annotated_targets(utt_hotwords.get(utt_id, []), ref_text, args.case_sensitive)
+        else:
+            targets = target_instances(ref_text, hotwords, args.case_sensitive)
         target_set = set(targets)
         retrieved_set = set(retrieved)
 
@@ -617,31 +713,18 @@ def write_badcases(path: Optional[str], badcases: Dict[str, List[dict]], topk: i
         text = text.replace("\n", "\n" + " " * 24)
         print(f"{label:<22}: {text}", file=f)
 
-    def yn(value: bool) -> str:
-        return "Y" if value else "N"
-
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for name, rows in badcases.items():
             print(f"=============== {name} count={len(rows)} ===============", file=f)
             for row in rows[:topk]:
-                target_detail = []
-                for target in row["targets"]:
-                    rank = target["retrieval_rank"] if target["retrieval_rank"] is not None else "-"
-                    target_detail.append(
-                        f"{target['word']}(aux={yn(target['aux_hit'])},base={yn(target['baseline_hit'])},"
-                        f"rank={rank},final={yn(target['final_hit'])},fix={yn(target['corrected'])},"
-                        f"bad={yn(target.get('regressed', False))})"
-                    )
                 show("utt_id", row["utt_id"])
                 show("target", ",".join(row["target_hotwords"]))
-                show("target_detail", " ".join(target_detail))
                 show("retrieved", ",".join(row["retrieved"]))
                 show("false_retrieved", ",".join(row["false_retrieved"]))
-                show("false_final_hotwords", ",".join(row["false_final_hotwords"]))
                 show("baseline_nonhot_cer", f"{row['baseline_nonhot_cer']:.4f}")
                 show("final_nonhot_cer", f"{row['final_nonhot_cer']:.4f}")
-                show("ref", row["ref_norm"])
+                show("label", row["ref_norm"])
                 show("aux", row["aux_norm"])
                 show("baseline", row["baseline_norm"])
                 show("final", row["final_norm"])

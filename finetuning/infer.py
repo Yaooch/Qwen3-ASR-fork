@@ -521,11 +521,15 @@ def worker_main(rank: int, gpu_id: int, shard: List[Dict], args, tmp_output_path
 
     hotword_retriever = None
     if args.mode == "joint" and args.hotword_file:
+        log(f"进程{rank}构建热词检索器")
         hotword_retriever = make_hotword_retriever(args)
+        log(f"进程{rank}热词检索器完成")
 
     all_records = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(batchify(shard, args.batch_size), 1):
+            if batch_idx == 1 or batch_idx % 10 == 0:
+                log(f"进程{rank}推理 batch {batch_idx}")
             batch_records = run_batch_infer(
                 model=model,
                 batch=batch,

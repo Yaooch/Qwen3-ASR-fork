@@ -2,7 +2,7 @@
 """热词召回：用粗识别文本做拼音滑窗检索。"""
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 
 NEAR_INITIALS = {
@@ -70,6 +70,9 @@ class HotwordRetriever:
         self._tone3_style = None
         self._initials_style = None
         self._finals_style = None
+        self._py_index = {}
+        self._initial_index = {}
+        self._final_index = {}
 
         try:
             from rapidfuzz import fuzz
@@ -86,6 +89,7 @@ class HotwordRetriever:
                 self._initials_style = Style.INITIALS
                 self._finals_style = Style.FINALS
                 self._entries = [self._entry(w) for w in self.hotwords]
+                self._build_index()
             except ImportError:
                 print("未安装 pypinyin，热词检索改用字符相似度")
                 self.scorer = "fuzz"
@@ -119,7 +123,7 @@ class HotwordRetriever:
         q_finals = self._tokens(query, self._finals_style)
 
         best = {}
-        for entry in self._entries:
+        for entry in self._candidates(q_py, q_initials, q_finals, topk):
             if not entry.py:
                 continue
             score = self._best_score(entry, q_py, q_tone, q_initials, q_finals)
@@ -129,6 +133,71 @@ class HotwordRetriever:
 
         ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
         return [w for w, _ in ranked[:topk]]
+
+    def _candidates(
+        self,
+        q_py: Sequence[str],
+        q_initials: Sequence[str],
+        q_finals: Sequence[str],
+        topk: int,
+    ) -> List[HotwordEntry]:
+        """先做拼音粗排，避免每条语音都全表滑窗精算。"""
+        if len(self._entries) <= 1024:
+            return self._entries
+
+        q_len = len(q_py)
+        limit = max(64, topk * 16)
+        if self._fuzz is None:
+            return self._indexed_candidates(q_py, q_initials, q_finals, q_len, limit)
+
+        q_text = " ".join(q_py)
+        scored = []
+        for entry in self._entries:
+            h_len = len(entry.py)
+            if not h_len or h_len > q_len + 1:
+                continue
+            score = self._fuzz.partial_ratio(q_text, " ".join(entry.py))
+            if score >= 35:
+                scored.append((score, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _score, entry in scored[:limit]]
+
+    def _indexed_candidates(
+        self,
+        q_py: Sequence[str],
+        q_initials: Sequence[str],
+        q_finals: Sequence[str],
+        q_len: int,
+        limit: int,
+    ) -> List[HotwordEntry]:
+        scores = {}
+        entries = {}
+
+        def add(cands, weight: int) -> None:
+            for entry in cands:
+                if len(entry.py) > q_len + 1:
+                    continue
+                scores[entry.word] = scores.get(entry.word, 0) + weight
+                entries[entry.word] = entry
+
+        for py in set(q_py):
+            add(self._py_index.get(py, []), 4)
+        for initial in set(q_initials):
+            if not initial:
+                continue
+            add(self._initial_index.get(initial, []), 1)
+            for near in NEAR_INITIALS.get(initial, set()):
+                add(self._initial_index.get(near, []), 1)
+        for final in set(q_finals):
+            if not final:
+                continue
+            add(self._final_index.get(final, []), 1)
+            for near in NEAR_FINALS.get(final, set()):
+                add(self._final_index.get(near, []), 1)
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [entries[word] for word, _score in ranked[:limit]]
 
     def _best_score(
         self,
@@ -272,6 +341,15 @@ class HotwordRetriever:
             initials=self._tokens(word, self._initials_style),
             finals=self._tokens(word, self._finals_style),
         )
+
+    def _build_index(self) -> None:
+        for entry in self._entries:
+            for py in set(entry.py):
+                self._py_index.setdefault(py, []).append(entry)
+            for initial in {x for x in entry.initials if x}:
+                self._initial_index.setdefault(initial, []).append(entry)
+            for final in {x for x in entry.finals if x}:
+                self._final_index.setdefault(final, []).append(entry)
 
     def _tokens(self, text: str, style) -> List[str]:
         tokens = []

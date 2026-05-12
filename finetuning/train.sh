@@ -29,7 +29,7 @@ export OMP_NUM_THREADS=4
 MODEL_PATH="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
 TRAIN_FILE=${TRAIN_FILE:-"/cfs/data/private/WangYaoChi/train_data/all/train_contextasr.jsonl"}
 EVAL_FILE=${EVAL_FILE:-"/cfs/data/private/WangYaoChi/train_data/all/eval_contextasr.jsonl"}
-OUTPUT_DIR=${OUTPUT_DIR:-"/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1"}
 
 VOCAB_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/lang_char_large_yue.txt"
 SP_MODEL_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"
@@ -38,7 +38,7 @@ SP_MODEL_PATH="/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dic
 # 实际总 batch = BATCH_SIZE * GRAD_ACC * NUM_GPUS
 BATCH_SIZE=${BATCH_SIZE:-8}
 GRAD_ACC=${GRAD_ACC:-4}
-EPOCHS=${EPOCHS:-3}
+EPOCHS=${EPOCHS:-2}
 
 # 辅助损失类型：ctc / rnnt。RNNT 更占显存。
 AUX_LOSS_TYPE=${AUX_LOSS_TYPE:-ctc}
@@ -47,7 +47,7 @@ TRAIN_MODE=${TRAIN_MODE:-llm_only}
 # train_mode=aux_only 时，是否同时训练 audio encoder。
 AUX_TRAIN_ENCODER=${AUX_TRAIN_ENCODER:-0}
 
-QWEN_LR=${QWEN_LR:-1e-5}
+QWEN_LR=${QWEN_LR:-5e-6}
 AUX_LR=${AUX_LR:-2e-3}
 # train_mode=llm_only 时不计算辅助 loss，此值会被忽略。
 AUX_WEIGHT=${AUX_WEIGHT:-0.1}

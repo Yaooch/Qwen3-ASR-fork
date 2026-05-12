@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # 批量推理配置。按需手动修改下面这些变量和 DATASETS。
-CKPT="${CKPT:-/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/}"
-EXP_CODE="${EXP_CODE:-joint_ctc_14}"
-MODE="${MODE:-joint}"
+CKPT="${CKPT:-/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228/}"
+EXP_CODE="${EXP_CODE:-joint_ctc_14_hotword_1}"
+MODE="${MODE:-llm}"
 STAGE="${STAGE:-all}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
@@ -15,6 +15,7 @@ DTYPE="${DTYPE:-bf16}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OUT_PREFIX="${OUT_PREFIX:-/cfs/data/private/WangYaoChi/test_out}"
 SKIP_DONE="${SKIP_DONE:-1}"
+PROMPT="${PROMPT:-"转写语音，专属名词优先按列表原文输出。"}"
 
 RNNT_MAX_SYMBOLS_PER_STEP="${RNNT_MAX_SYMBOLS_PER_STEP:-3}"
 AUX_ENCODER_BATCH_SIZE="${AUX_ENCODER_BATCH_SIZE:-4}"
@@ -292,6 +293,9 @@ for item in "${DATASETS[@]}"; do
         cmd+=(--stream)
     else
         cmd+=(--no_stream)
+    fi
+    if [[ -n "${PROMPT}" ]]; then
+        cmd+=(--prompt "${PROMPT}")
     fi
 
     "${cmd[@]}"

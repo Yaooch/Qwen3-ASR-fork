@@ -51,19 +51,19 @@ cd "${SCRIPT_DIR}"
 # /cfs/data/private/hubk/asr_test_set/hotWords_test_set/text
 
 # CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
-CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword/checkpoint-342"
+CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
 # CKPT="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 STAGE="all"
 MODE="joint"
 INPUT_SCP="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/wav.scp"
 REF_DIR="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/text"
-OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword/hotword_aishell/ctc_no_hotword"
+OUTPUT_DIR="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_1/hotword_aishell/ctc_no_hotword"
 GPU_IDS="0,1,2,3"
 BATCH_SIZE=128
 DTYPE="bf16"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LANGUAGE=""
-PROMPT=""
+PROMPT="转写语音，专属名词优先按列表原文输出。"
 # PROMPT="你是一个拥有超高精度的语音识别引擎。专属名词列表如下:[孙作为, 宋雪倩, 薛思皓, 郭震, 户保坤, 岑吴镕, 王瑶池, 应臻奕, 淮水竹亭, 白月梵星, 清华池]。请根据音频内容进行识别，当遇到音素类似的词汇时，必须优先匹配列表中的专属名词，而不是通用词汇。"
 HOTWORD_FILE=""
 HOTWORD_TOPK=5
