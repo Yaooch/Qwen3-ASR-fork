@@ -1,7 +1,6 @@
-# qwen_asr/joint/hotword.py
+# qwen_asr/joint/hotword.pinyin
 """热词召回：用粗识别文本做拼音滑窗检索。"""
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import List, Optional, Sequence
 
 
@@ -44,8 +43,8 @@ NEAR_FINALS = {
 @dataclass
 class HotwordEntry:
     word: str
-    py: List[str]
-    tone_py: List[str]
+    pinyin: List[str]
+    tone_pinyin: List[str]
     initials: List[str]
     finals: List[str]
 
@@ -56,12 +55,10 @@ class HotwordRetriever:
     def __init__(
         self,
         hotwords: List[str],
-        scorer: str = "pinyin",
         pinyin_style: str = "normal",
         min_score: Optional[float] = None,
     ):
         self.hotwords = [h.strip() for h in hotwords if h.strip()]
-        self.scorer = scorer
         self.pinyin_style = pinyin_style
         self.min_score = min_score
         self._entries = []
@@ -70,33 +67,22 @@ class HotwordRetriever:
         self._tone3_style = None
         self._initials_style = None
         self._finals_style = None
-        self._py_index = {}
+        self._pinyin_index = {}
         self._initial_index = {}
         self._final_index = {}
 
         try:
-            from rapidfuzz import fuzz
-            self._fuzz = fuzz
-        except ImportError:
-            self._fuzz = None
+            from pypinyin import Style, lazy_pinyin
+        except ImportError as exc:
+            raise RuntimeError("缺少依赖 pypinyin，请先安装后再使用热词召回。") from exc
 
-        if scorer == "pinyin":
-            try:
-                from pypinyin import Style, lazy_pinyin
-                self._lazy_pinyin = lazy_pinyin
-                self._style = self._parse_style(Style, pinyin_style)
-                self._tone3_style = Style.TONE3
-                self._initials_style = Style.INITIALS
-                self._finals_style = Style.FINALS
-                self._entries = [self._entry(w) for w in self.hotwords]
-                self._build_index()
-            except ImportError:
-                print("未安装 pypinyin，热词检索改用字符相似度")
-                self.scorer = "fuzz"
-
-        if self.scorer == "edit":
-            import editdistance
-            self._ed = editdistance
+        self._lazy_pinyin = lazy_pinyin
+        self._style = self._parse_style(Style, pinyin_style)
+        self._tone3_style = Style.TONE3
+        self._initials_style = Style.INITIALS
+        self._finals_style = Style.FINALS
+        self._entries = [self._entry(w) for w in self.hotwords]
+        self._build_index()
 
     @classmethod
     def from_file(cls, path: str, **kwargs):
@@ -107,11 +93,7 @@ class HotwordRetriever:
     def retrieve(self, query: str, topk: int = 10) -> List[str]:
         if not self.hotwords or not query:
             return []
-        if self.scorer == "pinyin":
-            return self._retrieve_pinyin(query, topk=topk)
-        if self.scorer == "edit":
-            return self._retrieve_edit(query, topk=topk)
-        return self._retrieve_fuzz(query, topk=topk)
+        return self._retrieve_pinyin(query, topk=topk)
 
     def _retrieve_pinyin(self, query: str, topk: int) -> List[str]:
         q_py = self._tokens(query, self._style)
@@ -124,10 +106,10 @@ class HotwordRetriever:
 
         best = {}
         for entry in self._candidates(q_py, q_initials, q_finals, topk):
-            if not entry.py:
+            if not entry.pinyin:
                 continue
             score = self._best_score(entry, q_py, q_tone, q_initials, q_finals)
-            threshold = self.min_score if self.min_score is not None else self._threshold(len(entry.py))
+            threshold = self.min_score if self.min_score is not None else self._threshold(len(entry.pinyin))
             if score >= threshold and score > best.get(entry.word, 0.0):
                 best[entry.word] = score
 
@@ -153,10 +135,10 @@ class HotwordRetriever:
         q_text = " ".join(q_py)
         scored = []
         for entry in self._entries:
-            h_len = len(entry.py)
+            h_len = len(entry.pinyin)
             if not h_len or h_len > q_len + 1:
                 continue
-            score = self._fuzz.partial_ratio(q_text, " ".join(entry.py))
+            score = self._fuzz.partial_ratio(q_text, " ".join(entry.pinyin))
             if score >= 35:
                 scored.append((score, entry))
 
@@ -176,13 +158,13 @@ class HotwordRetriever:
 
         def add(cands, weight: int) -> None:
             for entry in cands:
-                if len(entry.py) > q_len + 1:
+                if len(entry.pinyin) > q_len + 1:
                     continue
                 scores[entry.word] = scores.get(entry.word, 0) + weight
                 entries[entry.word] = entry
 
-        for py in set(q_py):
-            add(self._py_index.get(py, []), 4)
+        for pinyin in set(q_py):
+            add(self._pinyin_index.get(pinyin, []), 4)
         for initial in set(q_initials):
             if not initial:
                 continue
@@ -207,7 +189,7 @@ class HotwordRetriever:
         q_initials: List[str],
         q_finals: List[str],
     ) -> float:
-        h_len = len(entry.py)
+        h_len = len(entry.pinyin)
         q_len = len(q_py)
         min_len = max(1, h_len - 1)
         max_len = min(q_len, h_len + 2)
@@ -233,17 +215,17 @@ class HotwordRetriever:
     def _window_score(
         self,
         entry: HotwordEntry,
-        py: List[str],
-        tone_py: List[str],
+        pinyin: List[str],
+        tone_pinyin: List[str],
         initials: List[str],
         finals: List[str],
     ) -> float:
-        py_score = self._ratio(entry.py, py)
-        tone_score = self._ratio(entry.tone_py, tone_py)
+        py_score = self._ratio(entry.pinyin, pinyin)
+        tone_score = self._ratio(entry.tone_pinyin, tone_pinyin)
         initial_score = self._ratio(entry.initials, initials)
         final_score = self._ratio(entry.finals, finals)
-        aligned_score = self._aligned_score(entry, py, initials, finals)
-        length_penalty = abs(len(entry.py) - len(py)) * 0.08
+        aligned_score = self._aligned_score(entry, pinyin, initials, finals)
+        length_penalty = abs(len(entry.pinyin) - len(pinyin)) * 0.08
 
         score = (
             0.45 * py_score
@@ -253,25 +235,25 @@ class HotwordRetriever:
             + 0.15 * aligned_score
             - length_penalty
         )
-        if entry.py == py:
+        if entry.pinyin == pinyin:
             score += 0.06
-        if entry.tone_py == tone_py:
+        if entry.tone_pinyin == tone_pinyin:
             score += 0.03
-        score = max(score, self._short_name_score(entry, py, initials, finals) - length_penalty)
+        score = max(score, self._short_name_score(entry, pinyin, initials, finals) - length_penalty)
         return min(1.0, max(0.0, score))
 
     def _aligned_score(
         self,
         entry: HotwordEntry,
-        py: List[str],
+        pinyin: List[str],
         initials: List[str],
         finals: List[str],
     ) -> float:
-        if len(entry.py) != len(py) or not py:
+        if len(entry.pinyin) != len(pinyin) or not pinyin:
             return 0.0
         scores = []
         for h_py, q_py, h_i, q_i, h_f, q_f in zip(
-            entry.py, py, entry.initials, initials, entry.finals, finals
+            entry.pinyin, pinyin, entry.initials, initials, entry.finals, finals
         ):
             scores.append(self._syllable_score(h_py, q_py, h_i, q_i, h_f, q_f))
         return sum(scores) / len(scores)
@@ -279,12 +261,12 @@ class HotwordRetriever:
     def _short_name_score(
         self,
         entry: HotwordEntry,
-        py: List[str],
+        pinyin: List[str],
         initials: List[str],
         finals: List[str],
     ) -> float:
-        h_len = len(entry.py)
-        q_len = len(py)
+        h_len = len(entry.pinyin)
+        q_len = len(pinyin)
         if h_len not in (3, 4) or q_len < h_len - 1 or q_len >= h_len:
             return 0.0
 
@@ -294,12 +276,12 @@ class HotwordRetriever:
             end = start + q_len
             sub = HotwordEntry(
                 word=entry.word,
-                py=entry.py[start:end],
-                tone_py=entry.tone_py[start:end],
+                pinyin=entry.pinyin[start:end],
+                tone_pinyin=entry.tone_pinyin[start:end],
                 initials=entry.initials[start:end],
                 finals=entry.finals[start:end],
             )
-            candidates.append(self._aligned_score(sub, py, initials, finals))
+            candidates.append(self._aligned_score(sub, pinyin, initials, finals))
         best = max(candidates) if candidates else 0.0
         if h_len == 3 and q_len == 2:
             return best * 0.92
@@ -336,16 +318,16 @@ class HotwordRetriever:
     def _entry(self, word: str) -> HotwordEntry:
         return HotwordEntry(
             word=word,
-            py=self._tokens(word, self._style),
-            tone_py=self._tokens(word, self._tone3_style),
+            pinyin=self._tokens(word, self._style),
+            tone_pinyin=self._tokens(word, self._tone3_style),
             initials=self._tokens(word, self._initials_style),
             finals=self._tokens(word, self._finals_style),
         )
 
     def _build_index(self) -> None:
         for entry in self._entries:
-            for py in set(entry.py):
-                self._py_index.setdefault(py, []).append(entry)
+            for pinyin in set(entry.pinyin):
+                self._pinyin_index.setdefault(pinyin, []).append(entry)
             for initial in {x for x in entry.initials if x}:
                 self._initial_index.setdefault(initial, []).append(entry)
             for final in {x for x in entry.finals if x}:
@@ -359,9 +341,9 @@ class HotwordRetriever:
                 self._flush(buf, tokens)
             elif "\u4e00" <= ch <= "\u9fff":
                 self._flush(buf, tokens)
-                py = self._lazy_pinyin(ch, style=style, errors="ignore", strict=False)
-                if py:
-                    tokens.append(py[0].lower() or "_")
+                items = self._lazy_pinyin(ch, style=style, errors="ignore", strict=False)
+                if items:
+                    tokens.append(items[0].lower() or "_")
             elif ch.isalnum():
                 buf.append(ch.lower())
             else:
@@ -400,28 +382,3 @@ class HotwordRetriever:
         if style_name == "tone3":
             return style_cls.TONE3
         raise ValueError(f"不支持的 pinyin_style: {style_name}")
-
-    def _retrieve_fuzz(self, query: str, topk: int) -> List[str]:
-        if self._fuzz is None:
-            return self._retrieve_edit(query, topk=topk)
-        scored = [(w, self._fuzz.partial_ratio(query, w)) for w in self.hotwords]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [w for w, score in scored[:topk] if score > 60]
-
-    def _retrieve_edit(self, query: str, topk: int) -> List[str]:
-        if not hasattr(self, "_ed"):
-            try:
-                import editdistance
-                self._ed = editdistance
-            except ImportError:
-                scored = [(w, SequenceMatcher(None, query, w).ratio()) for w in self.hotwords]
-                scored.sort(key=lambda x: x[1], reverse=True)
-                return [w for w, score in scored[:topk] if score > 0.6]
-
-        scored = []
-        for w in self.hotwords:
-            dist = self._ed.eval(query, w)
-            norm = max(len(query), len(w), 1)
-            scored.append((w, 1.0 - dist / norm))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [w for w, score in scored[:topk] if score > 0.6]

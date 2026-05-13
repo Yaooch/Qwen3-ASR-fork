@@ -3,6 +3,16 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from .defaults import (
+    RNNT_MAX_SYMBOLS,
+    STREAM_CHUNK_SEC,
+    STREAM_ENCODER_BATCH,
+    STREAM_FIRST_PAD_SEC,
+    STREAM_LEFT_SEC,
+    STREAM_RIGHT_SEC,
+    STREAM_WINDOW_BATCH,
+)
+
 
 class StreamMixin:
     """流式窗口、音频特征和 chunk 拼接。"""
@@ -132,7 +142,6 @@ class StreamMixin:
             need_llm_features=False,
             encoder_batch_size=encoder_batch_size,
         )
-        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
         return [hs_pad[i, : int(length)] for i, length in enumerate(out_lens.tolist())]
 
     @torch.no_grad()
@@ -156,8 +165,6 @@ class StreamMixin:
             need_llm_features=True,
             encoder_batch_size=encoder_batch_size,
         )
-        hs_pad = hs_pad.to(next(self.aux_head.parameters()).dtype)
-
         aux_results = []
         llm_results = []
         offset = 0
@@ -168,16 +175,40 @@ class StreamMixin:
             offset += cur_len
         return aux_results, llm_results
 
+    def _window_batch_size(self, windows: List, window_batch_size: int) -> int:
+        if window_batch_size is None or window_batch_size <= 0:
+            return len(windows)
+        return window_batch_size
+
+    def _current_chunk_slice(
+        self,
+        window,
+        feature_count: int,
+        feature_len_cache: Optional[Dict[int, int]],
+        device: torch.device,
+    ) -> slice:
+        start, end, enc_start, _enc_end, left_pad_samples, _ = window
+        keep_start_samples = left_pad_samples + start - enc_start
+        keep_end_samples = left_pad_samples + end - enc_start
+        keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
+        keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
+        keep_start_idx = self._enc_len(keep_start_feat, device)
+        keep_end_idx = self._enc_len(keep_end_feat, device)
+
+        keep_start_idx = max(0, min(keep_start_idx, feature_count))
+        keep_end_idx = max(keep_start_idx, min(keep_end_idx, feature_count))
+        return slice(keep_start_idx, keep_end_idx)
+
     @torch.no_grad()
     def _stream_aux_chunks(
         self,
         wav,
-        chunk_sec: float = 0.64,
-        left_context_sec: float = 0.64,
-        right_context_sec: float = 0.07,
-        first_chunk_left_pad_sec: float = 0.0,
-        window_batch_size: int = 4,
-        window_encoder_batch_size: int = 1,
+        chunk_sec: float = STREAM_CHUNK_SEC,
+        left_context_sec: float = STREAM_LEFT_SEC,
+        right_context_sec: float = STREAM_RIGHT_SEC,
+        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
+        window_batch_size: int = STREAM_WINDOW_BATCH,
+        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
         feature_len_cache: Optional[Dict[int, int]] = None,
     ) -> List[torch.Tensor]:
         """Encode overlap windows and keep only the newly arrived chunk frames."""
@@ -189,8 +220,7 @@ class StreamMixin:
             right_context_sec=right_context_sec,
             first_chunk_left_pad_sec=first_chunk_left_pad_sec,
         )
-        if window_batch_size is None or window_batch_size <= 0:
-            window_batch_size = len(windows)
+        window_batch_size = self._window_batch_size(windows, window_batch_size)
 
         kept_chunks = []
         for batch_start in range(0, len(windows), window_batch_size):
@@ -200,19 +230,14 @@ class StreamMixin:
                 encoder_batch_size=window_encoder_batch_size,
             )
 
-            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
-                batch_windows, window_features_batch
-            ):
-                keep_start_samples = left_pad_samples + start - enc_start
-                keep_end_samples = left_pad_samples + end - enc_start
-                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
-                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
-                keep_start_idx = self._enc_len(keep_start_feat, device)
-                keep_end_idx = self._enc_len(keep_end_feat, device)
-
-                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
-                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
-                kept = window_features[keep_start_idx:keep_end_idx]
+            for window, window_features in zip(batch_windows, window_features_batch):
+                cur_slice = self._current_chunk_slice(
+                    window,
+                    window_features.shape[0],
+                    feature_len_cache,
+                    device,
+                )
+                kept = window_features[cur_slice]
                 if kept.numel() > 0:
                     kept_chunks.append(kept)
 
@@ -224,12 +249,12 @@ class StreamMixin:
     def _stream_llm_feats(
         self,
         wav,
-        chunk_sec: float = 0.64,
-        left_context_sec: float = 0.64,
-        right_context_sec: float = 0.07,
-        first_chunk_left_pad_sec: float = 0.0,
-        window_batch_size: int = 4,
-        window_encoder_batch_size: int = 1,
+        chunk_sec: float = STREAM_CHUNK_SEC,
+        left_context_sec: float = STREAM_LEFT_SEC,
+        right_context_sec: float = STREAM_RIGHT_SEC,
+        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
+        window_batch_size: int = STREAM_WINDOW_BATCH,
+        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
         feature_len_cache: Optional[Dict[int, int]] = None,
     ) -> torch.Tensor:
         """Encode overlap windows and concatenate current-chunk LLM audio features."""
@@ -241,8 +266,7 @@ class StreamMixin:
             right_context_sec=right_context_sec,
             first_chunk_left_pad_sec=first_chunk_left_pad_sec,
         )
-        if window_batch_size is None or window_batch_size <= 0:
-            window_batch_size = len(windows)
+        window_batch_size = self._window_batch_size(windows, window_batch_size)
 
         kept_chunks = []
         for batch_start in range(0, len(windows), window_batch_size):
@@ -252,19 +276,14 @@ class StreamMixin:
                 encoder_batch_size=window_encoder_batch_size,
             )
 
-            for (start, end, enc_start, _enc_end, left_pad_samples, _), window_features in zip(
-                batch_windows, llm_features_batch
-            ):
-                keep_start_samples = left_pad_samples + start - enc_start
-                keep_end_samples = left_pad_samples + end - enc_start
-                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
-                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
-                keep_start_idx = self._enc_len(keep_start_feat, device)
-                keep_end_idx = self._enc_len(keep_end_feat, device)
-
-                keep_start_idx = max(0, min(keep_start_idx, window_features.shape[0]))
-                keep_end_idx = max(keep_start_idx, min(keep_end_idx, window_features.shape[0]))
-                kept = window_features[keep_start_idx:keep_end_idx]
+            for window, window_features in zip(batch_windows, llm_features_batch):
+                cur_slice = self._current_chunk_slice(
+                    window,
+                    window_features.shape[0],
+                    feature_len_cache,
+                    device,
+                )
+                kept = window_features[cur_slice]
                 if kept.numel() > 0:
                     kept_chunks.append(kept)
 
@@ -276,12 +295,12 @@ class StreamMixin:
     def _stream_joint_feats(
         self,
         wav,
-        chunk_sec: float = 0.64,
-        left_context_sec: float = 0.64,
-        right_context_sec: float = 0.07,
-        first_chunk_left_pad_sec: float = 0.0,
-        window_batch_size: int = 4,
-        window_encoder_batch_size: int = 1,
+        chunk_sec: float = STREAM_CHUNK_SEC,
+        left_context_sec: float = STREAM_LEFT_SEC,
+        right_context_sec: float = STREAM_RIGHT_SEC,
+        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
+        window_batch_size: int = STREAM_WINDOW_BATCH,
+        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
         feature_len_cache: Optional[Dict[int, int]] = None,
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """流式窗口只跑一次 encoder，同时保留 aux chunk 和 LLM 特征。"""
@@ -293,8 +312,7 @@ class StreamMixin:
             right_context_sec=right_context_sec,
             first_chunk_left_pad_sec=first_chunk_left_pad_sec,
         )
-        if window_batch_size is None or window_batch_size <= 0:
-            window_batch_size = len(windows)
+        window_batch_size = self._window_batch_size(windows, window_batch_size)
 
         aux_chunks = []
         llm_chunks = []
@@ -305,30 +323,19 @@ class StreamMixin:
                 encoder_batch_size=window_encoder_batch_size,
             )
 
-            for (
-                start,
-                end,
-                enc_start,
-                _enc_end,
-                left_pad_samples,
-                _,
-            ), aux_features, llm_features in zip(
+            for window, aux_features, llm_features in zip(
                 batch_windows,
                 aux_features_batch,
                 llm_features_batch,
             ):
-                keep_start_samples = left_pad_samples + start - enc_start
-                keep_end_samples = left_pad_samples + end - enc_start
-                keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
-                keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
-                keep_start_idx = self._enc_len(keep_start_feat, device)
-                keep_end_idx = self._enc_len(keep_end_feat, device)
-
-                keep_start_idx = max(0, min(keep_start_idx, aux_features.shape[0]))
-                keep_end_idx = max(keep_start_idx, min(keep_end_idx, aux_features.shape[0]))
-
-                aux_kept = aux_features[keep_start_idx:keep_end_idx]
-                llm_kept = llm_features[keep_start_idx:keep_end_idx]
+                cur_slice = self._current_chunk_slice(
+                    window,
+                    aux_features.shape[0],
+                    feature_len_cache,
+                    device,
+                )
+                aux_kept = aux_features[cur_slice]
+                llm_kept = llm_features[cur_slice]
                 if aux_kept.numel() > 0:
                     aux_chunks.append(aux_kept)
                 if llm_kept.numel() > 0:
@@ -344,11 +351,11 @@ class StreamMixin:
     def _rnnt_stream_decode(
         self,
         chunks: List[torch.Tensor],
-        max_symbols_per_step: int = 5,
+        max_symbols_per_step: int = RNNT_MAX_SYMBOLS,
     ) -> List[int]:
         """Stateful RNNT greedy decode. Predictor state is carried across chunks."""
-        if self.aux_loss_type != "rnnt":
-            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 rnnt。")
+        if self.rnnt is None:
+            raise RuntimeError("当前 checkpoint 没有 RNNT 头。")
         if max_symbols_per_step <= 0:
             raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")
 
@@ -388,8 +395,8 @@ class StreamMixin:
     @torch.no_grad()
     def _ctc_stream_decode(self, chunks: List[torch.Tensor]) -> List[int]:
         """Streaming CTC greedy decode with CTC collapse state carried across chunks."""
-        if self.aux_loss_type != "ctc":
-            raise RuntimeError(f"当前 checkpoint 的 aux_loss_type={self.aux_loss_type!r}，不是 ctc。")
+        if self.ctc is None:
+            raise RuntimeError("当前 checkpoint 没有 CTC 头。")
 
         emitted = []
         prev_id = -1

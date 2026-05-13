@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import editdistance
 import librosa
@@ -13,9 +13,28 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
+from qwen_asr.joint.defaults import DEFAULT_PROMPT, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
+
+
+TASKS = {"llm", "encoder", "ctc", "rnnt"}
+
+
+def csv_set(value: str, allowed: set, name: str) -> tuple:
+    out = []
+    for part in (value or "").split(","):
+        item = part.strip().lower()
+        if not item:
+            continue
+        if item not in allowed:
+            raise ValueError(f"不支持的 {name}: {item}")
+        if item not in out:
+            out.append(item)
+    if not out:
+        raise ValueError(f"{name} 不能为空")
+    return tuple(out)
 
 
 def patch_outer_forward(model):
@@ -50,101 +69,50 @@ def patch_outer_forward(model):
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
 
 
-def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+def latest_checkpoint(output_dir: str) -> Optional[str]:
     if not output_dir or not os.path.isdir(output_dir):
         return None
-
-    best_step, best_path = None, None
+    best = None
     for name in os.listdir(output_dir):
         m = _CKPT_RE.match(name)
-        if not m:
-            continue
-        step = int(m.group(1))
         path = os.path.join(output_dir, name)
-        if os.path.isdir(path) and (best_step is None or step > best_step):
-            best_step, best_path = step, path
-    return best_path
+        if m and os.path.isdir(path) and (best is None or int(m.group(1)) > best[0]):
+            best = (int(m.group(1)), path)
+    return best[1] if best else None
 
 
-def load_aux_from_model_path(joint_model: Qwen3ASRJointModel, model_path: str, is_main: bool = True) -> bool:
-    """如果 model_path 是同类型 joint checkpoint，就加载已经训练好的辅助头。"""
-    cfg_path = os.path.join(model_path, "ctc_config.json")
-    if not os.path.exists(cfg_path):
-        return False
-
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    ckpt_aux_type = cfg.get("aux_loss_type", "ctc")
-    cur_aux_type = getattr(joint_model, "aux_loss_type", "ctc")
-    if ckpt_aux_type != cur_aux_type:
-        if is_main:
-            print(
-                f"MODEL_PATH 是 {ckpt_aux_type.upper()} checkpoint，"
-                f"当前训练 {cur_aux_type.upper()}：跳过旧辅助头，使用新初始化辅助头。"
-            )
-        return False
-
-    ckpt_vocab_size = cfg.get("vocab_size")
-    if ckpt_vocab_size is not None and ckpt_vocab_size != joint_model.vocab_size:
-        raise ValueError(
-            f"MODEL_PATH 辅助头词表大小={ckpt_vocab_size}，"
-            f"当前词表大小={joint_model.vocab_size}。请使用同一份 vocab。"
-        )
-
-    if cur_aux_type == "rnnt":
-        aux_name, module = "rnnt_head.pt", joint_model.rnnt
-    else:
-        aux_name, module = "ctc_head.pt", joint_model.ctc
-
-    aux_path = os.path.join(model_path, aux_name)
-    if not os.path.exists(aux_path):
-        raise FileNotFoundError(f"MODEL_PATH 是 joint checkpoint，但未找到辅助头：{aux_path}")
-
-    missing, unexpected = module.load_state_dict(torch.load(aux_path, map_location="cpu"), strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"辅助头结构和 checkpoint 不一致：missing={missing}, unexpected={unexpected}"
-        )
-
-    if is_main:
-        print(f"已从 MODEL_PATH 加载辅助头：{aux_path}")
-    return True
-
-
-def load_audio(path: str, sr: int = 16000, max_duration: float = 100.0):
+def load_audio(path: str, sr: int = 16000, max_duration: float = 30.0):
     try:
         wav, _ = librosa.load(path, sr=sr, mono=True)
-        duration = len(wav) / sr
-        if duration > max_duration:
-            print(f"音频{duration}s过长，跳过：{path}")
+        if len(wav) / sr > max_duration:
+            print(f"音频过长，跳过：{path}")
             return None
         return wav
-    except Exception as e:
-        print(f"音频读取失败，跳过：{path}，{e}")
+    except Exception as exc:
+        print(f"音频读取失败，跳过：{path}，{exc}")
         return None
 
 
 def build_prefix_messages(prompt: str, audio_array):
     return [
-        {"role": "system", "content": prompt or ""},
+        {"role": "system", "content": prompt or DEFAULT_PROMPT},
         {"role": "user", "content": [{"type": "audio", "audio": audio_array}]},
     ]
 
 
-def make_preprocess_fn_prefix_only(processor):
+def make_preprocess_fn(processor):
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = ex.get("prompt", "")
-        prefix_msgs = build_prefix_messages(prompt, None)
+        prompt = ex.get("prompt") or DEFAULT_PROMPT
+        target = ex.get("target") or ex.get("text") or ""
         prefix_text = processor.apply_chat_template(
-            [prefix_msgs],
+            [build_prefix_messages(prompt, None)],
             add_generation_prompt=True,
             tokenize=False,
         )[0]
         return {
-            "prompt": prompt,
             "audio": ex["audio"],
-            "target": ex["text"],
+            "prompt": prompt,
+            "target": target,
             "prefix_text": prefix_text,
         }
 
@@ -158,340 +126,234 @@ class DataCollatorForJointTraining:
     sp_model: Any
     sampling_rate: int = 16000
 
-    def __init__(self, processor, vocab, sp_model, sampling_rate=16000):
-        self.processor = processor
-        self.vocab = vocab
-        self.sp_model = sp_model
-        self.sampling_rate = sampling_rate
-        self.cjk_pattern = re.compile(r"([\u4e00-\u9fff])")
-        self._id_to_token = {v: k for k, v in vocab.items()}
+    def __post_init__(self):
+        self.cjk = re.compile(r"([\u4e00-\u9fff])")
 
     def __call__(self, features: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        valid_features = []
-        for f in features:
-            wav = load_audio(f["audio"], sr=self.sampling_rate)
+        rows = []
+        for item in features:
+            wav = load_audio(item["audio"], sr=self.sampling_rate)
             if wav is not None:
-                f["_audio"] = wav
-                valid_features.append(f)
-
-        if not valid_features:
+                item = dict(item)
+                item["_audio"] = wav
+                rows.append(item)
+        if not rows:
             return None
 
-        prefix_texts = [f["prefix_text"] for f in valid_features]
-        targets = [f["target"] for f in valid_features]
-        audios = [f["_audio"] for f in valid_features]
-
+        prefix_texts = [x["prefix_text"] for x in rows]
+        targets = [x["target"] for x in rows]
+        audios = [x["_audio"] for x in rows]
         eos = self.processor.tokenizer.eos_token or ""
-        full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
+        full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
 
-        full_inputs = self.processor(
-            text=full_texts,
-            audio=audios,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-        )
-        prefix_inputs = self.processor(
-            text=prefix_texts,
-            audio=audios,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-        )
-
-        prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
-        labels = full_inputs["input_ids"].clone()
-        for i, pl in enumerate(prefix_lens):
-            labels[i, :pl] = -100
-
+        full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
+        prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
+        labels = full["input_ids"].clone()
+        for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
+            labels[idx, :length] = -100
         pad_id = self.processor.tokenizer.pad_token_id
         if pad_id is not None:
             labels[labels == pad_id] = -100
-        full_inputs["labels"] = labels
+        full["labels"] = labels
 
-        target_ids_list = [self._text_to_aux_ids(t) for t in targets]
-        max_target_len = max((len(t) for t in target_ids_list), default=0)
-        batch_size = len(valid_features)
-
-        target_ids = torch.zeros(batch_size, max_target_len, dtype=torch.long)
-        target_lengths = torch.zeros(batch_size, dtype=torch.long)
-        for i, ids in enumerate(target_ids_list):
+        ids_list = [self.text_to_ids(text) for text in targets]
+        max_len = max((len(ids) for ids in ids_list), default=0)
+        target_ids = torch.zeros(len(rows), max_len, dtype=torch.long)
+        target_lens = torch.zeros(len(rows), dtype=torch.long)
+        for idx, ids in enumerate(ids_list):
             if ids:
-                target_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-            target_lengths[i] = len(ids)
+                target_ids[idx, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            target_lens[idx] = len(ids)
+        full["ctc_target_ids"] = target_ids
+        full["ctc_target_lengths"] = target_lens
+        full["texts"] = targets
+        return full
 
-        # 字段名沿用 ctc_target_*，RNNT 分支也复用这份标签。
-        full_inputs["ctc_target_ids"] = target_ids
-        full_inputs["ctc_target_lengths"] = target_lengths
-        full_inputs["texts"] = targets
-        return full_inputs
-
-    def _text_to_aux_ids(self, text: str) -> List[int]:
+    def text_to_ids(self, text: str) -> List[int]:
         if "<asr_text>" in text:
             text = text.split("<asr_text>")[-1]
-        text = text.strip()
-        if not text:
-            return []
-
         ids = []
-        pieces = [w for w in self.cjk_pattern.split(text) if w.strip()]
-        for item in pieces:
-            if self.cjk_pattern.fullmatch(item):
-                ids.append(self.vocab.get(item, self.vocab.get("<unk>", 1)))
+        for part in [x for x in self.cjk.split(text.strip()) if x.strip()]:
+            if self.cjk.fullmatch(part):
+                ids.append(self.vocab.get(part, self.vocab.get("<unk>", 1)))
                 continue
-
-            for piece in self.sp_model.encode_as_pieces(item.upper()):
-                if piece in self.vocab:
-                    ids.append(self.vocab[piece])
-                else:
-                    ids.append(self.vocab.get(piece.replace("▁", ""), self.vocab.get("<unk>", 1)))
+            for piece in self.sp_model.encode_as_pieces(part.upper()):
+                ids.append(self.vocab.get(piece, self.vocab.get(piece.replace("▁", ""), self.vocab.get("<unk>", 1))))
         return ids
 
 
+def module_set_trainable(module, enabled: bool) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = enabled
+
+
+def set_trainable(model: Qwen3ASRJointModel, tasks: Iterable[str]) -> None:
+    tasks = set(tasks)
+    module_set_trainable(model, False)
+    audio_tower = model.qwen_model.thinker.audio_tower
+
+    if "llm" in tasks:
+        module_set_trainable(model.qwen_model, True)
+        module_set_trainable(audio_tower, False)
+        module_set_trainable(getattr(audio_tower, "proj1", None), True)
+        module_set_trainable(getattr(audio_tower, "proj2", None), True)
+    if "encoder" in tasks:
+        module_set_trainable(audio_tower, True)
+        if "llm" not in tasks:
+            module_set_trainable(getattr(audio_tower, "proj1", None), False)
+            module_set_trainable(getattr(audio_tower, "proj2", None), False)
+    if "ctc" in tasks:
+        module_set_trainable(model.ctc, True)
+    if "rnnt" in tasks:
+        module_set_trainable(model.rnnt, True)
+
+
+def group_name(param_name: str) -> str:
+    if param_name.startswith(("ctc.", "module.ctc.")):
+        return "ctc"
+    if param_name.startswith(("rnnt.", "module.rnnt.")):
+        return "rnnt"
+    if ".audio_tower." in param_name and not any(x in param_name for x in (".proj1.", ".proj2.")):
+        return "encoder"
+    return "llm"
+
+
 class JointTrainer(Trainer):
-    def __init__(self, ctc_lr=1e-3, qwen_lr=2e-5, *args, **kwargs):
+    def __init__(self, lr_by_group: Dict[str, float], save_heads=(), head_source="", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ctc_lr = ctc_lr
-        self.qwen_lr = qwen_lr
-        self._loss_log_sums = {}
-        self._loss_log_count = 0
+        self.lr_by_group = lr_by_group
+        self.save_heads = tuple(save_heads)
+        self.head_source = head_source
+        self._loss_sums = {}
+        self._loss_count = 0
 
     def create_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
 
-        decay_parameters = self.get_decay_parameter_names(self.model)
-        optimizer_grouped_parameters = []
-
+        decay_names = self.get_decay_parameter_names(self.model)
+        groups = {}
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
+            group = group_name(name)
+            key = (group, self.lr_by_group[group], self.args.weight_decay if name in decay_names else 0.0)
+            groups.setdefault(key, []).append(param)
 
-            is_aux_head = (
-                name.startswith("ctc.")
-                or name.startswith("rnnt.")
-                or name.startswith("module.ctc.")
-                or name.startswith("module.rnnt.")
-            )
-            lr = self.ctc_lr if is_aux_head else self.qwen_lr
-            group_name = "aux" if is_aux_head else "qwen"
-            weight_decay = self.args.weight_decay if name in decay_parameters else 0.0
-
-            for group in optimizer_grouped_parameters:
-                if group["name"] == group_name and group["lr"] == lr and group["weight_decay"] == weight_decay:
-                    group["params"].append(param)
-                    break
-            else:
-                optimizer_grouped_parameters.append(
-                    {"params": [param], "lr": lr, "weight_decay": weight_decay, "name": group_name}
-                )
-
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-        optimizer_kwargs.pop("lr", None)
-        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-
+        params = [
+            {"params": values, "name": name, "lr": lr, "weight_decay": wd}
+            for (name, lr, wd), values in groups.items()
+        ]
+        opt_cls, opt_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+        opt_kwargs.pop("lr", None)
+        self.optimizer = opt_cls(params, **opt_kwargs)
         if self.args.process_index == 0:
-            print(f"学习率：Qwen={self.qwen_lr}，Aux={self.ctc_lr}")
+            print("学习率：" + "，".join(f"{g['name']}={g['lr']}" for g in params))
         return self.optimizer
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
         if isinstance(outputs, dict) and model.training:
-            self._loss_log_sums["loss"] = self._loss_log_sums.get("loss", 0.0) + float(
-                loss.detach().float().item()
-            )
-            for key in ("llm_loss", "ctc_loss", "rnnt_loss"):
-                value = outputs.get(key)
+            for key in ("loss", "llm_loss", "ctc_loss", "rnnt_loss"):
+                value = loss if key == "loss" else outputs.get(key)
                 if torch.is_tensor(value):
-                    self._loss_log_sums[key] = self._loss_log_sums.get(key, 0.0) + float(
-                        value.detach().float().item()
-                    )
-            self._loss_log_count += 1
-
+                    self._loss_sums[key] = self._loss_sums.get(key, 0.0) + float(value.detach().float().item())
+            self._loss_count += 1
         return (loss, outputs) if return_outputs else loss
 
-    def _group_lr(self, name: str):
-        if self.optimizer is None:
-            return None
-        for group in self.optimizer.param_groups:
-            if group.get("name") == name:
-                return group["lr"]
-        return None
-
     def log(self, logs, *args, **kwargs):
-        if self._loss_log_count > 0 and "loss" in logs:
-            avg_logs = {
-                key: value / self._loss_log_count
-                for key, value in self._loss_log_sums.items()
-            }
-            ordered_logs = {}
-            for key in ("loss", "llm_loss", "ctc_loss", "rnnt_loss"):
-                if key in avg_logs:
-                    ordered_logs[key] = avg_logs[key]
-                elif key in logs:
-                    ordered_logs[key] = logs[key]
-
-            if "grad_norm" in logs:
-                ordered_logs["grad_norm"] = logs["grad_norm"]
-
-            qwen_lr = self._group_lr("qwen")
-            aux_lr = self._group_lr("aux")
-            if qwen_lr is not None:
-                ordered_logs["qwen_lr"] = qwen_lr
-            if aux_lr is not None:
-                ordered_logs["aux_lr"] = aux_lr
-
-            for key, value in logs.items():
-                if key not in ordered_logs and key != "learning_rate":
-                    ordered_logs[key] = value
-            logs = ordered_logs
-            self._loss_log_sums = {}
-            self._loss_log_count = 0
-
+        if self._loss_count > 0 and "loss" in logs:
+            merged = {k: v / self._loss_count for k, v in self._loss_sums.items()}
+            merged.update({k: v for k, v in logs.items() if k not in merged and k != "learning_rate"})
+            for group in self.optimizer.param_groups if self.optimizer else []:
+                merged[f"{group.get('name')}_lr"] = group["lr"]
+            logs = merged
+            self._loss_sums = {}
+            self._loss_count = 0
         return super().log(logs, *args, **kwargs)
 
     def _prepare_inputs(self, inputs):
-        if inputs is None:
-            return None
         inputs = super()._prepare_inputs(inputs)
-        model_dtype = getattr(self.model, "dtype", None)
-        if model_dtype is not None:
-            for k, v in list(inputs.items()):
-                if torch.is_tensor(v) and v.is_floating_point():
-                    inputs[k] = v.to(dtype=model_dtype)
+        dtype = getattr(self.model, "dtype", None)
+        if dtype is not None:
+            for key, value in list(inputs.items()):
+                if torch.is_tensor(value) and value.is_floating_point():
+                    inputs[key] = value.to(dtype=dtype)
         return inputs
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        base_model = self.model.module if hasattr(self.model, "module") else self.model
-        if getattr(base_model, "train_mode", "joint") == "llm_only":
-            if self.args.process_index == 0:
-                print("LLM-only：跳过辅助头 CER 验证")
+        base = self.model.module if hasattr(self.model, "module") else self.model
+        heads = [x for x in ("ctc", "rnnt") if x in base.heads]
+        if not heads:
             return metrics
 
-        aux_loss_type = getattr(base_model, "aux_loss_type", "ctc")
-        aux_name = aux_loss_type.upper()
-
-        self.model.eval()
         dataloader = self.get_eval_dataloader(eval_dataset)
-        total_edits, total_chars = 0, 0
-        debug_samples, max_debug = 0, 5
-
-        with torch.no_grad():
-            for batch in dataloader:
-                inputs = self._prepare_inputs(batch)
-                predictions = base_model.decode_feats(
-                    inputs["input_features"],
-                    inputs.get("feature_attention_mask", None),
-                )
-                texts = inputs.get("texts", [])
-
-                for pred_text, ref_text in zip(predictions, texts):
-                    ref_clean = ref_text.split("<asr_text>")[-1].strip() if "<asr_text>" in ref_text else ref_text.strip()
-                    ref_pieces = self.data_collator.sp_model.encode_as_pieces(ref_clean.upper())
-                    ref_processed = "".join(ref_pieces).replace("▁", " ").strip().lower()
-
-                    if self.args.process_index == 0 and debug_samples < max_debug:
-                        print(f"[验证样例{debug_samples}] {aux_name}: {pred_text}")
-                        print(f"[验证样例{debug_samples}] 参考: {ref_processed}")
-                        debug_samples += 1
-
-                    total_edits += editdistance.eval(pred_text, ref_processed)
-                    total_chars += len(ref_processed)
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            metrics_tensor = torch.tensor(
-                [total_edits, total_chars],
-                dtype=torch.float64,
-                device=self.args.device,
-            )
-            torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
-            total_edits, total_chars = metrics_tensor[0].item(), metrics_tensor[1].item()
-
-        cer = total_edits / total_chars if total_chars > 0 else 0.0
-        if self.args.process_index == 0:
-            print(f"{aux_name} 验证 CER：{cer:.4f}")
-
-        metric_name = f"{metric_key_prefix}_{aux_loss_type}_cer"
-        metrics[metric_name] = cer
-        self.log({metric_name: cer})
+        self.model.eval()
+        for head in heads:
+            edits, chars, shown = 0, 0, 0
+            with torch.no_grad():
+                for batch in dataloader:
+                    inputs = self._prepare_inputs(batch)
+                    preds = base.decode_feats(
+                        inputs["input_features"],
+                        inputs.get("feature_attention_mask"),
+                        head=head,
+                    )
+                    for pred, ref in zip(preds, inputs.get("texts", [])):
+                        ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
+                        ref = "".join(self.data_collator.sp_model.encode_as_pieces(ref.upper())).replace("▁", " ").strip().lower()
+                        if self.args.process_index == 0 and shown < 3:
+                            print(f"[验证样例{shown}] {head.upper()}: {pred}")
+                            print(f"[验证样例{shown}] 参考: {ref}")
+                            shown += 1
+                        edits += editdistance.eval(pred, ref)
+                        chars += len(ref)
+            cer = edits / chars if chars else 0.0
+            key = f"{metric_key_prefix}_{head}_cer"
+            metrics[key] = cer
+            if self.args.process_index == 0:
+                print(f"{head.upper()} 验证 CER：{cer:.4f}")
         return metrics
 
     def _load_from_checkpoint(self, resume_from_checkpoint: str, model=None):
-        if model is None:
-            model = self.model
-        base_model = model.module if hasattr(model, "module") else model
-
+        model = model or self.model
+        base = model.module if hasattr(model, "module") else model
         if self.args.process_index == 0:
             print(f"恢复训练：{resume_from_checkpoint}")
-
-        self._load_qwen_base_weights(base_model.qwen_model, resume_from_checkpoint)
-        self._load_aux_weights(base_model, resume_from_checkpoint)
-        sync_audio_window_config(base_model.qwen_model)
-
-        if hasattr(base_model.qwen_model, "tie_weights"):
-            base_model.qwen_model.tie_weights()
-
-        if self.args.process_index == 0:
-            print("模型恢复完成")
+        self._load_qwen(base.qwen_model, resume_from_checkpoint)
+        load_heads(base, resume_from_checkpoint, is_main=self.args.process_index == 0, strict=False)
 
     @staticmethod
-    def _load_qwen_base_weights(qwen_model, ckpt_dir: str):
-        index_file = os.path.join(ckpt_dir, "model.safetensors.index.json")
-        safetensors_file = os.path.join(ckpt_dir, "model.safetensors")
-        bin_file = os.path.join(ckpt_dir, "pytorch_model.bin")
-
-        if os.path.exists(index_file):
+    def _load_qwen(qwen_model, ckpt_dir: str):
+        if os.path.exists(os.path.join(ckpt_dir, "model.safetensors.index.json")):
             return load_sharded_checkpoint(qwen_model, ckpt_dir, strict=False)
-        if os.path.exists(safetensors_file):
-            return load_safetensors_model(qwen_model, safetensors_file, strict=False)
-        if os.path.exists(bin_file):
-            return qwen_model.load_state_dict(torch.load(bin_file, map_location="cpu"), strict=False)
+        if os.path.exists(os.path.join(ckpt_dir, "model.safetensors")):
+            return load_safetensors_model(qwen_model, os.path.join(ckpt_dir, "model.safetensors"), strict=False)
+        if os.path.exists(os.path.join(ckpt_dir, "pytorch_model.bin")):
+            return qwen_model.load_state_dict(torch.load(os.path.join(ckpt_dir, "pytorch_model.bin"), map_location="cpu"), strict=False)
         raise FileNotFoundError(f"没有在 checkpoint 中找到底座权重文件：{ckpt_dir}")
-
-    def _load_aux_weights(self, base_model, ckpt_dir: str):
-        if getattr(base_model, "aux_loss_type", "ctc") == "rnnt":
-            aux_name, module = "rnnt_head.pt", base_model.rnnt
-        else:
-            aux_name, module = "ctc_head.pt", base_model.ctc
-
-        aux_path = os.path.join(ckpt_dir, aux_name)
-        if not os.path.exists(aux_path):
-            if self.args.process_index == 0:
-                print(f"未找到辅助头权重：{aux_path}")
-            return
-
-        missing, unexpected = module.load_state_dict(torch.load(aux_path, map_location="cpu"), strict=False)
-        if self.args.process_index == 0:
-            print(f"已加载辅助头：{aux_path}")
-            if missing:
-                print(f"缺少参数：{missing}")
-            if unexpected:
-                print(f"多余参数：{unexpected}")
 
     def save_model(self, output_dir=None, _internal_call=False):
         if self.args.process_index != 0:
             return
-        if output_dir is None:
-            output_dir = self.args.output_dir
+        output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-
-        base_model = self.model.module if hasattr(self.model, "module") else self.model
-        sync_audio_window_config(base_model.qwen_model)
-        base_model.qwen_model.save_pretrained(output_dir, safe_serialization=True)
-        base_model.save_aux(output_dir)
-
-        old_joint = os.path.join(output_dir, "pytorch_model.bin")
-        if os.path.exists(old_joint):
-            os.remove(old_joint)
-            print(f"已删除旧权重文件：{old_joint}")
+        base = self.model.module if hasattr(self.model, "module") else self.model
+        sync_audio_window_config(base.qwen_model)
+        base.qwen_model.save_pretrained(output_dir, safe_serialization=True)
+        base.save_aux(output_dir, heads=self.save_heads, copy_heads_from=self.head_source)
+        old = os.path.join(output_dir, "pytorch_model.bin")
+        if os.path.exists(old):
+            os.remove(old)
 
 
-def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
+def copy_hf_files(src_dir: str, dst_dir: str):
     os.makedirs(dst_dir, exist_ok=True)
-    required = [
+    for name in (
         "config.json",
         "generation_config.json",
         "preprocessor_config.json",
@@ -502,145 +364,125 @@ def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
         "chat_template.json",
         "merges.txt",
         "vocab.json",
-    ]
-    for fn in required:
-        src = os.path.join(src_dir, fn)
+    ):
+        src = os.path.join(src_dir, name)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(dst_dir, fn))
+            shutil.copy2(src, os.path.join(dst_dir, name))
 
 
-class MakeEveryCheckpointInferableCallback(TrainerCallback):
-    def __init__(self, base_model_path: str):
+class InferableCheckpointCallback(TrainerCallback):
+    def __init__(self, base_model_path: str, save_heads=()):
         self.base_model_path = base_model_path
+        self.save_heads = tuple(save_heads)
 
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
             return control
         ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        if not os.path.isdir(ckpt_dir):
-            ckpt_dir = kwargs.get("checkpoint", ckpt_dir)
-        copy_required_hf_files_for_qwen_asr(self.base_model_path, ckpt_dir)
+        copy_hf_files(self.base_model_path, ckpt_dir)
         model = kwargs.get("model")
         if model is not None:
-            base_model = model.module if hasattr(model, "module") else model
-            if hasattr(base_model, "save_aux"):
-                sync_audio_window_config(base_model.qwen_model)
-                base_model.save_aux(ckpt_dir)
+            base = model.module if hasattr(model, "module") else model
+            sync_audio_window_config(base.qwen_model)
+            base.save_aux(ckpt_dir, heads=self.save_heads, copy_heads_from=self.base_model_path)
         return control
 
 
-def enable_aux_only_training(joint_model: Qwen3ASRJointModel, train_encoder: bool = False) -> None:
-    """只使用辅助 loss；可选择同时训练 audio encoder。"""
-    joint_model.train_mode = "aux_only"
-    joint_model.ctc_only = True
-    joint_model.ctc_weight = 1.0
-
-    for param in joint_model.qwen_model.parameters():
-        param.requires_grad = False
-    if train_encoder:
-        audio_tower = joint_model.qwen_model.thinker.audio_tower
-        for param in audio_tower.parameters():
-            param.requires_grad = True
-        # Aux 特征固定取 ln_post 后、proj1/proj2 前；LLM adapter 不参与训练。
-        for name in ("proj1", "proj2"):
-            module = getattr(audio_tower, name, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = False
-    for param in joint_model.aux_head.parameters():
-        param.requires_grad = True
-
-
-def enable_llm_only_training(joint_model: Qwen3ASRJointModel) -> None:
-    """只使用 LLM loss；冻结 audio encoder 和辅助头。"""
-    joint_model.train_mode = "llm_only"
-    joint_model.ctc_only = False
-    joint_model.ctc_weight = 0.0
-
-    for param in joint_model.qwen_model.parameters():
-        param.requires_grad = True
-
-    audio_tower = joint_model.qwen_model.thinker.audio_tower
-    for param in audio_tower.parameters():
-        param.requires_grad = False
-
-    for param in joint_model.aux_head.parameters():
-        param.requires_grad = False
-
-
 def sync_audio_window_config(qwen_model, n_window: Optional[int] = None, n_window_infer: Optional[int] = None):
-    """同步 audio tower 的运行参数和保存用 config。"""
     audio_tower = qwen_model.thinker.audio_tower
     audio_config = qwen_model.config.thinker_config.audio_config
-
-    if n_window is not None and n_window > 0:
+    if n_window is not None:
         audio_tower.n_window = n_window
         audio_tower.config.n_window = n_window
         audio_config.n_window = n_window
-
-    if n_window_infer is not None and n_window_infer > 0:
+    if n_window_infer is not None:
         audio_tower.n_window_infer = n_window_infer
         audio_tower.config.n_window_infer = n_window_infer
         audio_config.n_window_infer = n_window_infer
-
-    audio_tower.config.n_window = audio_tower.n_window
-    audio_tower.config.n_window_infer = audio_tower.n_window_infer
-    audio_config.n_window = audio_tower.n_window
-    audio_config.n_window_infer = audio_tower.n_window_infer
     return audio_tower
 
 
-def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR Joint Finetuning")
+def load_heads(model: Qwen3ASRJointModel, path: str, heads=None, is_main: bool = True, strict: bool = True):
+    for name in model.heads if heads is None else heads:
+        head_path = os.path.join(path, f"{name}_head.pt")
+        if not os.path.exists(head_path):
+            if strict:
+                raise FileNotFoundError(f"未找到 {name.upper()} 头：{head_path}")
+            continue
+        missing, unexpected = getattr(model, name).load_state_dict(torch.load(head_path, map_location="cpu"), strict=False)
+        if is_main:
+            print(f"已加载 {name.upper()} 头：{head_path}")
+            if missing:
+                print(f"缺少参数：{missing}")
+            if unexpected:
+                print(f"多余参数：{unexpected}")
 
+
+def existing_heads(path: str) -> tuple:
+    return tuple(
+        name
+        for name in ("ctc", "rnnt")
+        if os.path.exists(os.path.join(path, f"{name}_head.pt"))
+    )
+
+
+def parse_args():
+    p = argparse.ArgumentParser("Qwen3-ASR 训练")
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
-    p.add_argument("--train_file", type=str, default="train.jsonl")
+    p.add_argument("--train_file", type=str, required=True)
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-joint-out")
-
+    p.add_argument("--train", type=str, default="llm,ctc", help="逗号组合：llm,encoder,ctc,rnnt")
     p.add_argument("--sr", type=int, default=16000)
-    p.add_argument("--ctc_weight", type=float, default=0.3, help="辅助 loss 权重；train_mode=llm_only 时忽略")
-    p.add_argument("--train_mode", type=str, default="joint", choices=["joint", "aux_only", "llm_only"], help="训练模式")
-    p.add_argument("--aux_loss_type", type=str, default="ctc", choices=["ctc", "rnnt"])
-    p.add_argument("--aux_train_encoder", type=int, default=0, help="aux_only 时同时训练 audio encoder；0 表示只训练辅助头")
-    p.add_argument("--aux_encoder_batch_size", type=int, default=1, help="CTC/RNNT 辅助头 audio encoder micro-batch，1 最稳")
-    p.add_argument("--aux_streaming_train", type=int, default=0, help="训练 aux loss 时使用流式窗口：当前块 + 随机左上下文 + 右上下文")
-    p.add_argument("--aux_stream_chunk_frames", type=int, default=64, help="流式 aux 训练当前块长度，单位为 feature frames，64 约等于 640ms")
-    p.add_argument("--aux_stream_left_context_frames", type=int, default=64, help="流式 aux 训练最大左上下文，训练时会在 [0, max] 随机采样")
-    p.add_argument("--aux_stream_right_context_frames", type=int, default=7, help="流式 aux 训练右上下文，7 约等于 70ms")
-    p.add_argument("--aux_stream_random_left", type=int, default=1, help="是否随机采样左上下文长度；0 表示总是使用最大左上下文")
-    p.add_argument("--aux_stream_window_batch_size", type=int, default=4, help="流式 aux 训练时一次送入 encoder 的窗口数量")
-    p.add_argument("--audio_n_window", type=int, default=0, help="Qwen audio encoder conv 前切块参数；0 表示沿用 checkpoint")
-    p.add_argument("--audio_n_window_infer", type=int, default=0, help="Qwen audio encoder attention block 参数；0 表示沿用 checkpoint")
-    p.add_argument("--vocab_path", type=str, default="")
-    p.add_argument("--sp_model_path", type=str, default=None)
+    p.add_argument("--vocab_path", type=str, default=TRAIN_VOCAB_PATH)
+    p.add_argument("--sp_model_path", type=str, default=TRAIN_SP_MODEL_PATH)
 
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--grad_acc", type=int, default=4)
-    p.add_argument("--qwen_lr", type=float, default=2e-5)
-    p.add_argument("--ctc_lr", type=float, default=1e-3, help="CTC/RNNT 辅助头学习率")
     p.add_argument("--epochs", type=float, default=10)
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
+    p.add_argument("--lr_llm", type=float, default=2e-5)
+    p.add_argument("--lr_encoder", type=float, default=1e-5)
+    p.add_argument("--lr_ctc", type=float, default=1e-3)
+    p.add_argument("--lr_rnnt", type=float, default=1e-3)
+    p.add_argument("--w_llm", type=float, default=1.0)
+    p.add_argument("--w_ctc", type=float, default=1.0)
+    p.add_argument("--w_rnnt", type=float, default=1.0)
+
+    p.add_argument("--audio_n_window", type=int, default=0)
+    p.add_argument("--audio_n_window_infer", type=int, default=0)
 
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--pin_memory", type=int, default=1)
     p.add_argument("--persistent_workers", type=int, default=1)
     p.add_argument("--prefetch_factor", type=int, default=2)
-
     p.add_argument("--save_strategy", type=str, default="steps")
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--save_total_limit", type=int, default=5)
-
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
-    return p.parse_args()
+    args = p.parse_args()
+    args.tasks = csv_set(args.train, TASKS, "train")
+    args.loss_tasks = tuple(x for x in args.tasks if x != "encoder")
+    if not args.loss_tasks:
+        raise ValueError("--train 至少需要包含 llm/ctc/rnnt 之一；encoder 只能配合这些 loss 一起训练。")
+    save_heads = [*existing_heads(args.model_path)]
+    active_heads = []
+    for name in args.loss_tasks:
+        if name in ("ctc", "rnnt"):
+            if name not in save_heads:
+                save_heads.append(name)
+            active_heads.append(name)
+    args.heads = tuple(save_heads)
+    args.active_heads = tuple(active_heads)
+    return args
 
 
-def load_vocab(vocab_path: str):
+def load_vocab(path: str):
     vocab = {}
-    with open(vocab_path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split()
             if len(parts) >= 2:
@@ -649,169 +491,109 @@ def load_vocab(vocab_path: str):
 
 
 def main():
-    args_cli = parse_args()
+    args = parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main = local_rank == 0
-    train_mode = args_cli.train_mode
-
-    if not args_cli.train_file:
-        raise ValueError("TRAIN_FILE is required.")
-    if not args_cli.vocab_path:
-        raise ValueError("--vocab_path is required.")
-    if not args_cli.sp_model_path:
-        raise ValueError("--sp_model_path is required.")
 
     import sentencepiece as spm
     from accelerate import PartialState
 
-    if is_main:
-        print(f"加载 SentencePiece：{args_cli.sp_model_path}")
     sp_model = spm.SentencePieceProcessor()
-    sp_model.load(args_cli.sp_model_path)
-
-    if is_main:
-        print(f"加载词表：{args_cli.vocab_path}")
-    vocab = load_vocab(args_cli.vocab_path)
+    sp_model.load(args.sp_model_path)
+    vocab = load_vocab(args.vocab_path)
     assert vocab.get("<blank>") == 0, "vocab must have <blank>: 0"
     assert vocab.get("<unk>") == 1, "vocab must have <unk>: 1"
-    if is_main:
-        print(f"词表大小：{len(vocab)}")
 
-    os.makedirs(args_cli.output_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     if is_main:
-        with open(os.path.join(args_cli.output_dir, "ctc_vocab.json"), "w", encoding="utf-8") as f:
+        print(f"训练任务：{','.join(args.tasks)}")
+        print(f"词表大小：{len(vocab)}")
+        with open(os.path.join(args.output_dir, "ctc_vocab.json"), "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=False, indent=2)
-        with open(os.path.join(args_cli.output_dir, "sp_model_config.json"), "w", encoding="utf-8") as f:
-            json.dump({"sp_model_path": args_cli.sp_model_path}, f)
+        with open(os.path.join(args.output_dir, "sp_model_config.json"), "w", encoding="utf-8") as f:
+            json.dump({"sp_model_path": args.sp_model_path}, f)
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        args_cli.model_path,
+    wrapper = Qwen3ASRModel.from_pretrained(
+        args.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
     )
-    qwen_model = asr_wrapper.model
-    processor = asr_wrapper.processor
-
+    qwen_model = wrapper.model
+    processor = wrapper.processor
     audio_tower = sync_audio_window_config(
         qwen_model,
-        n_window=args_cli.audio_n_window if args_cli.audio_n_window > 0 else None,
-        n_window_infer=args_cli.audio_n_window_infer if args_cli.audio_n_window_infer > 0 else None,
+        n_window=args.audio_n_window if args.audio_n_window > 0 else None,
+        n_window_infer=args.audio_n_window_infer if args.audio_n_window_infer > 0 else None,
     )
-
     if audio_tower.n_window_infer < audio_tower.n_window * 2:
         raise ValueError("audio_n_window_infer 必须 >= audio_n_window * 2")
     if is_main:
         print(f"Audio 窗口：n_window={audio_tower.n_window}，n_window_infer={audio_tower.n_window_infer}")
-        if audio_tower.n_window_infer % (audio_tower.n_window * 2) != 0:
-            print("注意：n_window_infer 不是 n_window*2 的整数倍，实际 block 会向下取整。")
 
     patch_outer_forward(qwen_model)
     qwen_model.generation_config = GenerationConfig.from_model_config(qwen_model.config)
     if hasattr(qwen_model, "gradient_checkpointing_enable"):
-        # Reentrant checkpointing can make DDP mark the same parameter ready
-        # multiple times when the audio tower is called repeatedly for
-        # aux_encoder_batch_size micro-batches inside one forward pass.
         try:
-            qwen_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            qwen_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         except TypeError:
             if is_main:
-                print("当前 transformers 不支持非重入 checkpoint，建议关闭 gradient checkpoint。")
+                print("当前 transformers 不支持非重入 checkpoint。")
 
-    joint_model = Qwen3ASRJointModel(
+    model = Qwen3ASRJointModel(
         qwen_model=qwen_model,
         vocab_size=len(vocab),
         vocab=vocab,
-        ctc_weight=0.0 if train_mode == "llm_only" else args_cli.ctc_weight,
         blank_id=0,
-        ctc_only=(train_mode == "aux_only"),
-        train_mode=train_mode,
-        aux_loss_type=args_cli.aux_loss_type,
-        aux_encoder_batch_size=args_cli.aux_encoder_batch_size,
-        aux_streaming_train=(args_cli.aux_streaming_train == 1),
-        aux_stream_chunk_frames=args_cli.aux_stream_chunk_frames,
-        aux_stream_left_context_frames=args_cli.aux_stream_left_context_frames,
-        aux_stream_right_context_frames=args_cli.aux_stream_right_context_frames,
-        aux_stream_random_left=(args_cli.aux_stream_random_left == 1),
-        aux_stream_window_batch_size=args_cli.aux_stream_window_batch_size,
+        heads=args.active_heads,
+        train_tasks=args.loss_tasks,
+        loss_weights={"llm": args.w_llm, "ctc": args.w_ctc, "rnnt": args.w_rnnt},
     )
-    loaded_aux = load_aux_from_model_path(joint_model, args_cli.model_path, is_main=is_main)
-    if train_mode == "llm_only" and not loaded_aux:
-        raise RuntimeError(
-            "train_mode=llm_only 会冻结辅助头，必须从已有联合 checkpoint 启动。"
-            "请把 --model_path 指向包含 ctc_config.json 和 ctc_head.pt/rnnt_head.pt 的目录。"
-        )
-
-    if train_mode == "aux_only":
-        enable_aux_only_training(joint_model, train_encoder=(args_cli.aux_train_encoder == 1))
-        if local_rank == 0:
-            trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in joint_model.parameters())
-            if args_cli.aux_train_encoder == 1:
-                print("Aux-only：训练 Encoder + 辅助头，跳过 LLM loss")
-            else:
-                print("Aux-only：只训练辅助头")
-            print(f"可训练参数：{trainable:,} / {total:,}")
-    elif train_mode == "llm_only":
-        enable_llm_only_training(joint_model)
-        if local_rank == 0:
-            trainable = sum(p.numel() for p in joint_model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in joint_model.parameters())
-            print("LLM-only：冻结 Audio Encoder + 辅助头，只训练 LLM")
-            print(f"可训练参数：{trainable:,} / {total:,}")
+    if args.active_heads:
+        load_heads(model, args.model_path, heads=args.active_heads, is_main=is_main, strict=False)
+    set_trainable(model, args.tasks)
+    if is_main:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"可训练参数：{trainable:,} / {total:,}")
 
     with PartialState().main_process_first():
         raw_ds = load_dataset(
             "json",
-            data_files={
-                "train": args_cli.train_file,
-                **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-            },
+            data_files={"train": args.train_file, **({"validation": args.eval_file} if args.eval_file else {})},
         )
-        ds = raw_ds.map(
-            make_preprocess_fn_prefix_only(processor),
-            num_proc=16,
-            desc="Preprocessing dataset",
-        )
+        ds = raw_ds.map(make_preprocess_fn(processor), num_proc=16, desc="Preprocessing dataset")
 
     keep = {"prompt", "audio", "target", "prefix_text"}
     for split in ds.keys():
-        drop = [c for c in ds[split].column_names if c not in keep]
+        drop = [col for col in ds[split].column_names if col not in keep]
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForJointTraining(
-        processor=processor,
-        vocab=vocab,
-        sp_model=sp_model,
-        sampling_rate=args_cli.sr,
-    )
-
+    collator = DataCollatorForJointTraining(processor, vocab, sp_model, sampling_rate=args.sr)
     training_args = TrainingArguments(
-        output_dir=args_cli.output_dir,
-        per_device_train_batch_size=args_cli.batch_size,
-        gradient_accumulation_steps=args_cli.grad_acc,
-        learning_rate=args_cli.qwen_lr,
-        num_train_epochs=args_cli.epochs,
-        logging_steps=args_cli.log_steps,
-        lr_scheduler_type=args_cli.lr_scheduler_type,
-        warmup_ratio=args_cli.warmup_ratio,
-        dataloader_num_workers=args_cli.num_workers,
-        dataloader_pin_memory=(args_cli.pin_memory == 1),
-        dataloader_persistent_workers=(args_cli.persistent_workers == 1),
-        dataloader_prefetch_factor=args_cli.prefetch_factor if args_cli.num_workers > 0 else None,
-        save_strategy=args_cli.save_strategy,
-        save_steps=args_cli.save_steps,
-        save_total_limit=args_cli.save_total_limit,
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_acc,
+        learning_rate=args.lr_llm,
+        num_train_epochs=args.epochs,
+        logging_steps=args.log_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_ratio=args.warmup_ratio,
+        dataloader_num_workers=args.num_workers,
+        dataloader_pin_memory=(args.pin_memory == 1),
+        dataloader_persistent_workers=(args.persistent_workers == 1),
+        dataloader_prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        save_strategy=args.save_strategy,
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
         save_safetensors=True,
         eval_strategy="steps",
-        eval_steps=args_cli.save_steps,
-        do_eval=bool(args_cli.eval_file),
+        eval_steps=args.save_steps,
+        do_eval=bool(args.eval_file),
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
@@ -819,30 +601,23 @@ def main():
         report_to="tensorboard",
         logging_dir="./logs_joint",
     )
-
     trainer = JointTrainer(
-        ctc_lr=args_cli.ctc_lr,
-        qwen_lr=args_cli.qwen_lr,
-        model=joint_model,
+        lr_by_group={"llm": args.lr_llm, "encoder": args.lr_encoder, "ctc": args.lr_ctc, "rnnt": args.lr_rnnt},
+        save_heads=args.heads,
+        head_source=args.model_path,
+        model=model,
         args=training_args,
         train_dataset=ds["train"],
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
+        callbacks=[InferableCheckpointCallback(base_model_path=args.model_path, save_heads=args.heads)],
     )
 
-    resume_from = (args_cli.resume_from or "").strip()
-    if not resume_from and args_cli.resume == 1:
-        resume_from = find_latest_checkpoint(training_args.output_dir) or ""
-
-    if resume_from:
-        if trainer.args.process_index == 0:
-            print(f"继续训练：{resume_from}")
-        trainer.train(resume_from_checkpoint=resume_from)
-    else:
-        trainer.train()
-
+    resume_from = (args.resume_from or "").strip()
+    if not resume_from and args.resume == 1:
+        resume_from = latest_checkpoint(training_args.output_dir) or ""
+    trainer.train(resume_from_checkpoint=resume_from or None)
     trainer.save_model(training_args.output_dir)
 
 
