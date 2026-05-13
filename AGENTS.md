@@ -20,7 +20,6 @@ qwen_asr/joint/stream.py                     流式窗口和 chunk 特征
 qwen_asr/joint/decode.py                     联合模型推理入口
 qwen_asr/joint/ctc.py                        CTC 辅助头
 qwen_asr/joint/rnnt.py                       RNNT 辅助头和 cached greedy 解码
-qwen_asr/joint/tokens.py                     词表工具
 qwen_asr/joint/hotword.py                    热词召回
 qwen_asr/joint/defaults.py                   默认提示词和内部推理常量
 qwen_asr/tools/hotword_eval.py               热词评估
@@ -88,7 +87,6 @@ python3 -m py_compile \
   qwen_asr/joint/decode.py \
   qwen_asr/joint/ctc.py \
   qwen_asr/joint/rnnt.py \
-  qwen_asr/joint/tokens.py \
   qwen_asr/joint/hotword.py \
   qwen_asr/joint/defaults.py \
   qwen_asr/tools/__init__.py \

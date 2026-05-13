@@ -246,52 +246,6 @@ class StreamMixin:
         return kept_chunks
 
     @torch.no_grad()
-    def _stream_llm_feats(
-        self,
-        wav,
-        chunk_sec: float = STREAM_CHUNK_SEC,
-        left_context_sec: float = STREAM_LEFT_SEC,
-        right_context_sec: float = STREAM_RIGHT_SEC,
-        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
-        window_batch_size: int = STREAM_WINDOW_BATCH,
-        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
-        feature_len_cache: Optional[Dict[int, int]] = None,
-    ) -> torch.Tensor:
-        """Encode overlap windows and concatenate current-chunk LLM audio features."""
-        device = next(self.qwen_model.parameters()).device
-        windows = self._windows(
-            wav,
-            chunk_sec=chunk_sec,
-            left_context_sec=left_context_sec,
-            right_context_sec=right_context_sec,
-            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
-        )
-        window_batch_size = self._window_batch_size(windows, window_batch_size)
-
-        kept_chunks = []
-        for batch_start in range(0, len(windows), window_batch_size):
-            batch_windows = windows[batch_start: batch_start + window_batch_size]
-            _aux_features_batch, llm_features_batch = self._enc_joint_windows(
-                [x[5] for x in batch_windows],
-                encoder_batch_size=window_encoder_batch_size,
-            )
-
-            for window, window_features in zip(batch_windows, llm_features_batch):
-                cur_slice = self._current_chunk_slice(
-                    window,
-                    window_features.shape[0],
-                    feature_len_cache,
-                    device,
-                )
-                kept = window_features[cur_slice]
-                if kept.numel() > 0:
-                    kept_chunks.append(kept)
-
-        if not kept_chunks:
-            raise RuntimeError("No streaming LLM audio features were produced.")
-        return torch.cat(kept_chunks, dim=0)
-
-    @torch.no_grad()
     def _stream_joint_feats(
         self,
         wav,

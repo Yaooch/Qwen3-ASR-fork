@@ -1,6 +1,7 @@
 # qwen_asr/joint/hotword.pinyin
 """热词召回：用粗识别文本做拼音滑窗检索。"""
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import List, Optional, Sequence
 
 
@@ -129,21 +130,7 @@ class HotwordRetriever:
 
         q_len = len(q_py)
         limit = max(64, topk * 16)
-        if self._fuzz is None:
-            return self._indexed_candidates(q_py, q_initials, q_finals, q_len, limit)
-
-        q_text = " ".join(q_py)
-        scored = []
-        for entry in self._entries:
-            h_len = len(entry.pinyin)
-            if not h_len or h_len > q_len + 1:
-                continue
-            score = self._fuzz.partial_ratio(q_text, " ".join(entry.pinyin))
-            if score >= 35:
-                scored.append((score, entry))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _score, entry in scored[:limit]]
+        return self._indexed_candidates(q_py, q_initials, q_finals, q_len, limit)
 
     def _indexed_candidates(
         self,
@@ -361,8 +348,6 @@ class HotwordRetriever:
             return 0.0
         left_text = " ".join(left)
         right_text = " ".join(right)
-        if self._fuzz is not None:
-            return self._fuzz.ratio(left_text, right_text) / 100.0
         return SequenceMatcher(None, left_text, right_text).ratio()
 
     def _threshold(self, length: int) -> float:

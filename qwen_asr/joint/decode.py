@@ -15,10 +15,14 @@ from .defaults import (
     STREAM_WINDOW_BATCH,
     hotword_prompt,
 )
-from .tokens import ids_to_text
 
 
 HOTWORD_SOURCE_ORDER = ("ctc", "rnnt")
+
+
+def ids_to_text(ids: List[int], id_to_token: Dict[int, str]) -> str:
+    tokens = [id_to_token.get(i, "") for i in ids]
+    return "".join(tokens).replace("▁", " ").strip().lower()
 
 
 class DecodeMixin:
@@ -61,22 +65,6 @@ class DecodeMixin:
             "window_encoder_batch_size": STREAM_ENCODER_BATCH,
         }
 
-    def decode(self, log_probs: torch.Tensor, output_lengths: torch.Tensor) -> List[str]:
-        if self.ctc is None:
-            raise RuntimeError("decode(log_probs) 需要 CTC 头。")
-
-        pred_ids = log_probs.argmax(dim=2)
-        results = []
-        for b in range(pred_ids.shape[0]):
-            ids = pred_ids[b, : int(output_lengths[b].item())].cpu().tolist()
-            kept, prev = [], -1
-            for idx in ids:
-                if idx != self.ctc.blank_id and idx != prev:
-                    kept.append(idx)
-                prev = idx
-            results.append(ids_to_text(kept, self._id_to_token))
-        return results
-
     def _decode_head(
         self,
         name: str,
@@ -117,31 +105,6 @@ class DecodeMixin:
             encoder_batch_size=encoder_batch_size,
         )
         return self._decode_head(head, hs_pad, out_lens, max_symbols_per_step=max_symbols_per_step)
-
-    def _asr_fields(self, obj):
-        if obj is None:
-            return {"text": "", "language": None}
-        if isinstance(obj, str):
-            return {"text": obj, "language": None}
-        if isinstance(obj, dict):
-            return {
-                "text": obj.get("text") or obj.get("prediction") or obj.get("transcription") or "",
-                "language": obj.get("language"),
-            }
-        text = getattr(obj, "text", None)
-        language = getattr(obj, "language", None)
-        if text is not None:
-            return {"text": str(text), "language": language}
-        return {"text": str(obj), "language": None}
-
-    def _norm_outputs(self, outputs, batch_size: int):
-        if isinstance(outputs, list):
-            if len(outputs) == batch_size:
-                return outputs
-            if batch_size == 1:
-                return [outputs]
-            raise ValueError(f"底座输出数量不匹配：expect {batch_size}, got {len(outputs)}")
-        return [outputs]
 
     def _audio_prompt(self, num_audio_tokens: int, context: str, language: Optional[str]) -> str:
         if self._asr_wrapper is None:

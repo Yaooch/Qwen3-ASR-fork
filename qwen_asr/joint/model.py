@@ -11,7 +11,6 @@ from .ctc import CTC
 from .rnnt import RNNT
 from .decode import DecodeMixin
 from .stream import StreamMixin
-from .tokens import build_id_to_token
 from .defaults import ENCODER_BATCH_SIZE, JOINT_CONFIG
 
 
@@ -24,8 +23,6 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         vocab_size: int,
         vocab: Dict[str, int],
         blank_id: int = 0,
-        ctc_layer_idx: Optional[int] = None,
-        ctc_position: str = "pre_proj",
         heads: Iterable[str] = ("ctc",),
         train_tasks: Iterable[str] = ("llm", "ctc"),
         loss_weights: Optional[Dict[str, float]] = None,
@@ -35,10 +32,8 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         self.vocab = vocab
         self.vocab_size = vocab_size
         self.blank_id = blank_id
-        self._id_to_token = build_id_to_token(vocab)
+        self._id_to_token = {v: k for k, v in vocab.items()}
 
-        self.ctc_layer_idx = ctc_layer_idx
-        self.ctc_position = ctc_position
         self.heads = self._clean_names(heads, allowed={"ctc", "rnnt"}, name="heads")
         self.train_tasks = self._clean_names(
             train_tasks,
@@ -50,13 +45,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             self.loss_weights.update({k: float(v) for k, v in loss_weights.items()})
         self.encoder_batch_size = ENCODER_BATCH_SIZE
 
-        audio_config = qwen_model.thinker.audio_tower.config
-        if ctc_position == "pre_proj":
-            self.encoder_output_size = audio_config.d_model
-        elif ctc_position == "post_proj":
-            self.encoder_output_size = audio_config.output_dim
-        else:
-            raise ValueError(f"不支持的 ctc_position: {ctc_position}")
+        self.encoder_output_size = qwen_model.thinker.audio_tower.config.d_model
 
         self.ctc = None
         self.rnnt = None
@@ -141,8 +130,6 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             vocab_size=cfg["vocab_size"],
             vocab=cfg.get("vocab", {}),
             blank_id=cfg.get("blank_id", 0),
-            ctc_layer_idx=cfg.get("ctc_layer_idx", None),
-            ctc_position=cfg.get("ctc_position", "pre_proj"),
             heads=cfg["heads"],
             train_tasks=("llm", *cfg["heads"]),
         )
@@ -269,26 +256,15 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         concat_features = torch.cat(valid_features, dim=1)
         audio_tower = self.qwen_model.thinker.audio_tower
 
-        if self.ctc_position == "post_proj":
-            enc = audio_tower(
-                input_features=concat_features,
-                feature_lens=feat_lens,
-                return_pre_proj=False,
-            )
-            audio_features_for_llm = enc.last_hidden_state
-            aux_features = audio_features_for_llm
-        else:
-            enc, aux_hidden = audio_tower(
-                input_features=concat_features,
-                feature_lens=feat_lens,
-                return_pre_proj=True,
-                ctc_layer_idx=self.ctc_layer_idx,
-            )
-            pre_final = enc.last_hidden_state
-            aux_features = aux_hidden
-            audio_features_for_llm = None
-            if need_llm_features:
-                audio_features_for_llm = audio_tower.proj2(audio_tower.act(audio_tower.proj1(pre_final)))
+        enc, aux_features = audio_tower(
+            input_features=concat_features,
+            feature_lens=feat_lens,
+            return_pre_proj=True,
+        )
+        pre_final = enc.last_hidden_state
+        audio_features_for_llm = None
+        if need_llm_features:
+            audio_features_for_llm = audio_tower.proj2(audio_tower.act(audio_tower.proj1(pre_final)))
 
         out_lens = self._out_lens(feat_lens)
         max_len = int(out_lens.max().item())
