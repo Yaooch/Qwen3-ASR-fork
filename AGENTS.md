@@ -24,6 +24,8 @@ qwen_asr/joint/hotword.py                    热词召回
 qwen_asr/joint/defaults.py                   默认提示词和内部推理常量
 qwen_asr/tools/hotword_eval.py               热词评估
 qwen_asr/tools/pinyin_eval.py                拼音评估
+qwen_asr/tools/cut_contextasr_dialogue.py    ContextASR Dialogue 按时间戳切分并生成训练 jsonl
+qwen_asr/tools/split_contextasr_dialogue_eval.py ContextASR Dialogue 抽取热词测试集和验证集
 finetuning/train.py                          联合训练入口
 finetuning/infer.py                          批量推理入口
 finetuning/qwen3_asr_sft.py                  原始 SFT baseline
@@ -48,13 +50,14 @@ assets/                                      项目文档资源
 - RNNT 解码固定使用 cached greedy。
 - CTC/RNNT 新训练固定接在 `ln_post` 后、`proj1/proj2` 前。
 - 推理不再使用 `joint` 模式；`--mode` 只接受 `llm/ctc/rnnt` 的逗号组合。
-- 训练不再使用 `train_mode/aux_loss_type`；`--train` 只接受 `llm/encoder/ctc/rnnt` 的逗号组合。
+- 训练不再使用 `train_mode/aux_loss_type`；`--train` 只接受 `llm/proj/encoder/ctc/rnnt` 的逗号组合，`proj` 对应 `audio_tower.proj1/act/proj2`。
 - 训练不再使用额外窗口参数；短窗口由 `audio_n_window/audio_n_window_infer` 控制。
 - 推理流式细节固定在 `qwen_asr/joint/defaults.py`，shell 只保留 `--stream/--no_stream`。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径和 WER 脚本路径统一放在 `qwen_asr/joint/defaults.py`。
 - 新 joint checkpoint 使用 `joint_config.json` 记录 `heads` 等结构信息；`--train` 只控制训练/loss，不训练的已有头不加载、保存时从源 checkpoint 复制。
+- 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件。
 - 热词召回固定使用 pinyin，缺少 `pypinyin` 直接报错，不做静默兜底。
-- 热词评估只比较默认 LLM 与热词 prompt LLM，拼音评估只保留 SAR/PER 和 badcase。
+- 热词评估只比较默认 LLM 与热词 prompt LLM；推理热词库和评估目标热词分开，评估目标文件使用 `utt_id<TAB>热词1,热词2` 格式。
 - 流式窗口裁剪、单条/批量返回、stream 参数组装、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
 - shell 脚本参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。
 - 每次 AI 对仓库做出代码、脚本、结构或验证流程修改后，必须同步检查并更新本 `AGENTS.md` 中相关说明，不能只改实现不改开发文档。
@@ -92,6 +95,8 @@ python3 -m py_compile \
   qwen_asr/tools/__init__.py \
   qwen_asr/tools/hotword_eval.py \
   qwen_asr/tools/pinyin_eval.py \
+  qwen_asr/tools/cut_contextasr_dialogue.py \
+  qwen_asr/tools/split_contextasr_dialogue_eval.py \
   finetuning/train.py \
   finetuning/infer.py \
   finetuning/qwen3_asr_sft.py \

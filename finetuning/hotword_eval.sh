@@ -5,33 +5,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
+baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
+
 stage="all"
-ckpt=""
-input_scp=""
-ref_path=""
-hotword_file=""
-output_dir=""
-gpu_ids="0"
-batch_size=16
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-3"
+input_scp="${baseurl}/wav.scp"
+ref_path="${baseurl}/text"
+hotword_file="${baseurl}/hotword.txt"
+target_hotword_file="${baseurl}/utt_hotword.txt"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_2/ContextASR"
+gpu_ids="0,1,2,3"
+batch_size=64
 dtype="bf16"
 hotword_topk=10
 hotword_pinyin_style="normal"
-prompt=""
 stream=1
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path
     [--ref_dir]=ref_path [--hotword_file]=hotword_file
+    [--target_hotword_file]=target_hotword_file
     [--output_dir]=output_dir
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
     [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
-    [--prompt]=prompt
 )
 
 usage() {
-    echo "用法：bash $0 --ckpt CKPT --input_scp wav.scp --ref_path text --hotword_file hotwords.txt --output_dir out"
+    echo "用法：bash $0 --ckpt CKPT --input_scp wav.scp --ref_path text --hotword_file hotwords.txt --target_hotword_file utt_hotword.txt --output_dir out"
     echo "可选：--stage all|infer|eval"
-    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --prompt TEXT --no_stream"
+    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --no_stream"
 }
 
 set_arg() {
@@ -78,6 +81,10 @@ if [[ -z "${hotword_file}" ]]; then
     echo "必须提供 --hotword_file"
     exit 1
 fi
+if [[ -z "${target_hotword_file}" ]]; then
+    echo "必须提供 --target_hotword_file"
+    exit 1
+fi
 
 mkdir -p "${output_dir}"
 detail_path="${output_dir}/details/results_detail.jsonl"
@@ -96,9 +103,6 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --hotword_topk "${hotword_topk}"
         --hotword_pinyin_style "${hotword_pinyin_style}"
     )
-    if [[ -n "${prompt}" ]]; then
-        infer_cmd+=(--prompt "${prompt}")
-    fi
     if [[ "${stream}" -eq 1 ]]; then
         infer_cmd+=(--stream)
     fi
@@ -111,7 +115,7 @@ if [[ "${stage}" == "all" || "${stage}" == "eval" ]]; then
         python3 "${PROJECT_ROOT}/qwen_asr/tools/hotword_eval.py"
         --ref_path "${ref_path}"
         --detail_path "${detail_path}"
-        --hotword_file "${hotword_file}"
+        --target_hotword_file "${target_hotword_file}"
         --output_path "${output_dir}/hotword_eval.txt"
         --badcase_path "${output_dir}/hotword_badcases.txt"
     )

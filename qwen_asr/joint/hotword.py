@@ -1,7 +1,6 @@
 # qwen_asr/joint/hotword.pinyin
 """热词召回：用粗识别文本做拼音滑窗检索。"""
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import List, Optional, Sequence
 
 
@@ -74,9 +73,11 @@ class HotwordRetriever:
 
         try:
             from pypinyin import Style, lazy_pinyin
+            from rapidfuzz import fuzz
         except ImportError as exc:
-            raise RuntimeError("缺少依赖 pypinyin，请先安装后再使用热词召回。") from exc
+            raise RuntimeError("缺少依赖 pypinyin 或 rapidfuzz，请先安装后再使用热词召回。") from exc
 
+        self._fuzz = fuzz
         self._lazy_pinyin = lazy_pinyin
         self._style = self._parse_style(Style, pinyin_style)
         self._tone3_style = Style.TONE3
@@ -130,7 +131,14 @@ class HotwordRetriever:
 
         q_len = len(q_py)
         limit = max(64, topk * 16)
-        return self._indexed_candidates(q_py, q_initials, q_finals, q_len, limit)
+        q_text = " ".join(q_py)
+        scored = []
+        for entry in self._indexed_candidates(q_py, q_initials, q_finals, q_len, limit * 4):
+            score = self._fuzz.partial_ratio(q_text, " ".join(entry.pinyin))
+            if score >= 35:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _score, entry in scored[:limit]]
 
     def _indexed_candidates(
         self,
@@ -300,7 +308,7 @@ class HotwordRetriever:
             return 0.72
         if initial_same:
             return 0.62
-        return SequenceMatcher(None, h_py, q_py).ratio() * 0.65
+        return self._fuzz.ratio(h_py, q_py) / 100.0 * 0.65
 
     def _entry(self, word: str) -> HotwordEntry:
         return HotwordEntry(
@@ -348,7 +356,7 @@ class HotwordRetriever:
             return 0.0
         left_text = " ".join(left)
         right_text = " ".join(right)
-        return SequenceMatcher(None, left_text, right_text).ratio()
+        return self._fuzz.ratio(left_text, right_text) / 100.0
 
     def _threshold(self, length: int) -> float:
         if length <= 1:

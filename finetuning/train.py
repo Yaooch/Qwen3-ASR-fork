@@ -19,7 +19,9 @@ from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArg
 from transformers.modeling_utils import load_sharded_checkpoint
 
 
-TASKS = {"llm", "encoder", "ctc", "rnnt"}
+TASKS = {"llm", "proj", "encoder", "ctc", "rnnt"}
+PROJ_MODULES = ("proj1", "act", "proj2")
+PROJ_PARAM_KEYS = tuple(f".{name}." for name in PROJ_MODULES)
 
 
 def csv_set(value: str, allowed: set, name: str) -> tuple:
@@ -183,10 +185,15 @@ class DataCollatorForJointTraining:
 
 
 def module_set_trainable(module, enabled: bool) -> None:
-    if module is None:
+    if module is None or not hasattr(module, "parameters"):
         return
     for param in module.parameters():
         param.requires_grad = enabled
+
+
+def set_proj_trainable(audio_tower, enabled: bool) -> None:
+    for name in PROJ_MODULES:
+        module_set_trainable(getattr(audio_tower, name, None), enabled)
 
 
 def set_trainable(model: Qwen3ASRJointModel, tasks: Iterable[str]) -> None:
@@ -197,13 +204,12 @@ def set_trainable(model: Qwen3ASRJointModel, tasks: Iterable[str]) -> None:
     if "llm" in tasks:
         module_set_trainable(model.qwen_model, True)
         module_set_trainable(audio_tower, False)
-        module_set_trainable(getattr(audio_tower, "proj1", None), True)
-        module_set_trainable(getattr(audio_tower, "proj2", None), True)
     if "encoder" in tasks:
         module_set_trainable(audio_tower, True)
-        if "llm" not in tasks:
-            module_set_trainable(getattr(audio_tower, "proj1", None), False)
-            module_set_trainable(getattr(audio_tower, "proj2", None), False)
+        if "proj" not in tasks:
+            set_proj_trainable(audio_tower, False)
+    if "proj" in tasks:
+        set_proj_trainable(audio_tower, True)
     if "ctc" in tasks:
         module_set_trainable(model.ctc, True)
     if "rnnt" in tasks:
@@ -215,8 +221,8 @@ def group_name(param_name: str) -> str:
         return "ctc"
     if param_name.startswith(("rnnt.", "module.rnnt.")):
         return "rnnt"
-    if ".audio_tower." in param_name and not any(x in param_name for x in (".proj1.", ".proj2.")):
-        return "encoder"
+    if ".audio_tower." in param_name:
+        return "proj" if any(x in param_name for x in PROJ_PARAM_KEYS) else "encoder"
     return "llm"
 
 
@@ -343,6 +349,7 @@ class JointTrainer(Trainer):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         base = self.model.module if hasattr(self.model, "module") else self.model
+        copy_hf_files(self.head_source, output_dir)
         sync_audio_window_config(base.qwen_model)
         base.qwen_model.save_pretrained(output_dir, safe_serialization=True)
         base.save_aux(output_dir, heads=self.save_heads, copy_heads_from=self.head_source)
@@ -432,7 +439,7 @@ def parse_args():
     p.add_argument("--train_file", type=str, required=True)
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-joint-out")
-    p.add_argument("--train", type=str, default="llm,ctc", help="逗号组合：llm,encoder,ctc,rnnt")
+    p.add_argument("--train", type=str, default="llm,ctc", help="逗号组合：llm,proj,encoder,ctc,rnnt")
     p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--vocab_path", type=str, default=TRAIN_VOCAB_PATH)
     p.add_argument("--sp_model_path", type=str, default=TRAIN_SP_MODEL_PATH)
@@ -444,6 +451,7 @@ def parse_args():
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
     p.add_argument("--lr_llm", type=float, default=2e-5)
+    p.add_argument("--lr_proj", type=float, default=2e-5)
     p.add_argument("--lr_encoder", type=float, default=1e-5)
     p.add_argument("--lr_ctc", type=float, default=1e-3)
     p.add_argument("--lr_rnnt", type=float, default=1e-3)
@@ -465,9 +473,11 @@ def parse_args():
     p.add_argument("--resume", type=int, default=0)
     args = p.parse_args()
     args.tasks = csv_set(args.train, TASKS, "train")
-    args.loss_tasks = tuple(x for x in args.tasks if x != "encoder")
+    if "proj" in args.tasks and "llm" not in args.tasks:
+        raise ValueError("proj 只作用于 LLM 路径，请和 llm 一起训练。")
+    args.loss_tasks = tuple(x for x in args.tasks if x not in ("encoder", "proj"))
     if not args.loss_tasks:
-        raise ValueError("--train 至少需要包含 llm/ctc/rnnt 之一；encoder 只能配合这些 loss 一起训练。")
+        raise ValueError("--train 至少需要包含 llm/ctc/rnnt 之一；encoder/proj 只能配合这些 loss 一起训练。")
     save_heads = [*existing_heads(args.model_path)]
     active_heads = []
     for name in args.loss_tasks:
@@ -602,7 +612,13 @@ def main():
         logging_dir="./logs_joint",
     )
     trainer = JointTrainer(
-        lr_by_group={"llm": args.lr_llm, "encoder": args.lr_encoder, "ctc": args.lr_ctc, "rnnt": args.lr_rnnt},
+        lr_by_group={
+            "llm": args.lr_llm,
+            "proj": args.lr_proj,
+            "encoder": args.lr_encoder,
+            "ctc": args.lr_ctc,
+            "rnnt": args.lr_rnnt,
+        },
         save_heads=args.heads,
         head_source=args.model_path,
         model=model,

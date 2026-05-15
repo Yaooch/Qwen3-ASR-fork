@@ -24,19 +24,23 @@ export OMP_NUM_THREADS=4
 model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/train_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-15"
+output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-16"
+# output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-2"
 
 batch_size=32
 grad_acc=4
-epochs=1
-train_tasks="ctc,encoder"
+epochs=2
 
-lr_encoder=2e-5
+# encoder, proj, llm, ctc, rnnt 可以设置不同的学习率，或者只微调其中部分模块
+train_tasks="encoder,ctc"
+
+lr_encoder=2e-4
 lr_llm=5e-6
+lr_proj=5e-6
 lr_ctc=2e-3
 lr_rnnt=2e-3
 
-w_llm=0.9
+w_llm=1
 w_ctc=1
 w_rnnt=0.1
 
@@ -65,6 +69,7 @@ torchrun \
     --grad_acc "$grad_acc" \
     --train "$train_tasks" \
     --lr_llm "$lr_llm" \
+    --lr_proj "$lr_proj" \
     --lr_encoder "$lr_encoder" \
     --lr_ctc "$lr_ctc" \
     --lr_rnnt "$lr_rnnt" \

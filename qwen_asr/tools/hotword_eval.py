@@ -5,7 +5,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List
 
 
 TAG_RE = re.compile(r"<\|.*?\|>|<[^>]+>")
@@ -18,6 +18,7 @@ class Counts:
     target_total: int = 0
     retrieved_total: int = 0
     retrieved_true: int = 0
+    retrieved_final_hit: int = 0
     retrieved_false: int = 0
     top1: int = 0
     top3: int = 0
@@ -34,7 +35,7 @@ def parse_args():
     p = argparse.ArgumentParser("热词 prompt 评估")
     p.add_argument("--ref_path", "--ref_dir", required=True)
     p.add_argument("--detail_path", required=True)
-    p.add_argument("--hotword_file", required=True)
+    p.add_argument("--target_hotword_file", required=True)
     p.add_argument("--output_path", required=True)
     p.add_argument("--badcase_path", default="")
     p.add_argument("--topk_badcases", type=int, default=100)
@@ -71,9 +72,18 @@ def read_refs(path: str) -> Dict[str, str]:
     return refs
 
 
-def read_hotwords(path: str) -> List[str]:
+def split_words(text: str) -> List[str]:
+    return [x.strip() for x in re.split(r"[,，]", text or "") if x.strip()]
+
+
+def read_target_hotwords(path: str) -> Dict[str, List[str]]:
+    rows = {}
     with open(path, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if parts and parts[0]:
+                rows[parts[0]] = split_words(parts[1] if len(parts) > 1 else "")
+    return rows
 
 
 def read_details(path: str) -> Dict[str, dict]:
@@ -93,11 +103,6 @@ def contains(text: str, word: str) -> bool:
     return compact(word) in compact(text)
 
 
-def targets(ref_text: str, hotwords: Sequence[str]) -> List[str]:
-    ref = compact(ref_text)
-    return [w for w in hotwords if compact(w) and compact(w) in ref]
-
-
 def percent(num: int, den: int) -> str:
     value = num / den if den else 0.0
     return f"{value * 100:.2f}% ({num}/{den})"
@@ -111,7 +116,7 @@ def ratio(num: int, den: int) -> str:
 def evaluate(args):
     refs = read_refs(args.ref_path)
     details = read_details(args.detail_path)
-    hotwords = read_hotwords(args.hotword_file)
+    target_map = read_target_hotwords(args.target_hotword_file)
     counts = Counts()
     badcases = []
     missing = 0
@@ -126,7 +131,7 @@ def evaluate(args):
         base_text = obj.get("llm_text") or ""
         final_text = obj.get("hotword_llm_text") or obj.get("text") or ""
         retrieved = obj.get("hotwords") or []
-        target_words = targets(ref_text, hotwords)
+        target_words = target_map.get(utt_id, [])
         target_set = set(target_words)
         false_retrieved = [w for w in retrieved if w not in target_set]
         false_final = [w for w in false_retrieved if contains(final_text, w) and not contains(ref_text, w)]
@@ -149,6 +154,7 @@ def evaluate(args):
             counts.top10 += int(rank is not None and rank <= 10)
             counts.base_hit += int(base_hit)
             counts.final_hit += int(final_hit)
+            counts.retrieved_final_hit += int(rank is not None and final_hit)
             counts.corrected += int((not base_hit) and final_hit)
             counts.regressed += int(base_hit and not final_hit)
             target_rows.append({"word": word, "rank": rank, "base_hit": base_hit, "final_hit": final_hit})
@@ -190,6 +196,7 @@ def write_summary(path: str, counts: Counts, missing: int):
         print("识别：", file=f)
         print(f"默认 LLM 热词识别率：{percent(counts.base_hit, counts.target_total)}", file=f)
         print(f"热词 LLM 热词识别率：{percent(counts.final_hit, counts.target_total)}", file=f)
+        print(f"正确召回热词 LLM 识别率：{percent(counts.retrieved_final_hit, counts.retrieved_true)}", file=f)
         print(f"新增修对数：{counts.corrected}", file=f)
         print(f"改坏数：{counts.regressed}", file=f)
         print(f"误注入识别热词数：{counts.false_final}", file=f)

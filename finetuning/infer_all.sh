@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228/"
-exp_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_1"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword/checkpoint-342"
+exp_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword"
 mode="llm"
 stage="all"
 gpu_ids="0,1,2,3,4,5,6,7"
@@ -15,7 +15,7 @@ skip_done=1
 prompt=""
 datasets_file=""
 stream=1
-wer_script=""
+wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
 
