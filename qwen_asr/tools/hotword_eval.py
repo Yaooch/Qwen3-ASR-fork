@@ -159,7 +159,7 @@ def evaluate(args):
             counts.regressed += int(base_hit and not final_hit)
             target_rows.append({"word": word, "rank": rank, "base_hit": base_hit, "final_hit": final_hit})
 
-        if false_final or any(not row["final_hit"] or row["base_hit"] != row["final_hit"] for row in target_rows):
+        if false_retrieved or false_final or any(not row["final_hit"] for row in target_rows):
             badcases.append({
                 "utt_id": utt_id,
                 "ref": ref_text,
@@ -202,21 +202,63 @@ def write_summary(path: str, counts: Counts, missing: int):
         print(f"误注入识别热词数：{counts.false_final}", file=f)
 
 
+BADCASE_GROUPS = [
+    ("false_final", "误召回且注入输出"),
+    ("false_retrieved", "误召回但未注入"),
+    ("retrieved_miss", "目标热词已召回但仍未识别"),
+    ("regressed", "默认识别正确但热词后改坏"),
+    ("missed_recall", "目标热词未召回且未识别"),
+]
+
+
+def badcase_groups(row: dict) -> Dict[str, List[str]]:
+    groups = {key: [] for key, _ in BADCASE_GROUPS}
+    false_final = set(row["false_final"])
+    groups["false_final"] = row["false_final"]
+    groups["false_retrieved"] = [w for w in row["false_retrieved"] if w not in false_final]
+
+    for item in row["targets"]:
+        word = item["word"]
+        if item["final_hit"]:
+            continue
+        if item["base_hit"]:
+            groups["regressed"].append(word)
+        elif item["rank"] is None:
+            groups["missed_recall"].append(word)
+        else:
+            groups["retrieved_miss"].append(word)
+    return groups
+
+
+def print_badcase(f, row: dict):
+    print(f"utt_id: {row['utt_id']}", file=f)
+    print("target: " + ",".join(row["target"]), file=f)
+    print("retrieved: " + ",".join(row["retrieved"]), file=f)
+    print(f"{'ref':<5}: {row['ref']}", file=f)
+    print(f"{'llm':<5}: {row['llm']}", file=f)
+    print(f"{'final':<5}: {row['hotword_llm']}", file=f)
+    print("", file=f)
+
+
 def write_badcases(path: str, rows: List[dict], topk: int):
     if not path:
         return
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    buckets = {key: [] for key, _ in BADCASE_GROUPS}
+    for row in rows[:topk]:
+        for key, words in badcase_groups(row).items():
+            if words:
+                buckets[key].append(row)
+
     with open(path, "w", encoding="utf-8") as f:
-        for row in rows[:topk]:
-            print(f"utt_id: {row['utt_id']}", file=f)
-            print("target: " + ",".join(row["target"]), file=f)
-            print("retrieved: " + ",".join(row["retrieved"]), file=f)
-            print("false_retrieved: " + ",".join(row["false_retrieved"]), file=f)
-            print("false_final: " + ",".join(row["false_final"]), file=f)
-            print("ref: " + row["ref"], file=f)
-            print("llm: " + row["llm"], file=f)
-            print("hotword_llm: " + row["hotword_llm"], file=f)
-            print("", file=f)
+        for key, title in BADCASE_GROUPS:
+            print(f"===== {title} ({len(buckets[key])}) =====", file=f)
+            if not buckets[key]:
+                print("无", file=f)
+                print("", file=f)
+                continue
+            for row in buckets[key]:
+                print_badcase(f, row)
 
 
 def main():

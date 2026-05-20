@@ -302,6 +302,77 @@ class StreamMixin:
         return aux_chunks, torch.cat(llm_chunks, dim=0)
 
     @torch.no_grad()
+    def _stream_batch_feats(
+        self,
+        wavs: List,
+        need_llm: bool,
+        chunk_sec: float = STREAM_CHUNK_SEC,
+        left_context_sec: float = STREAM_LEFT_SEC,
+        right_context_sec: float = STREAM_RIGHT_SEC,
+        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
+        window_batch_size: int = STREAM_WINDOW_BATCH,
+        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
+        feature_len_cache: Optional[Dict[int, int]] = None,
+    ) -> Tuple[List[List[torch.Tensor]], List[torch.Tensor]]:
+        """把一个 batch 内所有流式窗口合批编码，避免逐条音频喂 GPU。"""
+        device = next(self.qwen_model.parameters()).device
+        all_windows = []
+        for wav_idx, wav in enumerate(wavs):
+            windows = self._windows(
+                wav,
+                chunk_sec=chunk_sec,
+                left_context_sec=left_context_sec,
+                right_context_sec=right_context_sec,
+                first_chunk_left_pad_sec=first_chunk_left_pad_sec,
+            )
+            all_windows.extend((wav_idx, window) for window in windows)
+
+        aux_chunks = [[] for _ in wavs]
+        llm_chunks = [[] for _ in wavs]
+        window_batch_size = self._window_batch_size(all_windows, window_batch_size)
+
+        for batch_start in range(0, len(all_windows), window_batch_size):
+            batch_items = all_windows[batch_start: batch_start + window_batch_size]
+            batch_windows = [item[1] for item in batch_items]
+            window_wavs = [window[5] for window in batch_windows]
+            if need_llm:
+                aux_batch, llm_batch = self._enc_joint_windows(
+                    window_wavs,
+                    encoder_batch_size=window_encoder_batch_size,
+                )
+            else:
+                aux_batch = self._enc_aux_windows(
+                    window_wavs,
+                    encoder_batch_size=window_encoder_batch_size,
+                )
+                llm_batch = [None] * len(aux_batch)
+
+            for (wav_idx, window), aux_features, llm_features in zip(batch_items, aux_batch, llm_batch):
+                cur_slice = self._current_chunk_slice(
+                    window,
+                    aux_features.shape[0],
+                    feature_len_cache,
+                    device,
+                )
+                aux_kept = aux_features[cur_slice]
+                if aux_kept.numel() > 0:
+                    aux_chunks[wav_idx].append(aux_kept)
+                if need_llm:
+                    llm_kept = llm_features[cur_slice]
+                    if llm_kept.numel() > 0:
+                        llm_chunks[wav_idx].append(llm_kept)
+
+        llm_features_list = []
+        for idx, chunks in enumerate(aux_chunks):
+            if not chunks:
+                raise RuntimeError(f"No streaming auxiliary features were produced for item {idx}.")
+            if need_llm:
+                if not llm_chunks[idx]:
+                    raise RuntimeError(f"No streaming LLM audio features were produced for item {idx}.")
+                llm_features_list.append(torch.cat(llm_chunks[idx], dim=0))
+        return aux_chunks, llm_features_list
+
+    @torch.no_grad()
     def _rnnt_stream_decode(
         self,
         chunks: List[torch.Tensor],

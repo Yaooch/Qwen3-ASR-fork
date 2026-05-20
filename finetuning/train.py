@@ -13,7 +13,7 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_PROMPT, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
+from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -22,6 +22,23 @@ from transformers.modeling_utils import load_sharded_checkpoint
 TASKS = {"llm", "proj", "encoder", "ctc", "rnnt"}
 PROJ_MODULES = ("proj1", "act", "proj2")
 PROJ_PARAM_KEYS = tuple(f".{name}." for name in PROJ_MODULES)
+
+
+def read_joint_cfg(path: str) -> Dict:
+    cfg_path = os.path.join(path or "", JOINT_CONFIG)
+    if not os.path.exists(cfg_path):
+        return {}
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_ctc_cfg(args, source_cfg: Dict) -> None:
+    if args.ctc_adapter == "auto":
+        args.ctc_adapter = source_cfg.get("ctc_adapter", "mlp")
+
+
+def ctc_train_cfg(args) -> Dict:
+    return {"adapter_type": args.ctc_adapter}
 
 
 def csv_set(value: str, allowed: set, name: str) -> tuple:
@@ -448,6 +465,7 @@ def parse_args():
     p.add_argument("--grad_acc", type=int, default=4)
     p.add_argument("--epochs", type=float, default=10)
     p.add_argument("--log_steps", type=int, default=10)
+    p.add_argument("--logging_dir", type=str, default="./logs_joint")
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
     p.add_argument("--lr_llm", type=float, default=2e-5)
@@ -458,6 +476,8 @@ def parse_args():
     p.add_argument("--w_llm", type=float, default=1.0)
     p.add_argument("--w_ctc", type=float, default=1.0)
     p.add_argument("--w_rnnt", type=float, default=1.0)
+
+    p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe，auto 会继承源 checkpoint")
 
     p.add_argument("--audio_n_window", type=int, default=0)
     p.add_argument("--audio_n_window_infer", type=int, default=0)
@@ -472,6 +492,8 @@ def parse_args():
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
     args = p.parse_args()
+    source_cfg = read_joint_cfg(args.model_path)
+    resolve_ctc_cfg(args, source_cfg)
     args.tasks = csv_set(args.train, TASKS, "train")
     if "proj" in args.tasks and "llm" not in args.tasks:
         raise ValueError("proj 只作用于 LLM 路径，请和 llm 一起训练。")
@@ -517,6 +539,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     if is_main:
         print(f"训练任务：{','.join(args.tasks)}")
+        print(f"CTC adapter：{args.ctc_adapter}")
         print(f"词表大小：{len(vocab)}")
         with open(os.path.join(args.output_dir, "ctc_vocab.json"), "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=False, indent=2)
@@ -561,6 +584,7 @@ def main():
         heads=args.active_heads,
         train_tasks=args.loss_tasks,
         loss_weights={"llm": args.w_llm, "ctc": args.w_ctc, "rnnt": args.w_rnnt},
+        ctc_config=ctc_train_cfg(args),
     )
     if args.active_heads:
         load_heads(model, args.model_path, heads=args.active_heads, is_main=is_main, strict=False)
@@ -609,7 +633,7 @@ def main():
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to="tensorboard",
-        logging_dir="./logs_joint",
+        logging_dir=args.logging_dir,
     )
     trainer = JointTrainer(
         lr_by_group={

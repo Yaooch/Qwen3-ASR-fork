@@ -7,9 +7,6 @@ from typing import Dict, Iterable, List
 
 
 TAG_RE = re.compile(r"<\|.*?\|>|<[^>]+>")
-ASCII_RE = re.compile(r"[A-Za-z0-9]+")
-
-
 @dataclass
 class EditStat:
     sub: int = 0
@@ -62,16 +59,25 @@ def is_chinese(ch: str) -> bool:
 
 def tokens(text: str, lazy_pinyin, style) -> List[str]:
     text = norm(text)
-    has_zh = any(is_chinese(ch) for ch in text)
-    if not has_zh:
-        return ASCII_RE.findall(text)
-
     out = []
+    buf = []
+
+    def flush():
+        if buf:
+            out.append("".join(buf))
+            buf.clear()
+
     for ch in text:
         if is_chinese(ch):
-            items = lazy_pinyin(ch, style=style, errors="ignore")
+            flush()
+            items = lazy_pinyin(ch, style=style, errors="ignore", strict=False)
             if items:
-                out.append(items[0])
+                out.append(items[0].lower())
+        elif ch.isascii() and ch.isalnum():
+            buf.append(ch)
+        else:
+            flush()
+    flush()
     return out
 
 
@@ -115,14 +121,25 @@ def iter_files(path: str) -> Iterable[str]:
         yield path
 
 
+def parse_line(line: str):
+    line = line.rstrip("\n")
+    if not line:
+        return None, None
+    if "\t" in line:
+        parts = line.split("\t")
+        return parts[0], parts[1] if len(parts) > 1 else ""
+    parts = line.split(maxsplit=1)
+    return parts[0], parts[1] if len(parts) > 1 else ""
+
+
 def read_refs(path: str) -> Dict[str, str]:
     refs = {}
     for file in iter_files(path):
         with open(file, "r", encoding="utf-8") as f:
             for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 2:
-                    refs[parts[0]] = parts[1]
+                utt_id, text = parse_line(line)
+                if utt_id:
+                    refs[utt_id] = text
     return refs
 
 
@@ -130,9 +147,9 @@ def read_results(path: str) -> Dict[str, str]:
     hyps = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) >= 2:
-                hyps[parts[0]] = parts[1]
+            utt_id, text = parse_line(line)
+            if utt_id:
+                hyps[utt_id] = text
     return hyps
 
 

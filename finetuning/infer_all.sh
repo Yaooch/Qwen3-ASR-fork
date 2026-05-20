@@ -4,20 +4,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword/checkpoint-342"
-exp_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword"
-mode="llm"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-17"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_17"
+mode="ctc,llm"
 stage="all"
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="1,2,3,4,5,6,7"
 batch_size=128
 dtype="bf16"
 skip_done=1
-prompt=""
 datasets_file=""
 stream=1
 wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
+text_topk_badcases=300
 
 # 字段：name|wav.scp|text|language。language 为空或 None 时跳过 LID 统计。
 DATASETS=(
@@ -32,15 +32,16 @@ DATASETS=(
 )
 
 declare -A arg_map=(
-    [--ckpt]=ckpt [--exp_dir]=exp_dir [--mode]=mode [--stage]=stage
+    [--ckpt]=ckpt [--outdir]=outdir [--mode]=mode [--stage]=stage
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
-    [--skip_done]=skip_done [--prompt]=prompt [--datasets_file]=datasets_file
+    [--skip_done]=skip_done [--datasets_file]=datasets_file
     [--wer_script]=wer_script [--pinyin_style]=pinyin_style
     [--pinyin_topk_badcases]=pinyin_topk_badcases
+    [--text_topk_badcases]=text_topk_badcases
 )
 
 usage() {
-    echo "用法：bash $0 --ckpt CKPT --exp_dir out"
+    echo "用法：bash $0 --ckpt CKPT --outdir out"
     echo "可选：--datasets_file datasets.txt 覆盖脚本内置数据集"
     echo "datasets.txt 每行：name|wav.scp|text|language"
 }
@@ -80,7 +81,7 @@ if [[ -z "${ckpt}" || "${#DATASETS[@]}" -eq 0 ]]; then
     exit 1
 fi
 
-summary_path="${exp_dir}/result.txt"
+summary_path="${outdir}/result.txt"
 
 result_path() {
     local output_dir="$1"
@@ -106,6 +107,7 @@ dataset_done() {
         [[ -z "${item}" ]] && continue
         has_result "${output_dir}" "${item}" || return 1
         [[ -f "${output_dir}/domain_${item}.txt" ]] || return 1
+        [[ -f "${details}/text_badcases_${item}.txt" ]] || return 1
         if [[ "${item}" == "ctc" || "${item}" == "rnnt" ]]; then
             [[ -f "${output_dir}/pinyin_similarity_${item}.txt" ]] || return 1
         fi
@@ -174,12 +176,12 @@ maybe_lid() {
 }
 
 write_summary() {
-    mkdir -p "${exp_dir}"
+    mkdir -p "${outdir}"
     {
         printf "dataset\tllm_wer\tllm_sar\tllm_lid\tctc_wer\tctc_sar\tctc_per\trnnt_wer\trnnt_sar\trnnt_per\n"
         for row in "${DATASETS[@]}"; do
             IFS='|' read -r name _scp _text _language <<< "${row}"
-            local output_dir="${exp_dir}/${name}"
+            local output_dir="${outdir}/${name}"
             local details="${output_dir}/details"
             printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
                 "${name}" \
@@ -198,7 +200,7 @@ write_summary() {
 
 for row in "${DATASETS[@]}"; do
     IFS='|' read -r name input_scp ref_dir language <<< "${row}"
-    output_dir="${exp_dir}/${name}"
+    output_dir="${outdir}/${name}"
     echo "数据集：${name}"
 
     if [[ "${skip_done}" -eq 1 ]] && dataset_done "${output_dir}" "${language}"; then
@@ -221,6 +223,7 @@ for row in "${DATASETS[@]}"; do
         --dtype "${dtype}"
         --pinyin_style "${pinyin_style}"
         --pinyin_topk_badcases "${pinyin_topk_badcases}"
+        --text_topk_badcases "${text_topk_badcases}"
     )
     if [[ -n "${wer_script}" ]]; then
         cmd+=(--wer_script "${wer_script}")
@@ -230,10 +233,6 @@ for row in "${DATASETS[@]}"; do
     else
         cmd+=(--no_stream)
     fi
-    if [[ -n "${prompt}" ]]; then
-        cmd+=(--prompt "${prompt}")
-    fi
-
     "${cmd[@]}"
     maybe_lid "${output_dir}" "${language}"
     write_summary

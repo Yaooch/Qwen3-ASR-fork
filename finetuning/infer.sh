@@ -16,7 +16,6 @@ gpu_ids="0,1,2,3"
 batch_size=128
 dtype="bf16"
 language=""
-prompt=""
 hotword_file=""
 hotword_topk=5
 hotword_pinyin_style="normal"
@@ -24,14 +23,16 @@ stream=1
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
+text_topk_badcases=100
 
 declare -A arg_map=(
     [--ckpt]=ckpt [--stage]=stage [--mode]=mode [--input_scp]=input_scp
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
-    [--dtype]=dtype [--language]=language [--prompt]=prompt
+    [--dtype]=dtype [--language]=language
     [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
     [--wer_script]=wer_script
     [--pinyin_style]=pinyin_style [--pinyin_topk_badcases]=pinyin_topk_badcases
+    [--text_topk_badcases]=text_topk_badcases
 )
 
 usage() {
@@ -56,7 +57,6 @@ usage() {
     echo "  --batch_size          每个进程的 batch size"
     echo "  --dtype               模型精度：bf16 / fp16 / fp32"
     echo "  --language            默认语种，可不传"
-    echo "  --prompt              额外提示词，仅 llm 模式有效"
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
@@ -66,6 +66,7 @@ usage() {
     echo "  --wer_script          WER 脚本路径，默认见 qwen_asr/joint/defaults.py"
     echo "  --pinyin_style        拼音风格：normal / tone3，默认 normal"
     echo "  --pinyin_topk_badcases 拼音 badcase 输出条数，默认 100"
+    echo "  --text_topk_badcases  文本 badcase 输出条数，默认 100；设为 0 输出全部"
     echo ""
 }
 
@@ -194,10 +195,6 @@ if [[ -n "${language}" ]]; then
     infer_cmd+=(--language "${language}")
 fi
 
-if [[ -n "${prompt}" ]]; then
-    infer_cmd+=(--prompt "${prompt}")
-fi
-
 if [[ -n "${hotword_file}" ]]; then
     infer_cmd+=(--hotword_file "${hotword_file}")
     infer_cmd+=(--hotword_topk "${hotword_topk}")
@@ -270,6 +267,11 @@ for target in "${targets[@]}"; do
         "${result_path}" \
         "${domain_path}" \
         > "${wer_path}"
+    python3 "${PROJECT_ROOT}/qwen_asr/tools/text_badcase.py" \
+        --ref_path "${ref_dir}" \
+        --result_path "${result_path}" \
+        --badcase_path "${details}/text_badcases_${suffix}.txt" \
+        --topk_badcases "${text_topk_badcases}"
 done
 fi
 
@@ -315,4 +317,5 @@ echo "WER文件: ${details}/wer_*.txt"
 echo "Domain文件: ${output_dir}/domain_*.txt"
 echo "拼音汇总: ${output_dir}/pinyin_similarity_*.txt"
 echo "拼音Badcase: ${details}/pinyin_badcases_*.txt"
+echo "文本Badcase: ${details}/text_badcases_*.txt"
 echo "============================================================"

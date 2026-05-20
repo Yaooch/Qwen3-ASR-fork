@@ -14,6 +14,29 @@ from .stream import StreamMixin
 from .defaults import ENCODER_BATCH_SIZE, JOINT_CONFIG
 
 
+def ctc_cfg(cfg: Dict) -> Dict:
+    """从 joint_config 还原 CTC adapter，旧 checkpoint 默认使用 MLP。"""
+    return {"adapter_type": cfg.get("ctc_adapter", "mlp")}
+
+
+def read_joint_cfg(path: Optional[str]) -> Dict:
+    if not path:
+        return {}
+    cfg_path = os.path.join(path, JOINT_CONFIG)
+    if not os.path.exists(cfg_path):
+        return {}
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_ctc_cfg(cfg: Dict, ctc=None, source_cfg: Optional[Dict] = None) -> None:
+    if ctc is None:
+        cfg["ctc_adapter"] = (source_cfg or {}).get("ctc_adapter", "mlp")
+        return
+
+    cfg["ctc_adapter"] = ctc.adapter_type
+
+
 class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
     """Qwen3-ASR + 可选 CTC/RNNT 辅助头。"""
 
@@ -26,6 +49,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         heads: Iterable[str] = ("ctc",),
         train_tasks: Iterable[str] = ("llm", "ctc"),
         loss_weights: Optional[Dict[str, float]] = None,
+        ctc_config: Optional[Dict] = None,
     ):
         super().__init__()
         self.qwen_model = qwen_model
@@ -50,7 +74,12 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         self.ctc = None
         self.rnnt = None
         if "ctc" in self.heads:
-            self.ctc = CTC(vocab_size, self.encoder_output_size, blank_id=blank_id)
+            self.ctc = CTC(
+                vocab_size,
+                self.encoder_output_size,
+                blank_id=blank_id,
+                **(ctc_config or {}),
+            )
         if "rnnt" in self.heads:
             self.rnnt = RNNT(vocab_size, self.encoder_output_size, blank_id=blank_id)
 
@@ -132,6 +161,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             blank_id=cfg.get("blank_id", 0),
             heads=cfg["heads"],
             train_tasks=("llm", *cfg["heads"]),
+            ctc_config=ctc_cfg(cfg),
         )
 
         instance.processor = base.processor
@@ -184,8 +214,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             "vocab": self.vocab,
         }
         if "ctc" in heads:
-            cfg["ctc_dropout"] = self.ctc.dropout if self.ctc is not None else 0.1
-            cfg["ctc_bottleneck_dim"] = self.ctc.bottleneck_dim if self.ctc is not None else 1024
+            save_ctc_cfg(cfg, self.ctc, read_joint_cfg(copy_heads_from))
         with open(os.path.join(output_dir, JOINT_CONFIG), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -321,7 +350,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             outputs[f"{name}_loss"] = cur_loss
             losses.append(self.loss_weights.get(name, 1.0) * cur_loss)
             if name == "ctc":
-                outputs["log_probs"] = self.ctc.log_softmax(head_hs)
+                outputs["log_probs"] = self.ctc.log_softmax(head_hs, out_lens)
 
         if need_llm:
             embeds = self.qwen_model.thinker.get_input_embeddings()(input_ids)

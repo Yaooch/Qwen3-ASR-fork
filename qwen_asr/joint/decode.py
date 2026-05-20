@@ -190,13 +190,7 @@ class DecodeMixin:
             encoder_batch_size=ENCODER_BATCH_SIZE,
         )
 
-    def _decode_stream_one(self, wav, modes: Sequence[str], need_llm: bool, stream_kwargs: Dict, max_symbols: int):
-        if need_llm:
-            chunks, llm_features = self._stream_joint_feats(wav, **stream_kwargs)
-        else:
-            chunks = self._stream_aux_chunks(wav, **stream_kwargs)
-            llm_features = None
-
+    def _decode_stream_chunks(self, chunks: List[torch.Tensor], modes: Sequence[str], max_symbols: int):
         texts = {}
         if "ctc" in modes:
             texts["ctc_text"] = ids_to_text(self._ctc_stream_decode(chunks), self._id_to_token)
@@ -205,6 +199,12 @@ class DecodeMixin:
                 self._rnnt_stream_decode(chunks, max_symbols_per_step=max_symbols),
                 self._id_to_token,
             )
+        return texts
+
+    def _decode_stream_one(self, wav, modes: Sequence[str], need_llm: bool, stream_kwargs: Dict, max_symbols: int):
+        chunks_list, llm_features_list = self._stream_batch_feats([wav], need_llm, **stream_kwargs)
+        texts = self._decode_stream_chunks(chunks_list[0], modes, max_symbols)
+        llm_features = llm_features_list[0] if need_llm else None
         return texts, llm_features
 
     @torch.no_grad()
@@ -233,15 +233,12 @@ class DecodeMixin:
         need_llm = "llm" in modes
 
         if stream:
-            llm_features_list = []
             feature_len_cache: Dict[int, int] = {}
             stream_kwargs = self._stream_kwargs()
             stream_kwargs["feature_len_cache"] = feature_len_cache
-            for i, wav in enumerate(wavs):
-                texts, llm_features = self._decode_stream_one(wav, modes, need_llm, stream_kwargs, max_symbols_per_step)
-                records[i].update(texts)
-                if need_llm:
-                    llm_features_list.append(llm_features)
+            chunks_list, llm_features_list = self._stream_batch_feats(wavs, need_llm, **stream_kwargs)
+            for record, chunks in zip(records, chunks_list):
+                record.update(self._decode_stream_chunks(chunks, modes, max_symbols_per_step))
         else:
             hs_pad, llm_features, out_lens, _ = self._encode_batch(wavs, need_llm)
             if "ctc" in modes:
