@@ -20,6 +20,7 @@ hotword_file=""
 hotword_topk=5
 hotword_pinyin_style="normal"
 stream=1
+stream_full_features=0
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
@@ -94,6 +95,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --stream)
             stream=1
+            shift 1
+            ;;
+        --stream_full_features)
+            stream_full_features=1
             shift 1
             ;;
         --no_stream)
@@ -203,6 +208,9 @@ fi
 
 if [[ "${stream}" -eq 1 ]]; then
     infer_cmd+=(--stream)
+fi
+if [[ "${stream_full_features}" -eq 1 ]]; then
+    infer_cmd+=(--stream_full_features)
 fi
 
 collect_result_targets() {

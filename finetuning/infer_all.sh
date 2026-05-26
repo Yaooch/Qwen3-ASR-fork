@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-26-1/checkpoint-6000"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_26_1-ckpt6k"
-mode="llm,ctc"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-27/checkpoint-3000"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_27-ckpt3k-stream020_1"
+mode="ctc"
 stage="all"
 gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=256
@@ -14,6 +14,7 @@ dtype="bf16"
 skip_done=0
 datasets_file=""
 stream=1
+stream_full_features=1
 wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
@@ -66,6 +67,7 @@ set_arg() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stream) stream=1; shift 1 ;;
+        --stream_full_features) stream_full_features=1; shift 1 ;;
         --no_stream) stream=0; shift 1 ;;
         -h|--help) usage; exit 0 ;;
         --*) set_arg "$1" "${2:-}"; shift 2 ;;
@@ -232,6 +234,9 @@ for row in "${DATASETS[@]}"; do
         cmd+=(--stream)
     else
         cmd+=(--no_stream)
+    fi
+    if [[ "${stream_full_features}" -eq 1 ]]; then
+        cmd+=(--stream_full_features)
     fi
     "${cmd[@]}"
     maybe_lid "${output_dir}" "${language}"

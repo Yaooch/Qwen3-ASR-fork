@@ -260,7 +260,12 @@ class DecodeMixin:
             feature_len_cache: Dict[int, int] = {}
             stream_kwargs = self._stream_kwargs()
             stream_kwargs["feature_len_cache"] = feature_len_cache
-            chunks_list, llm_features_list = self._stream_batch_feats(wavs, need_llm, **stream_kwargs)
+            stream_fn = (
+                self._stream_batch_feats_from_full_features
+                if kwargs.get("stream_full_features", False)
+                else self._stream_batch_feats
+            )
+            chunks_list, llm_features_list = stream_fn(wavs, need_llm, **stream_kwargs)
             for record, texts in zip(records, self._decode_stream_batch(chunks_list, modes, max_symbols_per_step)):
                 record.update(texts)
         else:

@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--hotword_topk", type=int, default=10)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
     parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--stream_full_features", action="store_true", help="流式批量验证时先整条提特征再切窗口")
     args = parser.parse_args()
     args.modes = parse_csv(args.mode, {"llm", "ctc", "rnnt"}, "mode")
     return args
@@ -155,6 +156,7 @@ def joint_records(model, batch: List[Dict], args, hotword) -> List[Dict]:
         hotword_retriever=hotword,
         hotword_topk=args.hotword_topk,
         stream=args.stream,
+        stream_full_features=args.stream_full_features,
     )
     if not isinstance(outs, list):
         outs = [outs]

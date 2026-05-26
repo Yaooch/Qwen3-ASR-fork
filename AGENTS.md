@@ -70,6 +70,7 @@ assets/                                      项目文档资源
 - WER 阶段需同时生成文本 badcase，输出 `utt_id/WER/ref/hyp` 四项；shell 脚本不再传自定义 prompt，统一使用 `qwen_asr/joint/defaults.py` 中默认值。
 - 训练集统计优先使用随机 seek 抽样和 badcase 关键词定向检索，避免对千万级 jsonl 做全量扫描。
 - 流式窗口裁剪、单条/批量返回、stream 参数组装、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
+- 批量验证流式和非流式差异时，可在推理脚本传 `--stream_full_features` 使用整条音频先提特征再按流式窗口切 feature 的路径；默认流式仍按 wav 窗口提特征。
 - shell 脚本参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。
 - 每次 AI 对仓库做出代码、脚本、结构或验证流程修改后，必须同步检查并更新本 `AGENTS.md` 中相关说明，不能只改实现不改开发文档。
 
