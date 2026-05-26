@@ -51,8 +51,18 @@ def parse_args():
     return args
 
 
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
+
+
 def torch_dtype(name: str):
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[name]
+
+
+def sync_audio_attention(qwen_model) -> None:
+    audio_tower = qwen_model.thinker.audio_tower
+    audio_tower.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+    qwen_model.config.thinker_config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+    qwen_model.thinker.config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
 
 
 def gpu_ids(value: str) -> List[int]:
@@ -171,7 +181,13 @@ def worker(rank: int, gpu_id: int, shard: List[Dict], args, tmp_path: str):
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
     if is_joint_checkpoint(args.ckpt):
-        model = Qwen3ASRJointModel.from_pretrained(args.ckpt, dtype=dtype, device_map=None).to(device)
+        model = Qwen3ASRJointModel.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+        ).to(device)
+        sync_audio_attention(model.qwen_model)
         model.eval()
         missing = [name for name in args.modes if name in ("ctc", "rnnt") and name not in model.heads]
         if missing:
@@ -187,9 +203,11 @@ def worker(rank: int, gpu_id: int, shard: List[Dict], args, tmp_path: str):
             args.ckpt,
             dtype=dtype,
             device_map=None,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
             max_inference_batch_size=args.batch_size,
         )
         model.model = model.model.to(device)
+        sync_audio_attention(model.model)
         model.model.eval()
         model.device = torch.device(device)
         infer_batch = lambda batch: raw_llm_records(model, batch, args)

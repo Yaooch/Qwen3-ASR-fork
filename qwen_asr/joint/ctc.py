@@ -7,8 +7,8 @@ import torch.nn.functional as F
 class CTCAdapter(nn.Module):
     """CTC 分支的轻量残差适配层。
 
-    输入已经过 audio tower 的 ln_post，这里不再做时序卷积，避免流式
-    chunk 边界引入补零伪影。MLP 只负责把共享特征轻量转到 CTC 空间。
+    输入已经过 audio tower 的 ln_post。depthwise 时序卷积提供帧间上下文，
+    MLP 负责把共享特征轻量转到 CTC 空间。
     """
 
     def __init__(self, dim: int, dropout: float = 0.1, hidden_mult: int = 2):
@@ -22,10 +22,9 @@ class CTCAdapter(nn.Module):
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout),
         )
-        self.scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.scale * self.ffn(self.norm(x))
+        return x + self.ffn(self.norm(x))
 
 
 class CTCMoEAdapter(nn.Module):
@@ -38,7 +37,7 @@ class CTCMoEAdapter(nn.Module):
         hidden_mult: int = 2,
         num_experts: int = 8,
         top_k: int = 2,
-        router_type: str = "utterance",
+        router_type: str = "frame",
     ):
         super().__init__()
         hidden_dim = dim * hidden_mult
@@ -58,7 +57,7 @@ class CTCMoEAdapter(nn.Module):
                 for _ in range(num_experts)
             ]
         )
-        self.scale = nn.Parameter(torch.tensor(0.1))
+        # self.scale = nn.Parameter(torch.tensor(0.1))
 
     def _mean(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
         if lengths is None:
@@ -85,7 +84,7 @@ class CTCMoEAdapter(nn.Module):
             router_in = self._mean(z, lengths)
             weights = self._topk(self.router(router_in)).unsqueeze(1).unsqueeze(3)
 
-        return x + self.scale * (expert_out * weights).sum(dim=2)
+        return x + (expert_out * weights).sum(dim=2)
 
 
 def build_ctc_adapter(adapter_type: str, dim: int, dropout: float = 0.1, hidden_mult: int = 2) -> nn.Module:

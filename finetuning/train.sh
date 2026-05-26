@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-gpu_ids="1,2,3,4,5,6,7"
+gpu_ids="0,1,2,3,4,5,6,7"
 if [[ $# -gt 0 ]]; then
     gpu_ids="$1"
 fi
@@ -24,32 +24,33 @@ export OMP_NUM_THREADS=4
 model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-17"
+output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-27"
 # output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-2"
-logging_dir="./logs_17"
+logging_dir="./logs/logs_27"
 
 batch_size=32
 grad_acc=4
 epochs=1
 
 # encoder, proj, llm, ctc, rnnt 可以设置不同的学习率，或者只微调其中部分模块
-train_tasks="encoder,proj,llm,ctc"
+train_tasks="encoder,ctc"
 
-lr_encoder=2e-5
-lr_llm=2e-5
-lr_proj=2e-5
-lr_ctc=1e-3
+lr_encoder=4e-5
+lr_llm=4e-5
+lr_proj=4e-5
+lr_ctc=2e-3
 lr_rnnt=2e-3
 
-w_llm=0.9
-w_ctc=0.1
+w_llm=0
+w_ctc=1
 w_rnnt=0.1
 
 # CTC adapter: auto 继承源 checkpoint；新 MoE 训练可设为 moe
-ctc_adapter="mlp"
+ctc_adapter="moe"
 
 audio_n_window=0
 audio_n_window_infer=200
+stream_train=0
 
 save_steps=1000
 num_workers=4
@@ -84,6 +85,7 @@ torchrun \
     --epochs "$epochs" \
     --audio_n_window "$audio_n_window" \
     --audio_n_window_infer "$audio_n_window_infer" \
+    --stream_train "$stream_train" \
     --save_steps "$save_steps" \
     --log_steps 10 \
     --logging_dir "$logging_dir" \

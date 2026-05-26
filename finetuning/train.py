@@ -19,6 +19,9 @@ from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArg
 from transformers.modeling_utils import load_sharded_checkpoint
 
 
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
+
+
 TASKS = {"llm", "proj", "encoder", "ctc", "rnnt"}
 PROJ_MODULES = ("proj1", "act", "proj2")
 PROJ_PARAM_KEYS = tuple(f".{name}." for name in PROJ_MODULES)
@@ -39,6 +42,13 @@ def resolve_ctc_cfg(args, source_cfg: Dict) -> None:
 
 def ctc_train_cfg(args) -> Dict:
     return {"adapter_type": args.ctc_adapter}
+
+
+def sync_audio_attention(qwen_model) -> None:
+    audio_tower = qwen_model.thinker.audio_tower
+    audio_tower.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+    qwen_model.config.thinker_config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+    qwen_model.thinker.config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
 
 
 def csv_set(value: str, allowed: set, name: str) -> tuple:
@@ -481,6 +491,7 @@ def parse_args():
 
     p.add_argument("--audio_n_window", type=int, default=0)
     p.add_argument("--audio_n_window_infer", type=int, default=0)
+    p.add_argument("--stream_train", type=int, default=0, help="1 表示 CTC/RNNT 按流式窗口特征训练")
 
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--pin_memory", type=int, default=1)
@@ -540,6 +551,7 @@ def main():
     if is_main:
         print(f"训练任务：{','.join(args.tasks)}")
         print(f"CTC adapter：{args.ctc_adapter}")
+        print(f"流式训练：{'开启' if args.stream_train == 1 else '关闭'}")
         print(f"词表大小：{len(vocab)}")
         with open(os.path.join(args.output_dir, "ctc_vocab.json"), "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=False, indent=2)
@@ -554,8 +566,10 @@ def main():
         args.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
+        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
     )
     qwen_model = wrapper.model
+    sync_audio_attention(qwen_model)
     processor = wrapper.processor
     audio_tower = sync_audio_window_config(
         qwen_model,
@@ -585,7 +599,9 @@ def main():
         train_tasks=args.loss_tasks,
         loss_weights={"llm": args.w_llm, "ctc": args.w_ctc, "rnnt": args.w_rnnt},
         ctc_config=ctc_train_cfg(args),
+        stream_train=(args.stream_train == 1),
     )
+    model.processor = processor
     if args.active_heads:
         load_heads(model, args.model_path, heads=args.active_heads, is_main=is_main, strict=False)
     set_trainable(model, args.tasks)

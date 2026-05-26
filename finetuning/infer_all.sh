@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-17"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_17"
-mode="ctc,llm"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-26-1/checkpoint-6000"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_26_1-ckpt6k"
+mode="llm,ctc"
 stage="all"
-gpu_ids="1,2,3,4,5,6,7"
-batch_size=128
+gpu_ids="0,1,2,3,4,5,6,7"
+batch_size=256
 dtype="bf16"
-skip_done=1
+skip_done=0
 datasets_file=""
 stream=1
 wer_script="/root/scripts/compute_asr_wer_with_slu.py"

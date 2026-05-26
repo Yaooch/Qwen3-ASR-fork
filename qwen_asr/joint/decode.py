@@ -190,16 +190,40 @@ class DecodeMixin:
             encoder_batch_size=ENCODER_BATCH_SIZE,
         )
 
-    def _decode_stream_chunks(self, chunks: List[torch.Tensor], modes: Sequence[str], max_symbols: int):
-        texts = {}
+    def _stream_hs_batch(self, chunks_list: List[List[torch.Tensor]]):
+        seqs = []
+        lengths = []
+        for idx, chunks in enumerate(chunks_list):
+            if not chunks:
+                raise RuntimeError(f"No streaming auxiliary features were produced for item {idx}.")
+            seq = torch.cat(chunks, dim=0)
+            seqs.append(seq)
+            lengths.append(int(seq.shape[0]))
+        hs_pad = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True)
+        out_lens = torch.tensor(lengths, dtype=torch.long, device=hs_pad.device)
+        return hs_pad, out_lens
+
+    def _decode_stream_batch(
+        self,
+        chunks_list: List[List[torch.Tensor]],
+        modes: Sequence[str],
+        max_symbols: int,
+    ) -> List[Dict[str, str]]:
+        records = [{} for _ in chunks_list]
+        if "ctc" not in modes and "rnnt" not in modes:
+            return records
+        hs_pad, out_lens = self._stream_hs_batch(chunks_list)
         if "ctc" in modes:
-            texts["ctc_text"] = ids_to_text(self._ctc_stream_decode(chunks), self._id_to_token)
+            for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens)):
+                record["ctc_text"] = text
         if "rnnt" in modes:
-            texts["rnnt_text"] = ids_to_text(
-                self._rnnt_stream_decode(chunks, max_symbols_per_step=max_symbols),
-                self._id_to_token,
-            )
-        return texts
+            texts = self._decode_head("rnnt", hs_pad, out_lens, max_symbols_per_step=max_symbols)
+            for record, text in zip(records, texts):
+                record["rnnt_text"] = text
+        return records
+
+    def _decode_stream_chunks(self, chunks: List[torch.Tensor], modes: Sequence[str], max_symbols: int):
+        return self._decode_stream_batch([chunks], modes, max_symbols)[0]
 
     def _decode_stream_one(self, wav, modes: Sequence[str], need_llm: bool, stream_kwargs: Dict, max_symbols: int):
         chunks_list, llm_features_list = self._stream_batch_feats([wav], need_llm, **stream_kwargs)
@@ -237,8 +261,8 @@ class DecodeMixin:
             stream_kwargs = self._stream_kwargs()
             stream_kwargs["feature_len_cache"] = feature_len_cache
             chunks_list, llm_features_list = self._stream_batch_feats(wavs, need_llm, **stream_kwargs)
-            for record, chunks in zip(records, chunks_list):
-                record.update(self._decode_stream_chunks(chunks, modes, max_symbols_per_step))
+            for record, texts in zip(records, self._decode_stream_batch(chunks_list, modes, max_symbols_per_step)):
+                record.update(texts)
         else:
             hs_pad, llm_features, out_lens, _ = self._encode_batch(wavs, need_llm)
             if "ctc" in modes:

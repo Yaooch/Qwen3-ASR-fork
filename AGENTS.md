@@ -54,9 +54,11 @@ assets/                                      项目文档资源
 - CTC adapter 支持 `mlp/moe` 配置，外部 head 仍固定叫 `ctc`，`joint_config.json` 只记录 `ctc_adapter`，旧 checkpoint 默认 `mlp`。
 - CTC/RNNT 新训练固定接在 `ln_post` 后、`proj1/proj2` 前。
 - 推理不再使用 `joint` 模式；`--mode` 只接受 `llm/ctc/rnnt` 的逗号组合。
+- 联合训练和批量推理入口默认显式传入 `attn_implementation="flash_attention_2"`，并同步 audio encoder 配置，确保 packed batch 的 `cu_seqlens` 分段由 FA2 隔离；未安装 flash-attn 时不要盲目调大 encoder batch。
 - 训练不再使用 `train_mode/aux_loss_type`；`--train` 只接受 `llm/proj/encoder/ctc/rnnt` 的逗号组合，`proj` 对应 `audio_tower.proj1/act/proj2`。
 - 训练不再使用额外窗口参数；短窗口由 `audio_n_window/audio_n_window_infer` 控制。
-- 推理流式细节固定在 `qwen_asr/joint/defaults.py`，shell 只保留 `--stream/--no_stream`；流式批量推理需把 batch 内窗口合批送 encoder，避免逐条音频小 batch 导致 GPU 空转。
+- CTC/RNNT 可通过 `finetuning/train.py --stream_train 1` 启用流式一致训练；默认关闭，开启后辅助头按流式窗口切特征、只拼当前 chunk 后计算 loss。
+- 推理流式细节固定在 `qwen_asr/joint/defaults.py`，shell 只保留 `--stream/--no_stream`；流式批量推理需把 batch 内窗口合批送 encoder，CTC/RNNT 流式解码需先拼接 batch 内 chunk 后批量 greedy，避免逐条音频小 batch 导致 GPU 空转。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径和 WER 脚本路径统一放在 `qwen_asr/joint/defaults.py`。
 - 新 joint checkpoint 使用 `joint_config.json` 记录 `heads` 等结构信息；`--train` 只控制训练/loss，不训练的已有头不加载、保存时从源 checkpoint 复制。
 - 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件。

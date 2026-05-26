@@ -51,26 +51,33 @@ class StreamMixin:
         if cache is not None and num_samples in cache:
             return cache[num_samples]
 
-        import numpy as np
+        feature_extractor = self.processor.feature_extractor
+        hop_length = int(getattr(feature_extractor, "hop_length", 0) or 0)
+        if hop_length > 0:
+            value = (num_samples + hop_length - 1) // hop_length
+        else:
+            import numpy as np
 
-        feat = self.processor.feature_extractor(
-            np.zeros((num_samples,), dtype=np.float32),
-            sampling_rate=16000,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-            return_attention_mask=True,
-        )
-        value = int(feat["attention_mask"].sum().item())
+            feat = feature_extractor(
+                np.zeros((num_samples,), dtype=np.float32),
+                sampling_rate=16000,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+                return_attention_mask=True,
+            )
+            value = int(feat["attention_mask"].sum().item())
+
         if cache is not None:
             cache[num_samples] = value
         return value
 
-    def _enc_len(self, feature_len: int, device: torch.device) -> int:
+    def _enc_len(self, feature_len: int, device: torch.device = None) -> int:
         if feature_len <= 0:
             return 0
-        x = torch.tensor([feature_len], dtype=torch.long, device=device)
-        return int(self._out_lens(x)[0].item())
+        leave = feature_len % 100
+        feat_lengths = (leave - 1) // 2 + 1
+        return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_len // 100) * 13
 
     def _windows(
         self,
