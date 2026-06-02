@@ -6,13 +6,12 @@ TRAIN_VOCAB_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/dat
 TRAIN_SP_MODEL_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"
 WER_SCRIPT = "/root/scripts/compute_asr_wer_with_slu.py"
 
-ENCODER_BATCH_SIZE = 256
+ENCODER_BATCH_SIZE = 512
 RNNT_MAX_SYMBOLS = 3
 
 STREAM_CHUNK_SEC = 0.64
 STREAM_LEFT_CHUNKS = 3
-STREAM_CNN_LEFT_FRAMES = 16
-STREAM_FEATURE_HOLD_FRAMES = 3
+STREAM_CNN_LEFT_FRAMES = 8
 
 
 def hotword_prompt(words, base: str = DEFAULT_PROMPT) -> str:

@@ -34,10 +34,6 @@ def read_rows(path: str) -> List[tuple[str, str]]:
     return rows
 
 
-def read_text(path: str) -> Dict[str, str]:
-    return dict(read_rows(path)) if path else {}
-
-
 def enc_len(length: int) -> int:
     for _ in range(3):
         length = (length + 1) // 2
@@ -45,79 +41,46 @@ def enc_len(length: int) -> int:
 
 
 def stream_mel(feature_extractor, wav) -> tuple[torch.Tensor, List[int]]:
+    """复现线上增量 Mel，只返回每轮新增帧。"""
     state = StreamingFeatureState(feature_extractor)
-    sr = state.sampling_rate
-    chunk_samples = max(1, int(round(STREAM_CHUNK_SEC * sr)))
+    chunk_samples = max(1, int(round(STREAM_CHUNK_SEC * state.sampling_rate)))
     pieces = []
     lengths = []
     for start in range(0, len(wav), chunk_samples):
-        end = min(len(wav), start + chunk_samples)
-        final = end >= len(wav)
-        segment, segment_start = state.prepare(wav[start:end])
+        segment, left_frames = state.append(wav[start:start + chunk_samples])
         batch = feature_extractor(
             [segment],
-            sampling_rate=sr,
+            sampling_rate=state.sampling_rate,
             return_tensors="pt",
             padding=True,
             truncation=False,
             return_attention_mask=True,
         )
         valid = int(batch["attention_mask"][0].sum().item())
-        piece = state.finish(batch["input_features"][0], valid, segment_start, final)
-        state.set_tail(segment)
+        piece = batch["input_features"][0, :, left_frames:valid]
         if piece.shape[1] > 0:
             pieces.append(piece)
             lengths.append(int(piece.shape[1]))
     return torch.cat(pieces, dim=1), lengths
 
 
-def overlap_cnn(audio_tower, full_mel: torch.Tensor, mel_chunk_lens: List[int]) -> torch.Tensor:
-    """固定离线 Mel，仅复现推理侧 overlap CNN 和裁剪。"""
+def stream_cnn(audio_tower, mel: torch.Tensor, chunk_lens: List[int]) -> torch.Tensor:
+    """固定 Mel，仅复现线上 8 帧 overlap CNN。"""
     pieces = []
-    feat_tail = None
-    feat_offset = 0
-    cnn_left = max(0, int(STREAM_CNN_LEFT_FRAMES))
-    for length in mel_chunk_lens:
-        new_feat = full_mel[:, feat_offset:feat_offset + length]
-        feat = new_feat if feat_tail is None else torch.cat([feat_tail, new_feat], dim=1)
-        left = 0 if feat_tail is None else feat_tail.shape[1]
-        feat_start = max(0, feat_offset - left)
-        feat_end = feat_offset + new_feat.shape[1]
-        keep_start = enc_len(feat_offset) - enc_len(feat_start)
-        keep_end = enc_len(feat_end) - enc_len(feat_start)
-        hidden_states = audio_tower._conv_subsample_chunk(feat)
-        pieces.append(hidden_states[keep_start:keep_end])
-        feat_offset = feat_end
-        feat_tail = feat[:, -cnn_left:] if feat.shape[1] > cnn_left else feat
-    return torch.cat(pieces, dim=0)
-
-
-def aligned_overlap_cnn(
-    audio_tower,
-    full_mel: torch.Tensor,
-    mel_chunk_lens: List[int],
-    wait_right: bool,
-) -> torch.Tensor:
-    """模拟修正：CNN 起点对齐 stride 网格，可选择等待完整右上下文。"""
-    pieces = []
-    feat_offset = 0
-    emitted = 0
-    for idx, length in enumerate(mel_chunk_lens):
-        feat_offset += length
-        final = idx == len(mel_chunk_lens) - 1
-        emit_end = enc_len(feat_offset) if final or not wait_right else feat_offset // 8
-        if emit_end <= emitted:
-            continue
-        feat_start = max(0, (emitted - 1) * 8)
-        hidden_states = audio_tower._conv_subsample_chunk(full_mel[:, feat_start:feat_offset])
-        local_offset = feat_start // 8
-        pieces.append(hidden_states[emitted - local_offset:emit_end - local_offset])
-        emitted = emit_end
+    tail = None
+    offset = 0
+    for length in chunk_lens:
+        new_mel = mel[:, offset:offset + length]
+        cnn_input = new_mel if tail is None else torch.cat([tail, new_mel], dim=1)
+        drop_prefix = 0 if tail is None else enc_len(STREAM_CNN_LEFT_FRAMES)
+        pieces.append(audio_tower._conv_subsample_chunk(cnn_input)[drop_prefix:])
+        tail = cnn_input[:, -STREAM_CNN_LEFT_FRAMES:]
+        offset += length
     return torch.cat(pieces, dim=0)
 
 
 def cache_encoder_from_cnn(audio_tower, cnn_states: torch.Tensor, chunk_out: int) -> torch.Tensor:
-    """固定整条 CNN 输出，仅复现推理侧 Transformer KV cache。"""
+    """固定 CNN 输出，仅复现线上 Transformer KV cache。"""
     caches = [None] * len(audio_tower.layers)
     cache_size = max(0, int(STREAM_LEFT_CHUNKS)) * chunk_out
     pieces = []
@@ -126,14 +89,15 @@ def cache_encoder_from_cnn(audio_tower, cnn_states: torch.Tensor, chunk_out: int
         positional_embedding = audio_tower.positional_embedding.positional_embedding[start:start + hidden_states.shape[0]]
         hidden_states = hidden_states + positional_embedding.to(hidden_states.device, dtype=hidden_states.dtype)
         new_caches = []
-        for encoder_layer, cache in zip(audio_tower.layers, caches):
-            hidden_states, cache = encoder_layer.forward_chunk(
-                hidden_states,
-                kv_cache=cache,
+        for layer, cache in zip(audio_tower.layers, caches):
+            outputs, layer_caches = layer.forward_batch_chunk(
+                [hidden_states],
+                kv_caches=[cache],
                 cache_size=cache_size,
                 detach_cache=True,
             )
-            new_caches.append(cache)
+            hidden_states = outputs[0]
+            new_caches.append(layer_caches[0])
         caches = new_caches
         pieces.append(audio_tower.ln_post(hidden_states))
     return torch.cat(pieces, dim=0)
@@ -153,24 +117,16 @@ def diff_stats(left: torch.Tensor, right: torch.Tensor) -> Dict[str, float]:
     }
 
 
-def mel_stats(full_mel: torch.Tensor, infer_mel: torch.Tensor) -> Dict:
-    full_mel = full_mel.transpose(0, 1)
-    infer_mel = infer_mel.transpose(0, 1)
-    stats = diff_stats(full_mel, infer_mel)
-    return {
-        "mel_train_len": int(full_mel.shape[0]),
-        "mel_infer_len": int(infer_mel.shape[0]),
-        "mel_len_equal": full_mel.shape[0] == infer_mel.shape[0],
-        **{f"mel_{key}": value for key, value in stats.items()},
-    }
+def prefixed_stats(prefix: str, left: torch.Tensor, right: torch.Tensor) -> Dict:
+    return {f"{prefix}_{key}": value for key, value in diff_stats(left, right).items()}
 
 
 @torch.inference_mode()
 def compare_one(model, wav_path: str) -> Dict:
     wav, _ = librosa.load(wav_path, sr=16000, mono=True)
     wav = wav.astype("float32", copy=False)
-    feature_extractor = model.processor.feature_extractor
-    batch = feature_extractor(
+    extractor = model.processor.feature_extractor
+    batch = extractor(
         [wav],
         sampling_rate=16000,
         return_tensors="pt",
@@ -179,30 +135,21 @@ def compare_one(model, wav_path: str) -> Dict:
         return_attention_mask=True,
     )
     full_mel = batch["input_features"][0, :, : int(batch["attention_mask"][0].sum().item())]
-    infer_mel, mel_chunk_lens = stream_mel(feature_extractor, wav)
+    infer_mel, mel_chunk_lens = stream_mel(extractor, wav)
 
     ref = next(model.qwen_model.parameters())
     input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
     feature_mask = batch["attention_mask"].to(device=ref.device)
     hs_train, train_lens, _ = model._stream_train_mask(input_features, feature_mask)
-    train_len = int(train_lens[0].item())
-    hs_train = hs_train[0, :train_len]
+    hs_train = hs_train[0, : int(train_lens[0].item())]
 
     audio_tower = model.qwen_model.thinker.audio_tower
-    full_mel_device = full_mel.to(device=ref.device, dtype=ref.dtype)
-    cnn_full = audio_tower._conv_subsample_chunk(full_mel_device)
-    cnn_overlap = overlap_cnn(audio_tower, full_mel_device, mel_chunk_lens)
-    cnn_aligned = aligned_overlap_cnn(audio_tower, full_mel_device, mel_chunk_lens, wait_right=False)
-    cnn_aligned_wait = aligned_overlap_cnn(audio_tower, full_mel_device, mel_chunk_lens, wait_right=True)
-    infer_mel_device = infer_mel.to(device=ref.device, dtype=ref.dtype)
-    cnn_aligned_wait_infer_mel = aligned_overlap_cnn(audio_tower, infer_mel_device, mel_chunk_lens, wait_right=True)
+    cnn_full = audio_tower._conv_subsample_chunk(full_mel.to(device=ref.device, dtype=ref.dtype))
+    cnn_stream = stream_cnn(audio_tower, full_mel.to(device=ref.device, dtype=ref.dtype), mel_chunk_lens)
     chunk_out = enc_len(model._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1))
-    hs_cache_from_full_cnn = cache_encoder_from_cnn(audio_tower, cnn_full, chunk_out)
-    hs_cache_from_overlap_cnn = cache_encoder_from_cnn(audio_tower, cnn_overlap, chunk_out)
-    hs_cache_from_aligned_wait_cnn = cache_encoder_from_cnn(audio_tower, cnn_aligned_wait, chunk_out)
-    hs_cache_from_aligned_wait_infer_mel = cache_encoder_from_cnn(audio_tower, cnn_aligned_wait_infer_mel, chunk_out)
+    hs_cache = cache_encoder_from_cnn(audio_tower, cnn_full, chunk_out)
 
-    chunks_list, _ = model._stream_batch_feats([wav], need_llm=False)
+    chunks_list, _ = model._encode_stream_waveforms([wav], need_llm=False)
     hs_infer = torch.cat(chunks_list[0], dim=0)
 
     head_dtype = next(model.ctc.parameters()).dtype
@@ -212,39 +159,27 @@ def compare_one(model, wav_path: str) -> Dict:
     infer_lens = torch.tensor([hs_infer.shape[0]], dtype=torch.long, device=hs_infer.device)
     ctc_train = model.ctc.log_softmax(hs_train_ctc, train_lens)[0]
     ctc_infer = model.ctc.log_softmax(hs_infer_ctc, infer_lens)[0]
-    hs_fixed_ctc = hs_cache_from_aligned_wait_infer_mel.unsqueeze(0).to(head_dtype)
-    fixed_lens = torch.tensor([hs_cache_from_aligned_wait_infer_mel.shape[0]], dtype=torch.long, device=hs_train.device)
-    ctc_fixed = model.ctc.log_softmax(hs_fixed_ctc, fixed_lens)[0]
-
     ctc_len = min(ctc_train.shape[0], ctc_infer.shape[0])
     top1_match = (ctc_train[:ctc_len].argmax(dim=1) == ctc_infer[:ctc_len].argmax(dim=1)).float()
-    fixed_len = min(ctc_train.shape[0], ctc_fixed.shape[0])
-    fixed_top1_match = (ctc_train[:fixed_len].argmax(dim=1) == ctc_fixed[:fixed_len].argmax(dim=1)).float()
     train_text = model._decode_head("ctc", hs_train_ctc, train_lens)[0]
     infer_text = model._decode_head("ctc", hs_infer_ctc, infer_lens)[0]
-    fixed_text = model._decode_head("ctc", hs_fixed_ctc, fixed_lens)[0]
 
     return {
-        **mel_stats(full_mel, infer_mel),
-        **{f"cnn_overlap_{key}": value for key, value in diff_stats(cnn_full, cnn_overlap).items()},
-        **{f"cnn_aligned_{key}": value for key, value in diff_stats(cnn_full, cnn_aligned).items()},
-        **{f"cnn_aligned_wait_{key}": value for key, value in diff_stats(cnn_full, cnn_aligned_wait).items()},
-        **{f"cache_from_full_cnn_{key}": value for key, value in diff_stats(hs_train, hs_cache_from_full_cnn).items()},
-        **{f"cache_from_overlap_cnn_{key}": value for key, value in diff_stats(hs_train, hs_cache_from_overlap_cnn).items()},
-        **{f"cache_from_aligned_wait_cnn_{key}": value for key, value in diff_stats(hs_train, hs_cache_from_aligned_wait_cnn).items()},
-        **{f"cache_from_aligned_wait_infer_mel_{key}": value for key, value in diff_stats(hs_train, hs_cache_from_aligned_wait_infer_mel).items()},
+        "mel_train_len": int(full_mel.shape[1]),
+        "mel_infer_len": int(infer_mel.shape[1]),
+        "mel_len_equal": full_mel.shape[1] == infer_mel.shape[1],
+        **prefixed_stats("mel", full_mel.transpose(0, 1), infer_mel.transpose(0, 1)),
+        **prefixed_stats("cnn", cnn_full, cnn_stream),
+        **prefixed_stats("cache", hs_train, hs_cache),
         "encoder_train_len": int(hs_train.shape[0]),
         "encoder_infer_len": int(hs_infer.shape[0]),
         "encoder_len_equal": hs_train.shape[0] == hs_infer.shape[0],
-        **{f"encoder_{key}": value for key, value in diff_stats(hs_train, hs_infer).items()},
-        **{f"ctc_{key}": value for key, value in diff_stats(ctc_train, ctc_infer).items()},
+        **prefixed_stats("encoder", hs_train, hs_infer),
+        **prefixed_stats("ctc", ctc_train, ctc_infer),
         "ctc_top1_match_rate": float(top1_match.mean().item()) if ctc_len else 1.0,
-        "ctc_fixed_top1_match_rate": float(fixed_top1_match.mean().item()) if fixed_len else 1.0,
         "ctc_train_text": train_text,
         "ctc_infer_text": infer_text,
-        "ctc_fixed_text": fixed_text,
         "ctc_text_equal": train_text == infer_text,
-        "ctc_fixed_text_equal": train_text == fixed_text,
     }
 
 
@@ -253,26 +188,23 @@ def mean(rows: List[Dict], key: str) -> float:
 
 
 def summarize(rows: List[Dict]) -> Dict:
-    return {
-        "samples": len(rows),
-        "mel_len_equal_rate": mean(rows, "mel_len_equal"),
-        "mel_mean_abs_diff": mean(rows, "mel_mean_abs_diff"),
-        "cnn_overlap_mean_abs_diff": mean(rows, "cnn_overlap_mean_abs_diff"),
-        "cnn_aligned_mean_abs_diff": mean(rows, "cnn_aligned_mean_abs_diff"),
-        "cnn_aligned_wait_mean_abs_diff": mean(rows, "cnn_aligned_wait_mean_abs_diff"),
-        "cache_from_full_cnn_mean_abs_diff": mean(rows, "cache_from_full_cnn_mean_abs_diff"),
-        "cache_from_overlap_cnn_mean_abs_diff": mean(rows, "cache_from_overlap_cnn_mean_abs_diff"),
-        "cache_from_aligned_wait_cnn_mean_abs_diff": mean(rows, "cache_from_aligned_wait_cnn_mean_abs_diff"),
-        "cache_from_aligned_wait_infer_mel_mean_abs_diff": mean(rows, "cache_from_aligned_wait_infer_mel_mean_abs_diff"),
-        "encoder_len_equal_rate": mean(rows, "encoder_len_equal"),
-        "encoder_mean_abs_diff": mean(rows, "encoder_mean_abs_diff"),
-        "encoder_cosine": mean(rows, "encoder_cosine"),
-        "ctc_mean_abs_diff": mean(rows, "ctc_mean_abs_diff"),
-        "ctc_top1_match_rate": mean(rows, "ctc_top1_match_rate"),
-        "ctc_fixed_top1_match_rate": mean(rows, "ctc_fixed_top1_match_rate"),
-        "ctc_text_equal_rate": mean(rows, "ctc_text_equal"),
-        "ctc_fixed_text_equal_rate": mean(rows, "ctc_fixed_text_equal"),
-    }
+    keys = (
+        "mel_len_equal",
+        "mel_mean_abs_diff",
+        "cnn_mean_abs_diff",
+        "cache_mean_abs_diff",
+        "encoder_len_equal",
+        "encoder_mean_abs_diff",
+        "encoder_cosine",
+        "ctc_mean_abs_diff",
+        "ctc_top1_match_rate",
+        "ctc_text_equal",
+    )
+    summary = {"samples": len(rows)}
+    for key in keys:
+        name = key.replace("_equal", "_equal_rate") if key.endswith("_equal") else key
+        summary[name] = mean(rows, key)
+    return summary
 
 
 def main():
@@ -293,7 +225,7 @@ def main():
     rows = read_rows(args.input_scp)
     if args.limit > 0:
         rows = rows[:args.limit]
-    refs = read_text(args.text)
+    refs = dict(read_rows(args.text)) if args.text else {}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -306,6 +238,7 @@ def main():
                 results.append(row)
                 print(
                     f"[{idx}/{len(rows)}] {utt_id} "
+                    f"cnn={row['cnn_mean_abs_diff']:.6f} "
                     f"enc={row['encoder_mean_abs_diff']:.6f} "
                     f"ctc_top1={row['ctc_top1_match_rate']:.4f} "
                     f"text_equal={row['ctc_text_equal']}",

@@ -5,11 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-34"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_34"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_34/fix"
 mode="ctc"
 stage="all" 
 gpu_ids="0,1,2,3,4,5,6,7"
-batch_size=256
+batch_size=512
 dtype="bf16"
 skip_done=0
 datasets_file=""

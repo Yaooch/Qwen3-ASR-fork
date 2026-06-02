@@ -282,6 +282,7 @@ def main():
         raise ValueError(f"scp 文件中没有可用样本：{args.input_scp}")
     ids = gpu_ids(args.gpu_ids)
     parts = shards(items, len(ids))
+    os.makedirs(args.output_dir, exist_ok=True)
     tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
 
     print("推理配置")

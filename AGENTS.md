@@ -71,8 +71,9 @@ assets/                                      项目文档资源
 - WER 阶段需同时生成文本 badcase，输出 `utt_id/WER/ref/hyp` 四项；shell 脚本不再传自定义 prompt，统一使用 `qwen_asr/joint/defaults.py` 中默认值。
 - 训练集统计优先使用随机 seek 抽样和 badcase 关键词定向检索，避免对千万级 jsonl 做全量扫描。
 - 流式特征状态、单条/批量返回、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
-- `--stream` 推理使用短 tail 增量 streaming feature state + encoder KV cache 的 CTC 流式路径，同一 tick 的 active waveform segment 需合批提特征；流式 encoder chunk 必须按全局 feature offset 计算 CNN 后保留范围，并沿用全局位置编码 offset；CTC 固定使用 batched greedy 解码，不保留 CPU prefix beam 慢路径；batch 内同一 tick 的 active chunk 需合批送 encoder，`--mode ctc,llm --stream` 在音频结束后复用已缓存的 encoder 输出一次性 LLM 解码，暂不做 LLM partial。
-- 流式对齐检查使用 `qwen_asr/tools/check_stream_alignment.py`，对同一音频比较整条 Mel + chunk mask 训练路径与增量 Mel + encoder KV cache 推理路径的 Mel、Encoder 和 CTC 输出；工具同时固定离线 Mel/CNN 输出，隔离检查 overlap CNN 与 Transformer KV cache。
+- `--stream` 推理每 640ms 处理一个 waveform chunk：前端仅保留 20ms raw tail 并提交全部新增 Mel，接受末帧约 2.5ms STFT 右上下文缺失的近似；CNN 保留 8 帧左侧 Mel overlap 并丢掉重复的 1 个 CNN token，使 stride=8 网格与训练侧对齐；batch 内 active chunk 合批送 encoder KV cache；CTC 固定使用 batched greedy，`--mode ctc,llm --stream` 在音频结束后复用 encoder 输出一次性 LLM 解码。
+- 流式对齐检查使用 `qwen_asr/tools/check_stream_alignment.py`，依次比较整条/增量 Mel、整条/overlap CNN、chunk mask/KV cache Encoder 和最终 CTC 输出。
+- 批量推理入口需在 worker 写入 `tmp_rank*.jsonl` 前创建输出目录。
 - shell 脚本参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。
 - 每次 AI 对仓库做出代码、脚本、结构或验证流程修改后，必须同步检查并更新本 `AGENTS.md` 中相关说明，不能只改实现不改开发文档。
 

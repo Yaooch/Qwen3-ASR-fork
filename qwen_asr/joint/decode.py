@@ -242,11 +242,7 @@ class DecodeMixin:
         if stream:
             if need_llm and "ctc" not in modes:
                 raise RuntimeError("流式 LLM 需要同时启用 CTC，以复用 CTC 流式 Encoder 输出。")
-            chunks_list, llm_features_list = self._stream_batch_feats(
-                wavs,
-                need_llm,
-                chunk_sec=STREAM_CHUNK_SEC,
-            )
+            chunks_list, llm_features_list = self._encode_stream_waveforms(wavs, need_llm)
             if "ctc" in modes:
                 for record, text in zip(records, self._decode_ctc_stream_batch(chunks_list)):
                     record["ctc_text"] = text
