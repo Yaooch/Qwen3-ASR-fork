@@ -26,6 +26,7 @@ qwen_asr/tools/hotword_eval.py               热词评估
 qwen_asr/tools/pinyin_eval.py                拼音评估
 qwen_asr/tools/text_badcase.py              文本 badcase 生成
 qwen_asr/tools/sample_train_stats.py        训练集随机抽样统计
+qwen_asr/tools/check_stream_alignment.py    流式训练与真实流式推理逐层对齐检查
 qwen_asr/tools/cut_contextasr_dialogue.py    ContextASR Dialogue 按时间戳切分并生成训练 jsonl
 qwen_asr/tools/split_contextasr_dialogue_eval.py ContextASR Dialogue 抽取热词测试集和验证集
 qwen_asr/tools/split_hotword_test_by_lang.py 热词测试集按中文/英文拆分
@@ -57,11 +58,11 @@ assets/                                      项目文档资源
 - 联合训练和批量推理入口默认显式传入 `attn_implementation="flash_attention_2"`，并同步 audio encoder 配置，确保 packed batch 的 `cu_seqlens` 分段由 FA2 隔离；未安装 flash-attn 时不要盲目调大 encoder batch。
 - 训练不再使用 `train_mode/aux_loss_type`；`--train` 只接受 `llm/proj/encoder/ctc/rnnt` 的逗号组合，`proj` 对应 `audio_tower.proj1/act/proj2`。
 - 训练不再使用额外窗口参数；短窗口由 `audio_n_window/audio_n_window_infer` 控制。
-- CTC/RNNT 可通过 `finetuning/train.py --stream_train 1` 启用流式一致训练；默认关闭，开启后辅助头按流式窗口切特征、只拼当前 chunk 后计算 loss。
+- CTC 可通过 `finetuning/train.py --stream_train 1` 启用流式一致训练；默认关闭，训练侧使用 WeNet-like chunk mask：整条 feature 过 CNN 后用固定 640ms chunk + 3 个左侧 chunk 的块状 attention mask 编码，不使用 FA2 packed-window 折中；若同时训练 LLM，则复用该流式 encoder 输出再过 `proj1/act/proj2`，不额外重跑整条 encoder；训练 batch 不携带未使用的 raw waveform；CTC-only 训练不构造 LLM `input_ids/labels`；训练期验证样例和 CER 也必须走同一 stream mask 路径。
 - 推理流式细节固定在 `qwen_asr/joint/defaults.py`，shell 只保留 `--stream/--no_stream`；流式批量推理需把 batch 内窗口合批送 encoder，CTC/RNNT 流式解码需先拼接 batch 内 chunk 后批量 greedy，避免逐条音频小 batch 导致 GPU 空转。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径和 WER 脚本路径统一放在 `qwen_asr/joint/defaults.py`。
 - 新 joint checkpoint 使用 `joint_config.json` 记录 `heads` 等结构信息；`--train` 只控制训练/loss，不训练的已有头不加载、保存时从源 checkpoint 复制。
-- 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件。
+- 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件，并保持 `config.json` 与 `joint_config.json` 的 audio window 参数一致。
 - 训练 TensorBoard 日志路径通过 `finetuning/train.py --logging_dir` 控制，`finetuning/train.sh` 顶部保留 `logging_dir` 变量。
 - 热词召回固定使用 pinyin，缺少 `pypinyin` 直接报错，不做静默兜底。
 - 热词评估只比较默认 LLM 与热词 prompt LLM；推理热词库和评估目标热词分开，评估目标文件使用 `utt_id<TAB>热词1,热词2` 格式；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
@@ -69,8 +70,9 @@ assets/                                      项目文档资源
 - 拼音评估需兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本` 两种格式；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。
 - WER 阶段需同时生成文本 badcase，输出 `utt_id/WER/ref/hyp` 四项；shell 脚本不再传自定义 prompt，统一使用 `qwen_asr/joint/defaults.py` 中默认值。
 - 训练集统计优先使用随机 seek 抽样和 badcase 关键词定向检索，避免对千万级 jsonl 做全量扫描。
-- 流式窗口裁剪、单条/批量返回、stream 参数组装、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
-- 批量验证流式和非流式差异时，可在推理脚本传 `--stream_full_features` 使用整条音频先提特征再按流式窗口切 feature 的路径；默认流式仍按 wav 窗口提特征。
+- 流式特征状态、单条/批量返回、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
+- `--stream` 推理使用短 tail 增量 streaming feature state + encoder KV cache 的 CTC 流式路径，同一 tick 的 active waveform segment 需合批提特征；流式 encoder chunk 必须按全局 feature offset 计算 CNN 后保留范围，并沿用全局位置编码 offset；CTC 固定使用 batched greedy 解码，不保留 CPU prefix beam 慢路径；batch 内同一 tick 的 active chunk 需合批送 encoder，`--mode ctc,llm --stream` 在音频结束后复用已缓存的 encoder 输出一次性 LLM 解码，暂不做 LLM partial。
+- 流式对齐检查使用 `qwen_asr/tools/check_stream_alignment.py`，对同一音频比较整条 Mel + chunk mask 训练路径与增量 Mel + encoder KV cache 推理路径的 Mel、Encoder 和 CTC 输出；工具同时固定离线 Mel/CNN 输出，隔离检查 overlap CNN 与 Transformer KV cache。
 - shell 脚本参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。
 - 每次 AI 对仓库做出代码、脚本、结构或验证流程修改后，必须同步检查并更新本 `AGENTS.md` 中相关说明，不能只改实现不改开发文档。
 

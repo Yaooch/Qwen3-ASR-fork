@@ -13,7 +13,7 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
+from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, STREAM_CHUNK_SEC, STREAM_LEFT_CHUNKS, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -154,6 +154,8 @@ class DataCollatorForJointTraining:
     vocab: dict
     sp_model: Any
     sampling_rate: int = 16000
+    stream_train: bool = False
+    need_llm: bool = True
 
     def __post_init__(self):
         self.cjk = re.compile(r"([\u4e00-\u9fff])")
@@ -169,21 +171,39 @@ class DataCollatorForJointTraining:
         if not rows:
             return None
 
-        prefix_texts = [x["prefix_text"] for x in rows]
         targets = [x["target"] for x in rows]
         audios = [x["_audio"] for x in rows]
-        eos = self.processor.tokenizer.eos_token or ""
-        full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
+        if self.need_llm:
+            prefix_texts = [x["prefix_text"] for x in rows]
+            eos = self.processor.tokenizer.eos_token or ""
+            full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
+            full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
+            prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
+            if self.stream_train:
+                stream_lens = [self.stream_audio_len(int(x)) for x in full["feature_attention_mask"].sum(dim=1).tolist()]
+                full_tok = self.tokenize_with_audio_len(full_texts, stream_lens)
+                prefix_tok = self.tokenize_with_audio_len(prefix_texts, stream_lens)
+                for key, value in full_tok.items():
+                    full[key] = value
+                prefix = prefix_tok
 
-        full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
-        prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
-        labels = full["input_ids"].clone()
-        for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
-            labels[idx, :length] = -100
-        pad_id = self.processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
-        full["labels"] = labels
+            labels = full["input_ids"].clone()
+            for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
+                labels[idx, :length] = -100
+            pad_id = self.processor.tokenizer.pad_token_id
+            if pad_id is not None:
+                labels[labels == pad_id] = -100
+            full["labels"] = labels
+        else:
+            full = self.processor.feature_extractor(
+                audios,
+                sampling_rate=self.sampling_rate,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+                return_attention_mask=True,
+            )
+            full["feature_attention_mask"] = full.pop("attention_mask")
 
         ids_list = [self.text_to_ids(text) for text in targets]
         max_len = max((len(ids) for ids in ids_list), default=0)
@@ -197,6 +217,35 @@ class DataCollatorForJointTraining:
         full["ctc_target_lengths"] = target_lens
         full["texts"] = targets
         return full
+
+    @staticmethod
+    def stream_conv_len(feature_len: int) -> int:
+        if feature_len <= 0:
+            return 0
+        feature_len = (feature_len + 1) // 2
+        feature_len = (feature_len + 1) // 2
+        feature_len = (feature_len + 1) // 2
+        return feature_len
+
+    def stream_audio_len(self, feature_len: int) -> int:
+        hop_length = int(getattr(self.processor.feature_extractor, "hop_length", 160) or 160)
+        chunk = max(1, int(round(STREAM_CHUNK_SEC * self.sampling_rate / hop_length)))
+        left = max(0, int(STREAM_LEFT_CHUNKS)) * chunk
+        total = 0
+        start = 0
+        while start < feature_len:
+            end = min(feature_len, start + chunk)
+            win_start = max(0, start - left)
+            total += self.stream_conv_len(end - win_start) - self.stream_conv_len(start - win_start)
+            start = end
+        return max(1, total)
+
+    def tokenize_with_audio_len(self, texts: List[str], audio_lens: List[int]):
+        audio_token = self.processor.audio_token
+        expanded = []
+        for text, length in zip(texts, audio_lens):
+            expanded.append(text.replace(audio_token, audio_token * int(length), 1))
+        return self.processor.tokenizer(expanded, return_tensors="pt", padding=True, truncation=False)
 
     def text_to_ids(self, text: str) -> List[int]:
         if "<asr_text>" in text:
@@ -418,6 +467,7 @@ class InferableCheckpointCallback(TrainerCallback):
         if model is not None:
             base = model.module if hasattr(model, "module") else model
             sync_audio_window_config(base.qwen_model)
+            base.qwen_model.config.save_pretrained(ckpt_dir)
             base.save_aux(ckpt_dir, heads=self.save_heads, copy_heads_from=self.base_model_path)
         return control
 
@@ -425,14 +475,14 @@ class InferableCheckpointCallback(TrainerCallback):
 def sync_audio_window_config(qwen_model, n_window: Optional[int] = None, n_window_infer: Optional[int] = None):
     audio_tower = qwen_model.thinker.audio_tower
     audio_config = qwen_model.config.thinker_config.audio_config
-    if n_window is not None:
-        audio_tower.n_window = n_window
-        audio_tower.config.n_window = n_window
-        audio_config.n_window = n_window
-    if n_window_infer is not None:
-        audio_tower.n_window_infer = n_window_infer
-        audio_tower.config.n_window_infer = n_window_infer
-        audio_config.n_window_infer = n_window_infer
+    n_window = audio_tower.n_window if n_window is None else n_window
+    n_window_infer = audio_tower.n_window_infer if n_window_infer is None else n_window_infer
+    audio_tower.n_window = n_window
+    audio_tower.config.n_window = n_window
+    audio_config.n_window = n_window
+    audio_tower.n_window_infer = n_window_infer
+    audio_tower.config.n_window_infer = n_window_infer
+    audio_config.n_window_infer = n_window_infer
     return audio_tower
 
 
@@ -623,7 +673,14 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForJointTraining(processor, vocab, sp_model, sampling_rate=args.sr)
+    collator = DataCollatorForJointTraining(
+        processor,
+        vocab,
+        sp_model,
+        sampling_rate=args.sr,
+        stream_train=(args.stream_train == 1),
+        need_llm=("llm" in args.loss_tasks),
+    )
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,

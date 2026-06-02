@@ -20,13 +20,13 @@ echo "==========================================================="
 export CUDA_VISIBLE_DEVICES=$gpu_ids
 export OMP_NUM_THREADS=4
 
-# model_path="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14/checkpoint-12653/"
+# model_path="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-31/checkpoint-6642/"
 model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-27"
+output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-35"
 # output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-2"
-logging_dir="./logs/logs_27"
+logging_dir="./logs/logs_35"
 
 batch_size=32
 grad_acc=4
@@ -46,11 +46,11 @@ w_ctc=1
 w_rnnt=0.1
 
 # CTC adapter: auto 继承源 checkpoint；新 MoE 训练可设为 moe
-ctc_adapter="moe"
+ctc_adapter="mlp"
 
 audio_n_window=0
 audio_n_window_infer=200
-stream_train=0
+stream_train=1
 
 save_steps=1000
 num_workers=4
@@ -91,4 +91,4 @@ torchrun \
     --logging_dir "$logging_dir" \
     --num_workers "$num_workers" \
     --lr_scheduler_type "cosine" \
-    --warmup_ratio 0.05
+    --warmup_ratio 0.05 \

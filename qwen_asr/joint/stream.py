@@ -1,17 +1,57 @@
 # qwen_asr/joint/stream.py
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
 from .defaults import (
-    RNNT_MAX_SYMBOLS,
     STREAM_CHUNK_SEC,
-    STREAM_ENCODER_BATCH,
-    STREAM_FIRST_PAD_SEC,
-    STREAM_LEFT_SEC,
-    STREAM_RIGHT_SEC,
-    STREAM_WINDOW_BATCH,
+    STREAM_LEFT_CHUNKS,
+    STREAM_CNN_LEFT_FRAMES,
+    STREAM_FEATURE_HOLD_FRAMES,
 )
+
+
+class StreamingFeatureState:
+    """连续接收 waveform，只对短 tail + 新 chunk 提取 feature。"""
+
+    def __init__(self, feature_extractor, hold_frames: int = STREAM_FEATURE_HOLD_FRAMES):
+        self.feature_extractor = feature_extractor
+        self.hold_frames = max(0, int(hold_frames))
+        self.hop_length = int(getattr(feature_extractor, "hop_length", 160) or 160)
+        self.n_fft = int(getattr(feature_extractor, "n_fft", 400) or 400)
+        self.sampling_rate = int(getattr(feature_extractor, "sampling_rate", 16000) or 16000)
+        raw_tail = self.n_fft + (self.hold_frames + 2) * self.hop_length
+        self.tail_limit = ((raw_tail + self.hop_length - 1) // self.hop_length) * self.hop_length
+        self.tail_samples = None
+        self.total_samples = 0
+        self.emitted_frames = 0
+
+    def prepare(self, wav):
+        import numpy as np
+
+        wav = np.asarray(wav, dtype=np.float32)
+        old_total = self.total_samples
+        self.total_samples += int(wav.shape[0])
+        if self.tail_samples is None:
+            return wav, old_total
+        segment_start = old_total - int(self.tail_samples.shape[0])
+        segment = np.concatenate([self.tail_samples, wav]) if wav.size > 0 else self.tail_samples
+        return segment, segment_start
+
+    def finish(self, input_features: torch.Tensor, valid: int, segment_start: int, final: bool) -> torch.Tensor:
+        frame_start = max(0, int(segment_start) // self.hop_length)
+        valid = int(valid)
+        valid_end = frame_start + valid
+        emit_end = valid_end if final else max(self.emitted_frames, valid_end - self.hold_frames)
+        local_start = max(0, self.emitted_frames - frame_start)
+        local_end = max(local_start, min(valid, emit_end - frame_start))
+        out = input_features[:, local_start:local_end] if local_end > local_start else input_features[:, :0]
+        self.emitted_frames = max(self.emitted_frames, frame_start + local_end)
+        return out
+
+    def set_tail(self, segment):
+        keep = min(int(segment.shape[0]), self.tail_limit)
+        self.tail_samples = segment[-keep:].copy() if keep > 0 else None
 
 
 class StreamMixin:
@@ -43,149 +83,12 @@ class StreamMixin:
             batch["feature_attention_mask"] = batch.pop("attention_mask")
         return batch
 
-    def _feat_len(self, num_samples: int, cache: Optional[Dict[int, int]] = None) -> int:
-        """Feature extractor valid length for a waveform with this many samples."""
-        if num_samples <= 0:
-            return 0
-        num_samples = int(num_samples)
-        if cache is not None and num_samples in cache:
-            return cache[num_samples]
-
-        feature_extractor = self.processor.feature_extractor
-        hop_length = int(getattr(feature_extractor, "hop_length", 0) or 0)
-        if hop_length > 0:
-            value = (num_samples + hop_length - 1) // hop_length
-        else:
-            import numpy as np
-
-            feat = feature_extractor(
-                np.zeros((num_samples,), dtype=np.float32),
-                sampling_rate=16000,
-                return_tensors="pt",
-                padding=True,
-                truncation=False,
-                return_attention_mask=True,
-            )
-            value = int(feat["attention_mask"].sum().item())
-
-        if cache is not None:
-            cache[num_samples] = value
-        return value
-
-    def _enc_len(self, feature_len: int, device: torch.device = None) -> int:
+    def _enc_len(self, feature_len: int) -> int:
         if feature_len <= 0:
             return 0
-        leave = feature_len % 100
-        feat_lengths = (leave - 1) // 2 + 1
-        return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_len // 100) * 13
-
-    def _windows(
-        self,
-        wav,
-        chunk_sec: float,
-        left_context_sec: float,
-        right_context_sec: float,
-        first_chunk_left_pad_sec: float,
-    ):
-        """Build current-chunk windows for streaming aux decoding."""
-        if chunk_sec <= 0:
-            raise ValueError(f"chunk_sec must be > 0, got {chunk_sec}")
-
-        import numpy as np
-
-        sr = 16000
-        total_samples = int(wav.shape[0])
-        chunk_samples = max(1, int(round(chunk_sec * sr)))
-        left_samples = max(0, int(round(left_context_sec * sr)))
-        right_samples = max(0, int(round(right_context_sec * sr)))
-        first_left_pad_samples = max(0, int(round(first_chunk_left_pad_sec * sr)))
-        if first_left_pad_samples >= chunk_samples:
-            raise ValueError(
-                "first_chunk_left_pad_sec must be smaller than chunk_sec, got "
-                f"{first_chunk_left_pad_sec} >= {chunk_sec}"
-            )
-
-        windows = []
-        start = 0
-        first_chunk = True
-        while start < total_samples:
-            cur_chunk_samples = chunk_samples
-            left_pad_samples = 0
-            if first_chunk and first_left_pad_samples > 0:
-                cur_chunk_samples = chunk_samples - first_left_pad_samples
-                left_pad_samples = first_left_pad_samples
-
-            end = min(total_samples, start + cur_chunk_samples)
-            enc_start = max(0, start - left_samples)
-            enc_end = min(total_samples, end + right_samples)
-            window_wav = wav[enc_start:enc_end]
-            if left_pad_samples > 0:
-                pad = np.zeros(left_pad_samples, dtype=window_wav.dtype)
-                window_wav = np.concatenate([pad, window_wav], axis=0)
-
-            windows.append((start, end, enc_start, enc_end, left_pad_samples, window_wav))
-            start = end
-            first_chunk = False
-        return windows
-
-    @torch.no_grad()
-    def _enc_aux_windows(
-        self,
-        window_wavs: List,
-        encoder_batch_size: int = 1,
-    ) -> List[torch.Tensor]:
-        """Encode audio windows and return one aux-feature tensor per window."""
-        if not window_wavs:
-            return []
-
-        ref = next(self.qwen_model.parameters())
-        batch = self._feature_batch(window_wavs)
-        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
-        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
-
-        hs_pad, _, out_lens, _ = self._enc_joint(
-            input_features,
-            feature_attention_mask,
-            need_llm_features=False,
-            encoder_batch_size=encoder_batch_size,
-        )
-        return [hs_pad[i, : int(length)] for i, length in enumerate(out_lens.tolist())]
-
-    @torch.no_grad()
-    def _enc_joint_windows(
-        self,
-        window_wavs: List,
-        encoder_batch_size: int = 1,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Encode audio windows and return aux + LLM features per window."""
-        if not window_wavs:
-            return [], []
-
-        ref = next(self.qwen_model.parameters())
-        batch = self._feature_batch(window_wavs)
-        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
-        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
-
-        hs_pad, llm_features, out_lens, _ = self._enc_joint(
-            input_features,
-            feature_attention_mask,
-            need_llm_features=True,
-            encoder_batch_size=encoder_batch_size,
-        )
-        aux_results = []
-        llm_results = []
-        offset = 0
-        for i, length in enumerate(out_lens.tolist()):
-            cur_len = int(length)
-            aux_results.append(hs_pad[i, :cur_len])
-            llm_results.append(llm_features[offset: offset + cur_len])
-            offset += cur_len
-        return aux_results, llm_results
-
-    def _window_batch_size(self, windows: List, window_batch_size: int) -> int:
-        if window_batch_size is None or window_batch_size <= 0:
-            return len(windows)
-        return window_batch_size
+        for _ in range(3):
+            feature_len = (feature_len + 1) // 2
+        return feature_len
 
     def _sec_to_feature_count(self, seconds: float, min_value: int = 0) -> int:
         feature_extractor = getattr(self.processor, "feature_extractor", None)
@@ -193,126 +96,140 @@ class StreamMixin:
         value = int(round(float(seconds) * 16000 / hop_length))
         return max(min_value, value)
 
-    def _current_chunk_slice(
+    def _stream_waveform_feats(
         self,
-        window,
-        feature_count: int,
-        feature_len_cache: Optional[Dict[int, int]],
-        device: torch.device,
-    ) -> slice:
-        start, end, enc_start, _enc_end, left_pad_samples, _ = window
-        keep_start_samples = left_pad_samples + start - enc_start
-        keep_end_samples = left_pad_samples + end - enc_start
-        keep_start_feat = self._feat_len(keep_start_samples, feature_len_cache)
-        keep_end_feat = self._feat_len(keep_end_samples, feature_len_cache)
-        keep_start_idx = self._enc_len(keep_start_feat, device)
-        keep_end_idx = self._enc_len(keep_end_feat, device)
-
-        keep_start_idx = max(0, min(keep_start_idx, feature_count))
-        keep_end_idx = max(keep_start_idx, min(keep_end_idx, feature_count))
-        return slice(keep_start_idx, keep_end_idx)
-
-    @torch.no_grad()
-    def _stream_aux_chunks(
-        self,
-        wav,
+        wavs: List,
+        need_llm: bool,
         chunk_sec: float = STREAM_CHUNK_SEC,
-        left_context_sec: float = STREAM_LEFT_SEC,
-        right_context_sec: float = STREAM_RIGHT_SEC,
-        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
-        window_batch_size: int = STREAM_WINDOW_BATCH,
-        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
-        feature_len_cache: Optional[Dict[int, int]] = None,
-    ) -> List[torch.Tensor]:
-        """Encode overlap windows and keep only the newly arrived chunk frames."""
-        device = next(self.qwen_model.parameters()).device
-        windows = self._windows(
-            wav,
-            chunk_sec=chunk_sec,
-            left_context_sec=left_context_sec,
-            right_context_sec=right_context_sec,
-            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
-        )
-        window_batch_size = self._window_batch_size(windows, window_batch_size)
+        **_kwargs,
+    ) -> Tuple[List[List[torch.Tensor]], List[torch.Tensor]]:
+        """CTC/RNNT cache 流式路径：增量前端 + batch active chunk encoder。"""
+        if chunk_sec <= 0:
+            raise ValueError(f"chunk_sec must be > 0, got {chunk_sec}")
 
-        kept_chunks = []
-        for batch_start in range(0, len(windows), window_batch_size):
-            batch_windows = windows[batch_start: batch_start + window_batch_size]
-            window_features_batch = self._enc_aux_windows(
-                [x[5] for x in batch_windows],
-                encoder_batch_size=window_encoder_batch_size,
+        import numpy as np
+
+        ref = next(self.qwen_model.parameters())
+        feature_extractor = self.processor.feature_extractor
+        sr = int(getattr(feature_extractor, "sampling_rate", 16000) or 16000)
+        chunk_samples = max(1, int(round(chunk_sec * sr)))
+        feature_chunk = self._sec_to_feature_count(chunk_sec, min_value=1)
+        cnn_left = max(0, int(STREAM_CNN_LEFT_FRAMES))
+        cache_size = max(0, int(STREAM_LEFT_CHUNKS)) * self._enc_len(feature_chunk)
+        audio_tower = self.qwen_model.thinker.audio_tower
+
+        states = []
+        for wav in wavs:
+            states.append({
+                "wav": np.asarray(wav, dtype=np.float32),
+                "pos": 0,
+                "frontend": StreamingFeatureState(feature_extractor),
+                "cache": None,
+                "chunks": [],
+                "feat_tail": None,
+                "feat_offset": 0,
+                "pos_offset": 0,
+                "done": False,
+            })
+
+        while any(not state["done"] for state in states):
+            pending = []
+            for idx, state in enumerate(states):
+                if state["done"]:
+                    continue
+                wav = state["wav"]
+                start = state["pos"]
+                end = min(len(wav), start + chunk_samples)
+                final = end >= len(wav)
+                segment, segment_start = state["frontend"].prepare(wav[start:end])
+                state["pos"] = end
+                state["done"] = final
+                if segment.size > 0:
+                    pending.append((idx, segment, segment_start, final))
+
+            if not pending:
+                continue
+
+            feature_batch = feature_extractor(
+                [item[1] for item in pending],
+                sampling_rate=sr,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+                return_attention_mask=True,
             )
+            mask = feature_batch.get("feature_attention_mask", feature_batch.get("attention_mask"))
 
-            for window, window_features in zip(batch_windows, window_features_batch):
-                cur_slice = self._current_chunk_slice(
-                    window,
-                    window_features.shape[0],
-                    feature_len_cache,
-                    device,
-                )
-                kept = window_features[cur_slice]
-                if kept.numel() > 0:
-                    kept_chunks.append(kept)
+            batch_items = []
+            max_len = 0
+            for row, (idx, segment, segment_start, final) in enumerate(pending):
+                state = states[idx]
+                valid = int(mask[row].sum().item()) if mask is not None else feature_batch["input_features"].shape[-1]
+                new_feat = state["frontend"].finish(feature_batch["input_features"][row], valid, segment_start, final)
+                state["frontend"].set_tail(segment)
+                if new_feat.shape[-1] == 0:
+                    continue
 
-        if not kept_chunks:
-            raise RuntimeError("No streaming auxiliary features were produced.")
-        return kept_chunks
+                new_feat = new_feat.to(device=ref.device, dtype=ref.dtype)
+                feat_tail = state["feat_tail"]
+                feat = new_feat if feat_tail is None else torch.cat([feat_tail, new_feat], dim=1)
+                left = 0 if feat_tail is None else feat_tail.shape[1]
+                feat_start = max(0, int(state["feat_offset"]) - left)
+                feat_end = int(state["feat_offset"]) + int(new_feat.shape[1])
+                keep_start = self._enc_len(int(state["feat_offset"])) - self._enc_len(feat_start)
+                keep_end = self._enc_len(feat_end) - self._enc_len(feat_start)
+                batch_items.append((idx, feat, keep_start, keep_end))
+                max_len = max(max_len, int(feat.shape[1]))
+                state["feat_offset"] = feat_end
 
-    @torch.no_grad()
-    def _stream_joint_feats(
-        self,
-        wav,
-        chunk_sec: float = STREAM_CHUNK_SEC,
-        left_context_sec: float = STREAM_LEFT_SEC,
-        right_context_sec: float = STREAM_RIGHT_SEC,
-        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
-        window_batch_size: int = STREAM_WINDOW_BATCH,
-        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
-        feature_len_cache: Optional[Dict[int, int]] = None,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        """流式窗口只跑一次 encoder，同时保留 aux chunk 和 LLM 特征。"""
-        device = next(self.qwen_model.parameters()).device
-        windows = self._windows(
-            wav,
-            chunk_sec=chunk_sec,
-            left_context_sec=left_context_sec,
-            right_context_sec=right_context_sec,
-            first_chunk_left_pad_sec=first_chunk_left_pad_sec,
-        )
-        window_batch_size = self._window_batch_size(windows, window_batch_size)
+                tail_src = feat if feat.shape[1] <= cnn_left else feat[:, -cnn_left:]
+                state["feat_tail"] = tail_src.detach()
+
+            if not batch_items:
+                continue
+
+            feat_dim = batch_items[0][1].shape[0]
+            batch_feats = batch_items[0][1].new_zeros((len(batch_items), feat_dim, max_len))
+            feat_lens = []
+            keep_starts = []
+            keep_ends = []
+            caches = []
+            pos_offsets = []
+            for row, (idx, feat, keep_start, keep_end) in enumerate(batch_items):
+                batch_feats[row, :, : feat.shape[1]] = feat
+                feat_lens.append(int(feat.shape[1]))
+                keep_starts.append(int(keep_start))
+                keep_ends.append(int(keep_end))
+                caches.append(states[idx]["cache"])
+                pos_offsets.append(int(states[idx]["pos_offset"]))
+
+            cur_chunks, new_caches = audio_tower.forward_stream_batch_chunks(
+                batch_feats,
+                torch.tensor(feat_lens, dtype=torch.long, device=ref.device),
+                torch.tensor(keep_starts, dtype=torch.long, device=ref.device),
+                torch.tensor(keep_ends, dtype=torch.long, device=ref.device),
+                kv_caches=caches,
+                cache_size=cache_size,
+                detach_cache=True,
+                position_offsets=torch.tensor(pos_offsets, dtype=torch.long, device=ref.device),
+            )
+            for (idx, _feat, _keep_start, _keep_end), cur, cache in zip(batch_items, cur_chunks, new_caches):
+                states[idx]["cache"] = cache
+                if cur.numel() > 0:
+                    states[idx]["chunks"].append(cur)
+                    states[idx]["pos_offset"] += int(cur.shape[0])
 
         aux_chunks = []
-        llm_chunks = []
-        for batch_start in range(0, len(windows), window_batch_size):
-            batch_windows = windows[batch_start: batch_start + window_batch_size]
-            aux_features_batch, llm_features_batch = self._enc_joint_windows(
-                [x[5] for x in batch_windows],
-                encoder_batch_size=window_encoder_batch_size,
-            )
-
-            for window, aux_features, llm_features in zip(
-                batch_windows,
-                aux_features_batch,
-                llm_features_batch,
-            ):
-                cur_slice = self._current_chunk_slice(
-                    window,
-                    aux_features.shape[0],
-                    feature_len_cache,
-                    device,
-                )
-                aux_kept = aux_features[cur_slice]
-                llm_kept = llm_features[cur_slice]
-                if aux_kept.numel() > 0:
-                    aux_chunks.append(aux_kept)
-                if llm_kept.numel() > 0:
-                    llm_chunks.append(llm_kept)
-
-        if not aux_chunks:
-            raise RuntimeError("No streaming auxiliary features were produced.")
-        if not llm_chunks:
-            raise RuntimeError("No streaming LLM audio features were produced.")
-        return aux_chunks, torch.cat(llm_chunks, dim=0)
+        llm_features = []
+        for wav_idx, state in enumerate(states):
+            chunks = state["chunks"]
+            if not chunks:
+                raise RuntimeError(f"No streaming auxiliary features were produced for item {wav_idx}.")
+            aux_chunks.append(chunks)
+            if need_llm:
+                seq = torch.cat(chunks, dim=0).to(device=ref.device, dtype=ref.dtype)
+                llm_features.append(audio_tower.proj2(audio_tower.act(audio_tower.proj1(seq))))
+        return aux_chunks, llm_features
 
     @torch.no_grad()
     def _stream_batch_feats(
@@ -320,217 +237,6 @@ class StreamMixin:
         wavs: List,
         need_llm: bool,
         chunk_sec: float = STREAM_CHUNK_SEC,
-        left_context_sec: float = STREAM_LEFT_SEC,
-        right_context_sec: float = STREAM_RIGHT_SEC,
-        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
-        window_batch_size: int = STREAM_WINDOW_BATCH,
-        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
-        feature_len_cache: Optional[Dict[int, int]] = None,
+        **kwargs,
     ) -> Tuple[List[List[torch.Tensor]], List[torch.Tensor]]:
-        """把一个 batch 内所有流式窗口合批编码，避免逐条音频喂 GPU。"""
-        device = next(self.qwen_model.parameters()).device
-        all_windows = []
-        for wav_idx, wav in enumerate(wavs):
-            windows = self._windows(
-                wav,
-                chunk_sec=chunk_sec,
-                left_context_sec=left_context_sec,
-                right_context_sec=right_context_sec,
-                first_chunk_left_pad_sec=first_chunk_left_pad_sec,
-            )
-            all_windows.extend((wav_idx, window) for window in windows)
-
-        aux_chunks = [[] for _ in wavs]
-        llm_chunks = [[] for _ in wavs]
-        window_batch_size = self._window_batch_size(all_windows, window_batch_size)
-
-        for batch_start in range(0, len(all_windows), window_batch_size):
-            batch_items = all_windows[batch_start: batch_start + window_batch_size]
-            batch_windows = [item[1] for item in batch_items]
-            window_wavs = [window[5] for window in batch_windows]
-            if need_llm:
-                aux_batch, llm_batch = self._enc_joint_windows(
-                    window_wavs,
-                    encoder_batch_size=window_encoder_batch_size,
-                )
-            else:
-                aux_batch = self._enc_aux_windows(
-                    window_wavs,
-                    encoder_batch_size=window_encoder_batch_size,
-                )
-                llm_batch = [None] * len(aux_batch)
-
-            for (wav_idx, window), aux_features, llm_features in zip(batch_items, aux_batch, llm_batch):
-                cur_slice = self._current_chunk_slice(
-                    window,
-                    aux_features.shape[0],
-                    feature_len_cache,
-                    device,
-                )
-                aux_kept = aux_features[cur_slice]
-                if aux_kept.numel() > 0:
-                    aux_chunks[wav_idx].append(aux_kept)
-                if need_llm:
-                    llm_kept = llm_features[cur_slice]
-                    if llm_kept.numel() > 0:
-                        llm_chunks[wav_idx].append(llm_kept)
-
-        llm_features_list = []
-        for idx, chunks in enumerate(aux_chunks):
-            if not chunks:
-                raise RuntimeError(f"No streaming auxiliary features were produced for item {idx}.")
-            if need_llm:
-                if not llm_chunks[idx]:
-                    raise RuntimeError(f"No streaming LLM audio features were produced for item {idx}.")
-                llm_features_list.append(torch.cat(llm_chunks[idx], dim=0))
-        return aux_chunks, llm_features_list
-
-    def _stream_batch_feats_from_full_features(
-        self,
-        wavs: List,
-        need_llm: bool,
-        chunk_sec: float = STREAM_CHUNK_SEC,
-        left_context_sec: float = STREAM_LEFT_SEC,
-        right_context_sec: float = STREAM_RIGHT_SEC,
-        first_chunk_left_pad_sec: float = STREAM_FIRST_PAD_SEC,
-        window_batch_size: int = STREAM_WINDOW_BATCH,
-        window_encoder_batch_size: int = STREAM_ENCODER_BATCH,
-        feature_len_cache: Optional[Dict[int, int]] = None,
-    ) -> Tuple[List[List[torch.Tensor]], List[torch.Tensor]]:
-        """批量验证用：整条音频先提特征，再按流式窗口切 feature。"""
-        if first_chunk_left_pad_sec > 0:
-            raise ValueError("full-feature stream 验证暂不支持 first_chunk_left_pad_sec > 0")
-
-        if chunk_sec <= 0:
-            raise ValueError(f"chunk_sec must be > 0, got {chunk_sec}")
-
-        ref = next(self.qwen_model.parameters())
-        batch = self._feature_batch(wavs)
-        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
-        feature_attention_mask = batch["feature_attention_mask"].to(device=ref.device)
-        feature_lens = feature_attention_mask.sum(dim=1).long()
-
-        chunk = self._sec_to_feature_count(chunk_sec, min_value=1)
-        left = self._sec_to_feature_count(left_context_sec, min_value=0)
-        right = self._sec_to_feature_count(right_context_sec, min_value=0)
-
-        all_windows = []
-        for wav_idx in range(len(wavs)):
-            total = int(feature_lens[wav_idx].item())
-            start = 0
-            while start < total:
-                end = min(total, start + chunk)
-                win_start = max(0, start - left)
-                win_end = min(total, end + right)
-                all_windows.append((
-                    wav_idx,
-                    input_features[wav_idx, :, win_start:win_end],
-                    self._enc_len(start - win_start),
-                    self._enc_len(end - win_start),
-                ))
-                start = end
-
-        aux_chunks = [[] for _ in wavs]
-        llm_chunks = [[] for _ in wavs]
-        window_batch_size = self._window_batch_size(all_windows, window_batch_size)
-
-        for batch_start in range(0, len(all_windows), window_batch_size):
-            batch_items = all_windows[batch_start: batch_start + window_batch_size]
-            max_len = max(item[1].shape[1] for item in batch_items)
-            win_features = input_features.new_zeros((len(batch_items), input_features.shape[1], max_len))
-            win_mask = torch.zeros((len(batch_items), max_len), dtype=torch.long, device=ref.device)
-            for idx, (_, feat, _, _) in enumerate(batch_items):
-                cur_len = feat.shape[1]
-                win_features[idx, :, :cur_len] = feat
-                win_mask[idx, :cur_len] = 1
-
-            hs_pad, llm_features, out_lens, _ = self._enc_joint(
-                win_features,
-                win_mask,
-                need_llm_features=need_llm,
-                encoder_batch_size=window_encoder_batch_size,
-            )
-
-            llm_offset = 0
-            for idx, (wav_idx, _feat, keep_start, keep_end) in enumerate(batch_items):
-                cur_len = int(out_lens[idx].item())
-                keep_start = max(0, min(keep_start, cur_len))
-                keep_end = max(keep_start, min(keep_end, cur_len))
-                if keep_end > keep_start:
-                    aux_chunks[wav_idx].append(hs_pad[idx, keep_start:keep_end])
-                    if need_llm:
-                        llm_chunks[wav_idx].append(llm_features[llm_offset + keep_start: llm_offset + keep_end])
-                llm_offset += cur_len
-
-        llm_features_list = []
-        for idx, chunks in enumerate(aux_chunks):
-            if not chunks:
-                raise RuntimeError(f"No streaming auxiliary features were produced for item {idx}.")
-            if need_llm:
-                if not llm_chunks[idx]:
-                    raise RuntimeError(f"No streaming LLM audio features were produced for item {idx}.")
-                llm_features_list.append(torch.cat(llm_chunks[idx], dim=0))
-        return aux_chunks, llm_features_list
-
-    @torch.no_grad()
-    def _rnnt_stream_decode(
-        self,
-        chunks: List[torch.Tensor],
-        max_symbols_per_step: int = RNNT_MAX_SYMBOLS,
-    ) -> List[int]:
-        """Stateful RNNT greedy decode. Predictor state is carried across chunks."""
-        if self.rnnt is None:
-            raise RuntimeError("当前 checkpoint 没有 RNNT 头。")
-        if max_symbols_per_step <= 0:
-            raise ValueError(f"max_symbols_per_step must be positive, got {max_symbols_per_step}")
-
-        rnnt = self.rnnt
-        device = next(rnnt.parameters()).device
-        rnnt_dtype = next(rnnt.parameters()).dtype
-        state_dtype = rnnt.embed.weight.dtype
-        hidden_size = rnnt.pred_rnn.hidden_size
-        num_layers = rnnt.pred_rnn.num_layers
-
-        h = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
-        c = torch.zeros(num_layers, 1, hidden_size, device=device, dtype=state_dtype)
-
-        start_token = torch.full((1, 1), rnnt.blank_id, dtype=torch.long, device=device)
-        pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(start_token), (h, c))
-        pred = rnnt.pred_proj(pred_step[:, -1, :])
-
-        emitted = []
-        for chunk in chunks:
-            enc = rnnt.enc_proj(chunk.to(device=device, dtype=rnnt_dtype).unsqueeze(0))[0]
-            for t in range(enc.shape[0]):
-                symbols = 0
-                while symbols < max_symbols_per_step:
-                    joint = torch.tanh(enc[t].unsqueeze(0) + pred)
-                    next_id = int(rnnt.joiner(joint).argmax(dim=-1).item())
-                    if next_id == rnnt.blank_id:
-                        break
-
-                    emitted.append(next_id)
-                    token = torch.tensor([[next_id]], dtype=torch.long, device=device)
-                    pred_step, (h, c) = rnnt.pred_rnn(rnnt.embed(token), (h, c))
-                    pred = rnnt.pred_proj(pred_step[:, -1, :])
-                    symbols += 1
-
-        return emitted
-
-    @torch.no_grad()
-    def _ctc_stream_decode(self, chunks: List[torch.Tensor]) -> List[int]:
-        """Streaming CTC greedy decode with CTC collapse state carried across chunks."""
-        if self.ctc is None:
-            raise RuntimeError("当前 checkpoint 没有 CTC 头。")
-
-        emitted = []
-        prev_id = -1
-        for chunk in chunks:
-            hs = chunk.to(device=next(self.ctc.parameters()).device, dtype=next(self.ctc.parameters()).dtype)
-            log_probs = self.ctc.log_softmax(hs.unsqueeze(0))[0]
-            pred_ids = log_probs.argmax(dim=-1).tolist()
-            for idx in pred_ids:
-                if idx != self.ctc.blank_id and idx != prev_id:
-                    emitted.append(idx)
-                prev_id = idx
-        return emitted
+        return self._stream_waveform_feats(wavs, need_llm, chunk_sec=chunk_sec, **kwargs)

@@ -15,8 +15,7 @@ from .defaults import (
     ENCODER_BATCH_SIZE,
     JOINT_CONFIG,
     STREAM_CHUNK_SEC,
-    STREAM_LEFT_SEC,
-    STREAM_RIGHT_SEC,
+    STREAM_LEFT_CHUNKS,
 )
 
 
@@ -231,19 +230,6 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         feat_lengths = (leave - 1) // 2 + 1
         return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
 
-    @staticmethod
-    def _out_len_value(length: int) -> int:
-        if length <= 0:
-            return 0
-        leave = length % 100
-        feat_length = (leave - 1) // 2 + 1
-        return ((feat_length - 1) // 2 + 1 - 1) // 2 + 1 + (length // 100) * 13
-
-    def _sec_to_feat(self, seconds: float) -> int:
-        feature_extractor = getattr(self.processor, "feature_extractor", None)
-        hop_length = int(getattr(feature_extractor, "hop_length", 160) or 160)
-        return max(1, int(round(seconds * 16000 / hop_length)))
-
     def _enc_joint(
         self,
         input_features: torch.Tensor,
@@ -335,75 +321,34 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
 
         return hs_pad, audio_features_for_llm, out_lens, feat_lens
 
-    def _enc_stream_train(
+    def _stream_train_mask(
         self,
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
     ):
-        """按流式窗口编码，拼回每条音频的当前 chunk 特征。"""
-        batch_size, feat_dim = input_features.shape[:2]
+        """按 WeNet 式 chunk mask 编码整条音频，当前 chunk 只看左侧固定 chunks。"""
+        batch_size = input_features.shape[0]
         device = input_features.device
         if feature_attention_mask is not None:
             feat_lens = feature_attention_mask.sum(dim=1).long()
         else:
             feat_lens = torch.full((batch_size,), input_features.shape[2], dtype=torch.long, device=device)
 
-        chunk = self._sec_to_feat(STREAM_CHUNK_SEC)
-        left = self._sec_to_feat(STREAM_LEFT_SEC)
-        right = max(0, self._sec_to_feat(STREAM_RIGHT_SEC))
-
-        windows = []
-        keep = []
-        for b in range(batch_size):
-            total = int(feat_lens[b].item())
-            start = 0
-            while start < total:
-                end = min(total, start + chunk)
-                win_start = max(0, start - left)
-                win_end = min(total, end + right)
-                windows.append(input_features[b, :, win_start:win_end])
-                keep.append((b, self._out_len_value(start - win_start), self._out_len_value(end - win_start)))
-                start = end
-
-        if not windows:
-            raise RuntimeError("流式训练没有生成有效窗口。")
-
-        max_feat_len = max(x.shape[1] for x in windows)
-        win_features = input_features.new_zeros((len(windows), feat_dim, max_feat_len))
-        win_mask = torch.zeros((len(windows), max_feat_len), dtype=torch.long, device=device)
-        for idx, feat in enumerate(windows):
-            cur_len = feat.shape[1]
-            win_features[idx, :, :cur_len] = feat
-            win_mask[idx, :cur_len] = 1
-
-        hs_win, _, win_lens, _ = self._enc_joint(
-            win_features,
-            win_mask,
-            need_llm_features=False,
-            encoder_batch_size=self.encoder_batch_size,
+        chunk = self._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1)
+        audio_tower = self.qwen_model.thinker.audio_tower
+        hs_pad, out_lens = audio_tower.forward_stream_mask(
+            input_features,
+            feat_lens,
+            chunk_size=chunk,
+            left_chunks=STREAM_LEFT_CHUNKS,
         )
-
-        seqs = [[] for _ in range(batch_size)]
-        for idx, (b, keep_start, keep_end) in enumerate(keep):
-            cur_len = int(win_lens[idx].item())
-            keep_start = max(0, min(keep_start, cur_len))
-            keep_end = max(keep_start, min(keep_end, cur_len))
-            if keep_end > keep_start:
-                seqs[b].append(hs_win[idx, keep_start:keep_end])
-
-        out_lens = torch.tensor(
-            [sum(part.shape[0] for part in parts) for parts in seqs],
-            dtype=torch.long,
-            device=device,
-        )
-        max_len = int(out_lens.max().item())
-        hs_pad = input_features.new_zeros((batch_size, max_len, self.encoder_output_size), dtype=hs_win.dtype)
-        for b, parts in enumerate(seqs):
-            if parts:
-                cur = torch.cat(parts, dim=0)
-                hs_pad[b, : cur.shape[0]] = cur
-
         return hs_pad, out_lens, feat_lens
+
+    def _project_llm_features(self, hs_pad: torch.Tensor, out_lens: torch.Tensor) -> torch.Tensor:
+        audio_tower = self.qwen_model.thinker.audio_tower
+        pieces = [hs_pad[b, : int(out_lens[b].item())] for b in range(hs_pad.shape[0])]
+        pre_final = torch.cat(pieces, dim=0)
+        return audio_tower.proj2(audio_tower.act(audio_tower.proj1(pre_final)))
 
     def _aux_loss(self, name: str, hs_pad, out_lens, target_ids, target_lengths):
         if target_ids is None:
@@ -429,13 +374,9 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
 
         audio_features_for_llm = None
         if self.stream_train and aux_tasks:
-            hs_pad, out_lens, _ = self._enc_stream_train(input_features, feature_attention_mask)
+            hs_pad, out_lens, _ = self._stream_train_mask(input_features, feature_attention_mask)
             if need_llm:
-                _, audio_features_for_llm, _, _ = self._enc_joint(
-                    input_features,
-                    feature_attention_mask,
-                    need_llm_features=True,
-                )
+                audio_features_for_llm = self._project_llm_features(hs_pad, out_lens)
         else:
             hs_pad, audio_features_for_llm, out_lens, _ = self._enc_joint(
                 input_features,
@@ -450,7 +391,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
             cur_loss = self._aux_loss(name, head_hs, out_lens, ctc_target_ids, ctc_target_lengths)
             outputs[f"{name}_loss"] = cur_loss
             losses.append(self.loss_weights.get(name, 1.0) * cur_loss)
-            if name == "ctc":
+            if name == "ctc" and not self.training:
                 outputs["log_probs"] = self.ctc.log_softmax(head_hs, out_lens)
 
         if need_llm:
