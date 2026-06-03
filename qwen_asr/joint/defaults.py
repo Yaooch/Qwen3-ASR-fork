@@ -6,11 +6,11 @@ TRAIN_VOCAB_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/dat
 TRAIN_SP_MODEL_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"
 WER_SCRIPT = "/root/scripts/compute_asr_wer_with_slu.py"
 
-ENCODER_BATCH_SIZE = 512
+ENCODER_BATCH_SIZE = 256
 RNNT_MAX_SYMBOLS = 3
 
 STREAM_CHUNK_SEC = 0.64
-STREAM_LEFT_CHUNKS = 3
+STREAM_LEFT_CHUNKS = 7
 STREAM_CNN_LEFT_FRAMES = 8
 
 

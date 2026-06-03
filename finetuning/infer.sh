@@ -19,7 +19,7 @@ language=""
 hotword_file=""
 hotword_topk=5
 hotword_pinyin_style="normal"
-stream=1
+encoder_mode="stream"
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
@@ -30,6 +30,7 @@ declare -A arg_map=(
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
     [--dtype]=dtype [--language]=language
     [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script
     [--pinyin_style]=pinyin_style [--pinyin_topk_badcases]=pinyin_topk_badcases
     [--text_topk_badcases]=text_topk_badcases
@@ -60,8 +61,9 @@ usage() {
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
-    echo "  --stream              使用 chunk-wise encoder 流式路径"
-    echo "  --no_stream           关闭流式推理；原始 Qwen3-ASR 模型需配合 --mode llm 使用"
+    echo "  --encoder_mode        Encoder 路径：offline / stream / train_mask"
+    echo "  --stream              等价于 --encoder_mode stream"
+    echo "  --no_stream           等价于 --encoder_mode offline"
     echo "  --ref_dir             WER 参考文件路径"
     echo "  --wer_script          WER 脚本路径，默认见 qwen_asr/joint/defaults.py"
     echo "  --pinyin_style        拼音风格：normal / tone3，默认 normal"
@@ -93,11 +95,11 @@ set_arg() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stream)
-            stream=1
+            encoder_mode="stream"
             shift 1
             ;;
         --no_stream)
-            stream=0
+            encoder_mode="offline"
             shift 1
             ;;
         -h|--help)
@@ -189,6 +191,7 @@ infer_cmd=(
     --gpu_ids "${gpu_ids}"
     --batch_size "${batch_size}"
     --dtype "${dtype}"
+    --encoder_mode "${encoder_mode}"
 )
 
 if [[ -n "${language}" ]]; then
@@ -199,10 +202,6 @@ if [[ -n "${hotword_file}" ]]; then
     infer_cmd+=(--hotword_file "${hotword_file}")
     infer_cmd+=(--hotword_topk "${hotword_topk}")
     infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
-fi
-
-if [[ "${stream}" -eq 1 ]]; then
-    infer_cmd+=(--stream)
 fi
 
 collect_result_targets() {
@@ -233,7 +232,7 @@ if [[ "${run_infer}" -eq 1 ]]; then
     echo "GPU: ${gpu_ids}"
     echo "Batch Size: ${batch_size}"
     echo "精度: ${dtype}"
-    echo "Stream: ${stream}"
+    echo "Encoder Mode: ${encoder_mode}"
     echo "============================================================"
 
     "${infer_cmd[@]}"

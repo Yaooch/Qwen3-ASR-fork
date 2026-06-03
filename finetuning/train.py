@@ -397,6 +397,7 @@ class JointTrainer(Trainer):
             cer = edits / chars if chars else 0.0
             key = f"{metric_key_prefix}_{head}_cer"
             metrics[key] = cer
+            self.log({key: cer})
             if self.args.process_index == 0:
                 print(f"{head.upper()} 验证 CER：{cer:.4f}")
         return metrics

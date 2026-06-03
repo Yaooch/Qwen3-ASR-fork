@@ -4,16 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-34"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_34/fix"
-mode="ctc"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-rnnt-6/checkpoint-24000"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_rnnt_6/train_mode"
+mode="rnnt"
 stage="all" 
 gpu_ids="0,1,2,3,4,5,6,7"
-batch_size=512
+batch_size=256
 dtype="bf16"
 skip_done=0
 datasets_file=""
-stream=1
+encoder_mode="train_mask"  # 可选：offline|stream|train_mask
 wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
@@ -35,6 +35,7 @@ declare -A arg_map=(
     [--ckpt]=ckpt [--outdir]=outdir [--mode]=mode [--stage]=stage
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
     [--skip_done]=skip_done [--datasets_file]=datasets_file
+    [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script [--pinyin_style]=pinyin_style
     [--pinyin_topk_badcases]=pinyin_topk_badcases
     [--text_topk_badcases]=text_topk_badcases
@@ -43,6 +44,7 @@ declare -A arg_map=(
 usage() {
     echo "用法：bash $0 --ckpt CKPT --outdir out"
     echo "可选：--datasets_file datasets.txt 覆盖脚本内置数据集"
+    echo "      --encoder_mode offline|stream|train_mask"
     echo "datasets.txt 每行：name|wav.scp|text|language"
 }
 
@@ -65,8 +67,8 @@ set_arg() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --stream) stream=1; shift 1 ;;
-        --no_stream) stream=0; shift 1 ;;
+        --stream) encoder_mode="stream"; shift 1 ;;
+        --no_stream) encoder_mode="offline"; shift 1 ;;
         -h|--help) usage; exit 0 ;;
         --*) set_arg "$1" "${2:-}"; shift 2 ;;
         *) echo "未知参数：$1"; usage; exit 1 ;;
@@ -101,6 +103,8 @@ dataset_done() {
     local details="${output_dir}/details"
 
     [[ -f "${details}/results_detail.jsonl" ]] || return 1
+    [[ -f "${details}/encoder_mode.txt" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "${details}/encoder_mode.txt")" == "${encoder_mode}" ]] || return 1
     IFS=',' read -ra modes <<< "${mode}"
     for item in "${modes[@]}"; do
         item="$(echo "${item}" | tr '[:upper:]' '[:lower:]' | xargs)"
@@ -221,17 +225,13 @@ for row in "${DATASETS[@]}"; do
         --gpu_ids "${gpu_ids}"
         --batch_size "${batch_size}"
         --dtype "${dtype}"
+        --encoder_mode "${encoder_mode}"
         --pinyin_style "${pinyin_style}"
         --pinyin_topk_badcases "${pinyin_topk_badcases}"
         --text_topk_badcases "${text_topk_badcases}"
     )
     if [[ -n "${wer_script}" ]]; then
         cmd+=(--wer_script "${wer_script}")
-    fi
-    if [[ "${stream}" -eq 1 ]]; then
-        cmd+=(--stream)
-    else
-        cmd+=(--no_stream)
     fi
     "${cmd[@]}"
     maybe_lid "${output_dir}" "${language}"

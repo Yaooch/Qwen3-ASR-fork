@@ -21,7 +21,7 @@ batch_size=64
 dtype="bf16"
 hotword_topk=5
 hotword_pinyin_style="normal"
-stream=1
+encoder_mode="stream"
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path
@@ -30,12 +30,13 @@ declare -A arg_map=(
     [--output_dir]=output_dir
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
     [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--encoder_mode]=encoder_mode
 )
 
 usage() {
     echo "用法：bash $0 --ckpt CKPT --input_scp wav.scp --ref_path text --hotword_file hotwords.txt --target_hotword_file utt_hotword.txt --output_dir out"
     echo "可选：--stage all|infer|eval"
-    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --no_stream"
+    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --encoder_mode offline|stream|train_mask"
 }
 
 set_arg() {
@@ -59,7 +60,8 @@ set_arg() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no_stream) stream=0; shift 1 ;;
+        --stream) encoder_mode="stream"; shift 1 ;;
+        --no_stream) encoder_mode="offline"; shift 1 ;;
         -h|--help) usage; exit 0 ;;
         --*) set_arg "$1" "${2:-}"; shift 2 ;;
         *) echo "未知参数：$1"; usage; exit 1 ;;
@@ -100,13 +102,11 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --gpu_ids "${gpu_ids}"
         --batch_size "${batch_size}"
         --dtype "${dtype}"
+        --encoder_mode "${encoder_mode}"
         --hotword_file "${hotword_file}"
         --hotword_topk "${hotword_topk}"
         --hotword_pinyin_style "${hotword_pinyin_style}"
     )
-    if [[ "${stream}" -eq 1 ]]; then
-        infer_cmd+=(--stream)
-    fi
     echo "运行热词提示推理：${output_dir}"
     "${infer_cmd[@]}"
 fi

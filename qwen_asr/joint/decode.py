@@ -13,6 +13,7 @@ from .defaults import (
 
 
 HOTWORD_SOURCE_ORDER = ("ctc", "rnnt")
+ENCODER_MODES = {"offline", "stream", "train_mask"}
 
 
 def ids_to_text(ids: List[int], id_to_token: Dict[int, str]) -> str:
@@ -25,6 +26,14 @@ class DecodeMixin:
 
     def _modes(self, modes) -> tuple:
         return self._clean_names(modes, {"llm", "ctc", "rnnt"}, "mode")
+
+    def _encoder_mode(self, encoder_mode: Optional[str], stream: bool) -> str:
+        mode = (encoder_mode or ("stream" if stream else "offline")).strip().lower()
+        if mode not in ENCODER_MODES:
+            raise ValueError(f"不支持的 encoder_mode: {mode}")
+        if stream and mode != "stream":
+            raise ValueError("stream=True 与 encoder_mode 冲突。")
+        return mode
 
     def _one_or_many(self, audio, results: List):
         return results[0] if isinstance(audio, str) else results
@@ -164,6 +173,21 @@ class DecodeMixin:
             offset += cur_len
         return out
 
+    def _feature_batch(self, wavs: List):
+        feature_extractor = self.processor.feature_extractor
+        sr = int(getattr(feature_extractor, "sampling_rate", 16000) or 16000)
+        batch = feature_extractor(
+            wavs,
+            sampling_rate=sr,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+        )
+        if "feature_attention_mask" not in batch and "attention_mask" in batch:
+            batch["feature_attention_mask"] = batch["attention_mask"]
+        return batch
+
     def _encode_batch(self, wavs: List, need_llm: bool):
         ref = next(self.qwen_model.parameters())
         batch = self._feature_batch(wavs)
@@ -177,6 +201,17 @@ class DecodeMixin:
             need_llm_features=need_llm,
             encoder_batch_size=ENCODER_BATCH_SIZE,
         )
+
+    def _encode_train_mask_batch(self, wavs: List, need_llm: bool):
+        ref = next(self.qwen_model.parameters())
+        batch = self._feature_batch(wavs)
+        mask = batch.get("feature_attention_mask", None)
+        input_features = batch["input_features"].to(device=ref.device, dtype=ref.dtype)
+        if mask is not None:
+            mask = mask.to(device=ref.device)
+        hs_pad, out_lens, feat_lens = self._stream_train_mask(input_features, mask)
+        llm_features = self._project_llm_features(hs_pad, out_lens) if need_llm else None
+        return hs_pad, llm_features, out_lens, feat_lens
 
     def _stream_hs_batch(self, chunks_list: List[List[torch.Tensor]]):
         seqs = []
@@ -224,10 +259,12 @@ class DecodeMixin:
         hotword_retriever=None,
         hotword_topk: int = 10,
         stream: bool = False,
+        encoder_mode: Optional[str] = None,
         max_symbols_per_step: int = RNNT_MAX_SYMBOLS,
         **kwargs,
     ):
         modes = self._modes(modes)
+        encoder_mode = self._encoder_mode(encoder_mode, stream)
         for name in ("ctc", "rnnt"):
             if name in modes:
                 self._head(name)
@@ -239,7 +276,10 @@ class DecodeMixin:
         records = [{"text": "", "language": lang, "hotwords": []} for lang in languages]
         need_llm = "llm" in modes
 
-        if stream:
+        if encoder_mode == "train_mask" and not ({"ctc", "rnnt"} & set(modes)):
+            raise RuntimeError("train_mask 需要同时启用 CTC 或 RNNT，以复用流式训练 Encoder 路径。")
+
+        if encoder_mode == "stream":
             if need_llm and "ctc" not in modes:
                 raise RuntimeError("流式 LLM 需要同时启用 CTC，以复用 CTC 流式 Encoder 输出。")
             chunks_list, llm_features_list = self._encode_stream_waveforms(wavs, need_llm)
@@ -251,7 +291,8 @@ class DecodeMixin:
                 for record, texts in zip(records, self._decode_stream_batch(chunks_list, rest_modes, max_symbols_per_step)):
                     record.update(texts)
         else:
-            hs_pad, llm_features, out_lens, _ = self._encode_batch(wavs, need_llm)
+            encode = self._encode_train_mask_batch if encoder_mode == "train_mask" else self._encode_batch
+            hs_pad, llm_features, out_lens, _ = encode(wavs, need_llm)
             if "ctc" in modes:
                 for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens)):
                     record["ctc_text"] = text

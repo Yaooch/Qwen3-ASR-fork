@@ -45,7 +45,9 @@ def parse_args():
     parser.add_argument("--hotword_file", default=None)
     parser.add_argument("--hotword_topk", type=int, default=10)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
-    parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
+    parser.add_argument("--stream", action="store_const", const="stream", dest="encoder_mode")
+    parser.add_argument("--no_stream", action="store_const", const="offline", dest="encoder_mode")
     args = parser.parse_args()
     args.modes = parse_csv(args.mode, {"llm", "ctc", "rnnt"}, "mode")
     return args
@@ -95,13 +97,6 @@ def batches(items: List[Dict], size: int):
         yield items[start: start + size]
 
 
-def shards(items: List[Dict], world_size: int) -> List[List[Dict]]:
-    out = [[] for _ in range(world_size)]
-    for idx, item in enumerate(items):
-        out[idx % world_size].append(item)
-    return out
-
-
 def is_joint_checkpoint(path: str) -> bool:
     return os.path.exists(os.path.join(path, JOINT_CONFIG))
 
@@ -142,6 +137,8 @@ def raw_llm_records(model, batch: List[Dict], args) -> List[Dict]:
             "mode": ",".join(args.modes),
             "text": text,
             "llm_text": text,
+            "encoder_mode": args.encoder_mode,
+            "stream": False,
         })
     return records
 
@@ -154,7 +151,7 @@ def joint_records(model, batch: List[Dict], args, hotword) -> List[Dict]:
         prompt=args.prompt or DEFAULT_PROMPT,
         hotword_retriever=hotword,
         hotword_topk=args.hotword_topk,
-        stream=args.stream,
+        encoder_mode=args.encoder_mode,
     )
     if not isinstance(outs, list):
         outs = [outs]
@@ -166,13 +163,15 @@ def joint_records(model, batch: List[Dict], args, hotword) -> List[Dict]:
             "input_language": item.get("language"),
             "language": out.get("language") or item.get("language") or "unknown",
             "mode": ",".join(args.modes),
-            "stream": bool(args.stream),
+            "encoder_mode": args.encoder_mode,
+            "stream": args.encoder_mode == "stream",
         })
         records.append(out)
     return records
 
 
-def worker(rank: int, gpu_id: int, shard: List[Dict], args, tmp_path: str):
+def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
+    shard = load_scp(args.input_scp, default_language=args.language)[rank::world_size]
     if not torch.cuda.is_available():
         raise RuntimeError("当前环境不可用 CUDA。")
     torch.cuda.set_device(gpu_id)
@@ -197,8 +196,8 @@ def worker(rank: int, gpu_id: int, shard: List[Dict], args, tmp_path: str):
     else:
         if args.modes != ("llm",):
             raise RuntimeError("原始 Qwen checkpoint 只支持 --mode llm。")
-        if args.stream:
-            raise RuntimeError("原始 Qwen checkpoint 不支持当前脚本的 --stream。")
+        if args.encoder_mode != "offline":
+            raise RuntimeError("原始 Qwen checkpoint 只支持 --encoder_mode offline。")
         model = Qwen3ASRModel.from_pretrained(
             args.ckpt,
             dtype=dtype,
@@ -238,7 +237,7 @@ def result_specs(rows: List[Dict]):
     return specs or [("text", "results_text.txt", "text")]
 
 
-def merge(tmp_files: List[str], output_dir: str):
+def merge(tmp_files: List[str], output_dir: str, encoder_mode: str):
     os.makedirs(output_dir, exist_ok=True)
     details = os.path.join(output_dir, "details")
     os.makedirs(details, exist_ok=True)
@@ -269,6 +268,8 @@ def merge(tmp_files: List[str], output_dir: str):
         for _, f in files:
             f.close()
 
+    with open(os.path.join(details, "encoder_mode.txt"), "w", encoding="utf-8") as f:
+        f.write(encoder_mode + "\n")
     for path in tmp_files:
         if os.path.exists(path):
             os.remove(path)
@@ -281,22 +282,22 @@ def main():
     if not items:
         raise ValueError(f"scp 文件中没有可用样本：{args.input_scp}")
     ids = gpu_ids(args.gpu_ids)
-    parts = shards(items, len(ids))
     os.makedirs(args.output_dir, exist_ok=True)
     tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
 
     print("推理配置")
     print(f"模型：{args.ckpt}")
     print(f"模式：{','.join(args.modes)}")
+    print(f"Encoder 模式：{args.encoder_mode}")
     print(f"输出：{args.output_dir}")
     print(f"GPU：{ids}")
     print(f"样本数：{len(items)}")
 
     if len(ids) == 1:
-        worker(0, ids[0], parts[0], args, tmp_files[0])
+        worker(0, ids[0], len(ids), args, tmp_files[0])
     else:
         ctx = mp.get_context("spawn")
-        procs = [ctx.Process(target=worker, args=(rank, gpu, parts[rank], args, tmp_files[rank])) for rank, gpu in enumerate(ids)]
+        procs = [ctx.Process(target=worker, args=(rank, gpu, len(ids), args, tmp_files[rank])) for rank, gpu in enumerate(ids)]
         for proc in procs:
             proc.start()
         for proc in procs:
@@ -304,7 +305,7 @@ def main():
             if proc.exitcode != 0:
                 raise RuntimeError(f"子进程失败，exitcode={proc.exitcode}")
 
-    paths, detail_path = merge(tmp_files, args.output_dir)
+    paths, detail_path = merge(tmp_files, args.output_dir, args.encoder_mode)
     print("推理完成")
     for name, path in paths.items():
         print(f"结果[{name}]：{path}")
