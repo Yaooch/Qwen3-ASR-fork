@@ -87,27 +87,106 @@ class CTCMoEAdapter(nn.Module):
         return x + (expert_out * weights).sum(dim=2)
 
 
-def build_ctc_adapter(adapter_type: str, dim: int, dropout: float = 0.1, hidden_mult: int = 2) -> nn.Module:
-    if adapter_type == "moe":
-        return CTCMoEAdapter(dim, dropout=dropout, hidden_mult=hidden_mult)
-    return CTCAdapter(dim, dropout=dropout, hidden_mult=hidden_mult)
+class CTCTransformerAdapter(nn.Module):
+    """CTC Transformer adaptor。"""
+
+    def __init__(
+        self,
+        dim: int,
+        model_dim: int,
+        ffn_dim: int,
+        num_layers: int,
+        num_heads: int,
+        layer_ffn_dim: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self._config = {
+            "transformer_dim": model_dim,
+            "transformer_ffn_dim": ffn_dim,
+            "transformer_layers": num_layers,
+            "transformer_heads": num_heads,
+            "transformer_layer_ffn_dim": layer_ffn_dim,
+        }
+        self.input_norm = nn.LayerNorm(dim)
+        self.skip_proj = nn.Identity() if dim == model_dim else nn.Linear(dim, model_dim)
+        # self.adapter_scale = nn.Parameter(torch.tensor(0.1))
+        self.in_proj = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.ReLU(),
+            nn.Linear(ffn_dim, model_dim),
+        )
+        self.layers = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=model_dim,
+                    nhead=num_heads,
+                    dim_feedforward=layer_ffn_dim,
+                    dropout=dropout,
+                    activation="relu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = nn.Identity()
+
+    def _padding_mask(self, lengths: torch.Tensor, size: int, device) -> torch.Tensor:
+        if lengths is None:
+            return None
+        pos = torch.arange(size, device=device).unsqueeze(0)
+        return pos >= lengths.to(device=device).unsqueeze(1)
+
+    def _attention_mask(self, size: int, device, mask_mode: str, chunk_size: int, left_chunks: int) -> torch.Tensor:
+        if mask_mode == "offline":
+            return None
+        if mask_mode == "causal":
+            return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
+        if mask_mode != "chunk":
+            raise ValueError(f"不支持的 CTC mask_mode: {mask_mode}")
+
+        chunk_size = max(1, int(chunk_size))
+        left_chunks = max(0, int(left_chunks))
+        pos = torch.arange(size, device=device)
+        q_chunk = pos // chunk_size
+        k_pos = pos.unsqueeze(0)
+        start = (q_chunk - left_chunks).clamp_min(0).unsqueeze(1) * chunk_size
+        end = ((q_chunk + 1) * chunk_size).unsqueeze(1)
+        return ~((k_pos >= start) & (k_pos < end))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor = None,
+        mask_mode: str = "offline",
+        chunk_size: int = 1,
+        left_chunks: int = 0,
+    ) -> torch.Tensor:
+        # z = self.skip_proj(x) + self.adapter_scale * self.in_proj(self.input_norm(x))
+        z = self.skip_proj(x) + self.in_proj(self.input_norm(x))
+        size = z.size(1)
+        padding_mask = self._padding_mask(lengths, size, z.device)
+        attention_mask = self._attention_mask(size, z.device, mask_mode, chunk_size, left_chunks)
+        mha = getattr(torch.backends, "mha", None)
+        old_fastpath = None
+        if mha is not None and hasattr(mha, "get_fastpath_enabled") and hasattr(mha, "set_fastpath_enabled"):
+            old_fastpath = mha.get_fastpath_enabled()
+            mha.set_fastpath_enabled(False)
+        try:
+            for layer in self.layers:
+                z = layer(z, src_mask=attention_mask, src_key_padding_mask=padding_mask)
+        finally:
+            if old_fastpath is not None:
+                mha.set_fastpath_enabled(old_fastpath)
+        return z
+
+    def config(self) -> dict:
+        return dict(self._config)
 
 
 class CTC(nn.Module):
-    """CTC 分支。
-
-    整体结构：
-        shared_encoder_output
-            -> ctc_adapter
-            -> linear classifier
-            -> log_softmax
-            -> CTC Loss
-
-    说明：
-    - adapter 用来把共享特征轻量适配到更适合 CTC 的空间
-    - ctc_lo 负责把每个时间步映射到词表维度
-    - blank_id 默认为 0
-    """
+    """CTC 分支：shared_encoder_output -> adapter -> classifier -> log_softmax -> CTC Loss。"""
 
     def __init__(
         self,
@@ -117,35 +196,74 @@ class CTC(nn.Module):
         dropout: float = 0.1,
         bottleneck_dim: int = 1024,
         adapter_type: str = "mlp",
+        transformer_dim: int = 1024,
+        transformer_ffn_dim: int = 1024,
+        transformer_layers: int = 4,
+        transformer_heads: int = 8,
+        transformer_layer_ffn_dim: int = 2048,
+        blank_bias: float = -2.0,
     ):
         super().__init__()
-        self.dropout = dropout
+        self.adapter_type = adapter_type.lower()
         self.bottleneck_dim = bottleneck_dim
-        self.adapter_type = adapter_type
-        self.adapter = build_ctc_adapter(
-            adapter_type,
-            encoder_output_size,
-            dropout=dropout,
-        )
-        self.ctc_lo = nn.Sequential(
-            nn.Linear(encoder_output_size, bottleneck_dim),
-            nn.SiLU(),
-            nn.Linear(bottleneck_dim, odim),
-        )
+        self.blank_bias = float(blank_bias)
         self.blank_id = blank_id
+
+        if self.adapter_type == "transformer":
+            self.adapter = CTCTransformerAdapter(
+                encoder_output_size,
+                model_dim=transformer_dim,
+                ffn_dim=transformer_ffn_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                layer_ffn_dim=transformer_layer_ffn_dim,
+                dropout=dropout,
+            )
+            self.ctc_lo = nn.Linear(transformer_dim, odim)
+        else:
+            if self.adapter_type == "moe":
+                self.adapter = CTCMoEAdapter(encoder_output_size, dropout=dropout)
+            else:
+                self.adapter = CTCAdapter(encoder_output_size, dropout=dropout)
+            self.ctc_lo = nn.Sequential(
+                nn.Linear(encoder_output_size, bottleneck_dim),
+                nn.SiLU(),
+                nn.Linear(bottleneck_dim, odim),
+            )
+
+        self._init_blank_bias()
         self.ctc_loss = nn.CTCLoss(blank=blank_id, zero_infinity=True)
 
-    def get_ctc_hidden(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor = None) -> torch.Tensor:
-        """对共享 encoder 输出做一层轻量适配。"""
-        if self.adapter_type == "moe":
-            return self.adapter(hs_pad, hs_lengths)
-        return self.adapter(hs_pad)
+    def _init_blank_bias(self) -> None:
+        linear = self.ctc_lo if isinstance(self.ctc_lo, nn.Linear) else self.ctc_lo[-1]
+        with torch.no_grad():
+            linear.bias[self.blank_id].fill_(self.blank_bias)
 
-    def log_softmax(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor = None) -> torch.Tensor:
-        """输出每个时间步对词表的对数概率。"""
-        ctc_hidden = self.get_ctc_hidden(hs_pad, hs_lengths)
-        logits = self.ctc_lo(ctc_hidden)
-        return F.log_softmax(logits, dim=2)
+    def config(self) -> dict:
+        cfg = {
+            "adapter_type": self.adapter_type,
+            "bottleneck_dim": self.bottleneck_dim,
+            "blank_bias": self.blank_bias,
+        }
+        if hasattr(self.adapter, "config"):
+            cfg.update(self.adapter.config())
+        return cfg
+
+    def log_softmax(
+        self,
+        hs_pad: torch.Tensor,
+        hs_lengths: torch.Tensor = None,
+        mask_mode: str = "offline",
+        chunk_size: int = 1,
+        left_chunks: int = 0,
+    ) -> torch.Tensor:
+        if self.adapter_type == "moe":
+            ctc_hidden = self.adapter(hs_pad, hs_lengths)
+        elif self.adapter_type == "transformer":
+            ctc_hidden = self.adapter(hs_pad, hs_lengths, mask_mode=mask_mode, chunk_size=chunk_size, left_chunks=left_chunks)
+        else:
+            ctc_hidden = self.adapter(hs_pad)
+        return F.log_softmax(self.ctc_lo(ctc_hidden), dim=2)
 
     def forward(
         self,
@@ -153,6 +271,9 @@ class CTC(nn.Module):
         hs_lengths: torch.Tensor,
         targets: torch.Tensor,
         target_lengths: torch.Tensor,
+        mask_mode: str = "offline",
+        chunk_size: int = 1,
+        left_chunks: int = 0,
     ) -> torch.Tensor:
         """计算 CTC loss。
 
@@ -162,11 +283,24 @@ class CTC(nn.Module):
         - targets: CTC 标签
         - target_lengths: 标签长度
         """
-        log_probs = self.log_softmax(hs_pad, hs_lengths).transpose(0, 1).float()
+        log_probs = self.log_softmax(
+            hs_pad,
+            hs_lengths,
+            mask_mode=mask_mode,
+            chunk_size=chunk_size,
+            left_chunks=left_chunks,
+        ).transpose(0, 1).float()
         return self.ctc_loss(log_probs, targets, hs_lengths, target_lengths)
 
     @torch.no_grad()
-    def greedy_decode(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor):
+    def greedy_decode(
+        self,
+        hs_pad: torch.Tensor,
+        hs_lengths: torch.Tensor,
+        mask_mode: str = "offline",
+        chunk_size: int = 1,
+        left_chunks: int = 0,
+    ):
         """CTC 贪心解码。
 
         返回：
@@ -174,7 +308,13 @@ class CTC(nn.Module):
         - 已经做了 blank 去除
         - 已经做了连续重复 token 去重
         """
-        log_probs = self.log_softmax(hs_pad, hs_lengths)   # [B, T, V]
+        log_probs = self.log_softmax(
+            hs_pad,
+            hs_lengths,
+            mask_mode=mask_mode,
+            chunk_size=chunk_size,
+            left_chunks=left_chunks,
+        )   # [B, T, V]
         preds = log_probs.argmax(dim=-1)       # [B, T]
 
         results = []

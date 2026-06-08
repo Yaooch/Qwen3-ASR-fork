@@ -65,11 +65,16 @@ class DecodeMixin:
         hs_pad: torch.Tensor,
         out_lens: torch.Tensor,
         max_symbols_per_step: int = RNNT_MAX_SYMBOLS,
+        ctc_mask_mode: str = "offline",
     ) -> List[str]:
         head = self._head(name)
         hs_pad = hs_pad.to(next(head.parameters()).dtype)
         if name == "ctc":
-            ids_batch = head.greedy_decode(hs_pad, out_lens)
+            ids_batch = head.greedy_decode(
+                hs_pad,
+                out_lens,
+                **self._ctc_mask_kwargs(ctc_mask_mode),
+            )
         else:
             ids_batch = head.greedy_decode(
                 hs_pad,
@@ -92,8 +97,10 @@ class DecodeMixin:
         if feature_attention_mask is not None:
             feature_attention_mask = feature_attention_mask.to(device=ref.device)
 
+        ctc_mask_mode = "offline"
         if getattr(self, "stream_train", False):
             hs_pad, out_lens, _ = self._stream_train_mask(input_features, feature_attention_mask)
+            ctc_mask_mode = "chunk"
         else:
             hs_pad, _, out_lens, _ = self._enc_joint(
                 input_features,
@@ -101,7 +108,13 @@ class DecodeMixin:
                 need_llm_features=False,
                 encoder_batch_size=encoder_batch_size,
             )
-        return self._decode_head(head, hs_pad, out_lens, max_symbols_per_step=max_symbols_per_step)
+        return self._decode_head(
+            head,
+            hs_pad,
+            out_lens,
+            max_symbols_per_step=max_symbols_per_step,
+            ctc_mask_mode=ctc_mask_mode,
+        )
 
     def _audio_prompt(self, num_audio_tokens: int, context: str, language: Optional[str]) -> str:
         if self._asr_wrapper is None:
@@ -228,7 +241,7 @@ class DecodeMixin:
 
     def _decode_ctc_stream_batch(self, chunks_list: List[List[torch.Tensor]]) -> List[str]:
         hs_pad, out_lens = self._stream_hs_batch(chunks_list)
-        return self._decode_head("ctc", hs_pad, out_lens)
+        return self._decode_head("ctc", hs_pad, out_lens, ctc_mask_mode="causal")
 
     def _decode_stream_batch(
         self,
@@ -241,7 +254,7 @@ class DecodeMixin:
             return records
         hs_pad, out_lens = self._stream_hs_batch(chunks_list)
         if "ctc" in modes:
-            for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens)):
+            for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens, ctc_mask_mode="causal")):
                 record["ctc_text"] = text
         if "rnnt" in modes:
             texts = self._decode_head("rnnt", hs_pad, out_lens, max_symbols_per_step=max_symbols)
@@ -292,9 +305,10 @@ class DecodeMixin:
                     record.update(texts)
         else:
             encode = self._encode_train_mask_batch if encoder_mode == "train_mask" else self._encode_batch
+            ctc_mask_mode = "chunk" if encoder_mode == "train_mask" else "offline"
             hs_pad, llm_features, out_lens, _ = encode(wavs, need_llm)
             if "ctc" in modes:
-                for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens)):
+                for record, text in zip(records, self._decode_head("ctc", hs_pad, out_lens, ctc_mask_mode=ctc_mask_mode)):
                     record["ctc_text"] = text
             if "rnnt" in modes:
                 rnnt_texts = self._decode_head("rnnt", hs_pad, out_lens, max_symbols_per_step=max_symbols_per_step)

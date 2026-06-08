@@ -13,6 +13,7 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
+from qwen_asr.joint.model import ctc_cfg as load_ctc_cfg
 from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, STREAM_CHUNK_SEC, STREAM_LEFT_CHUNKS, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
@@ -38,10 +39,13 @@ def read_joint_cfg(path: str) -> Dict:
 def resolve_ctc_cfg(args, source_cfg: Dict) -> None:
     if args.ctc_adapter == "auto":
         args.ctc_adapter = source_cfg.get("ctc_adapter", "mlp")
+        args.ctc_config = load_ctc_cfg(source_cfg)
+    else:
+        args.ctc_config = {"adapter_type": args.ctc_adapter}
 
 
 def ctc_train_cfg(args) -> Dict:
-    return {"adapter_type": args.ctc_adapter}
+    return args.ctc_config
 
 
 def sync_audio_attention(qwen_model) -> None:
@@ -338,6 +342,8 @@ class JointTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        if torch.is_tensor(loss) and not torch.isfinite(loss.detach()).all():
+            raise FloatingPointError("训练 loss 出现 NaN/Inf，已停止以避免保存损坏权重。")
         if isinstance(outputs, dict) and model.training:
             for key in ("loss", "llm_loss", "ctc_loss", "rnnt_loss"):
                 value = loss if key == "loss" else outputs.get(key)
@@ -366,6 +372,18 @@ class JointTrainer(Trainer):
                     inputs[key] = value.to(dtype=dtype)
         return inputs
 
+    @staticmethod
+    def _text_lang(text: str) -> str:
+        has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in text)
+        has_alpha = any("a" <= ch.lower() <= "z" for ch in text)
+        if has_cjk and has_alpha:
+            return "mix"
+        if has_cjk:
+            return "zh"
+        if has_alpha:
+            return "en"
+        return "other"
+
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
         base = self.model.module if hasattr(self.model, "module") else self.model
@@ -377,28 +395,129 @@ class JointTrainer(Trainer):
         self.model.eval()
         for head in heads:
             edits, chars, shown = 0, 0, 0
+            total, empty = 0, 0
+            bucket_edits = [0, 0, 0]
+            bucket_chars = [0, 0, 0]
+            lang_names = ("zh", "en", "mix", "other")
+            lang_to_idx = {name: idx for idx, name in enumerate(lang_names)}
+            lang_total = [0, 0, 0, 0]
+            lang_empty = [0, 0, 0, 0]
+            blank_argmax, valid_frames, blank_prob_sum = 0, 0, 0.0
+            empty_blank_prob, empty_blank_count = 0.0, 0
+            nonempty_blank_prob, nonempty_blank_count = 0.0, 0
+            nonblank_frames, nonblank_samples = 0, 0
             with torch.no_grad():
                 for batch in dataloader:
                     inputs = self._prepare_inputs(batch)
-                    preds = base.decode_feats(
-                        inputs["input_features"],
-                        inputs.get("feature_attention_mask"),
-                        head=head,
-                    )
-                    for pred, ref in zip(preds, inputs.get("texts", [])):
-                        ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
-                        ref = "".join(self.data_collator.sp_model.encode_as_pieces(ref.upper())).replace("▁", " ").strip().lower()
+                    if head == "ctc":
+                        outputs = base(
+                            input_features=inputs["input_features"],
+                            feature_attention_mask=inputs.get("feature_attention_mask"),
+                            ctc_target_ids=inputs.get("ctc_target_ids"),
+                            ctc_target_lengths=inputs.get("ctc_target_lengths"),
+                            tasks=("ctc",),
+                        )
+                        log_probs = outputs["log_probs"]
+                        out_lens = outputs["output_lengths"]
+                        frame_ids = log_probs.argmax(dim=-1)
+                        preds = []
+                        sample_blank_means = []
+                        blank_probs = log_probs[..., base.blank_id].exp()
+                        for row in range(frame_ids.shape[0]):
+                            cur_len = int(out_lens[row].item())
+                            cur_ids = frame_ids[row, :cur_len]
+                            cur_blank = blank_probs[row, :cur_len]
+                            valid_frames += cur_len
+                            blank_argmax += int((cur_ids == base.blank_id).sum().item())
+                            blank_prob_sum += float(cur_blank.sum().item())
+                            sample_blank_means.append(float(cur_blank.mean().item()) if cur_len > 0 else 0.0)
+                            cur_nonblank = int((cur_ids != base.blank_id).sum().item())
+                            nonblank_frames += cur_nonblank
+                            nonblank_samples += 1
+                            kept = [int(x) for x in torch.unique_consecutive(cur_ids).tolist() if int(x) != base.blank_id]
+                            preds.append("".join(base._id_to_token.get(i, "") for i in kept).replace("▁", " ").strip().lower())
+                    else:
+                        preds = base.decode_feats(
+                            inputs["input_features"],
+                            inputs.get("feature_attention_mask"),
+                            head=head,
+                        )
+                        sample_blank_means = []
+                    for idx, (pred, ref) in enumerate(zip(preds, inputs.get("texts", []))):
+                        raw_ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
+                        lang_idx = lang_to_idx[self._text_lang(raw_ref)]
+                        ref = "".join(self.data_collator.sp_model.encode_as_pieces(raw_ref.upper())).replace("▁", " ").strip().lower()
                         if self.args.process_index == 0 and shown < 3:
                             print(f"[验证样例{shown}] {head.upper()}: {pred}")
                             print(f"[验证样例{shown}] 参考: {ref}")
                             shown += 1
-                        edits += editdistance.eval(pred, ref)
-                        chars += len(ref)
+                        cur_edits = editdistance.eval(pred, ref)
+                        cur_chars = len(ref)
+                        bucket = 0 if cur_chars <= 10 else 1 if cur_chars <= 30 else 2
+                        bucket_edits[bucket] += cur_edits
+                        bucket_chars[bucket] += cur_chars
+                        edits += cur_edits
+                        chars += cur_chars
+                        total += 1
+                        is_empty = int(pred == "")
+                        empty += is_empty
+                        lang_total[lang_idx] += 1
+                        lang_empty[lang_idx] += is_empty
+                        if head == "ctc":
+                            sample_blank_prob = sample_blank_means[idx]
+                            if is_empty:
+                                empty_blank_prob += sample_blank_prob
+                                empty_blank_count += 1
+                            else:
+                                nonempty_blank_prob += sample_blank_prob
+                                nonempty_blank_count += 1
+            stats = torch.tensor(
+                [
+                    edits, chars, total, empty, *bucket_edits, *bucket_chars, *lang_total, *lang_empty,
+                    blank_argmax, valid_frames, blank_prob_sum, empty_blank_prob, empty_blank_count,
+                    nonempty_blank_prob, nonempty_blank_count, nonblank_frames, nonblank_samples,
+                ],
+                dtype=torch.float64,
+                device=self.args.device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            values = stats.cpu().tolist()
+            edits, chars, total, empty = values[:4]
+            bucket_edits = values[4:7]
+            bucket_chars = values[7:10]
+            lang_total = values[10:14]
+            lang_empty = values[14:18]
+            blank_values = values[18:27]
             cer = edits / chars if chars else 0.0
+            empty_rate = empty / total if total else 0.0
+            lang_rates = [lang_empty[idx] / lang_total[idx] if lang_total[idx] else 0.0 for idx in range(len(lang_names))]
             key = f"{metric_key_prefix}_{head}_cer"
             metrics[key] = cer
             self.log({key: cer})
             if self.args.process_index == 0:
+                bucket_cer = [e / c if c else 0.0 for e, c in zip(bucket_edits, bucket_chars)]
+                lang_parts = [
+                    f"{name}={int(lang_empty[idx])}/{int(lang_total[idx])}({lang_rates[idx]:.4f})"
+                    for idx, name in enumerate(lang_names)
+                ]
+                print(f"{head.upper()} 验证统计：样本={int(total)}，空输出率={empty_rate:.4f}，字符={int(chars)}")
+                print(f"{head.upper()} 空输出语种：" + "，".join(lang_parts))
+                if head == "ctc":
+                    blank_argmax, valid_frames, blank_prob_sum, empty_blank_prob, empty_blank_count, nonempty_blank_prob, nonempty_blank_count, nonblank_frames, nonblank_samples = blank_values
+                    blank_frame_ratio = blank_argmax / valid_frames if valid_frames else 0.0
+                    mean_blank_prob = blank_prob_sum / valid_frames if valid_frames else 0.0
+                    empty_mean_blank = empty_blank_prob / empty_blank_count if empty_blank_count else 0.0
+                    nonempty_mean_blank = nonempty_blank_prob / nonempty_blank_count if nonempty_blank_count else 0.0
+                    mean_nonblank_frames = nonblank_frames / nonblank_samples if nonblank_samples else 0.0
+                    print(
+                        f"CTC blank诊断：argmax_blank帧率={blank_frame_ratio:.4f}，"
+                        f"mean_blank_prob={mean_blank_prob:.4f}，"
+                        f"空样本mean_blank_prob={empty_mean_blank:.4f}，"
+                        f"非空样本mean_blank_prob={nonempty_mean_blank:.4f}，"
+                        f"平均nonblank帧数={mean_nonblank_frames:.2f}"
+                    )
+                print(f"{head.upper()} 分桶 CER：<=10={bucket_cer[0]:.4f}，11-30={bucket_cer[1]:.4f}，>30={bucket_cer[2]:.4f}")
                 print(f"{head.upper()} 验证 CER：{cer:.4f}")
         return metrics
 
@@ -538,7 +657,7 @@ def parse_args():
     p.add_argument("--w_ctc", type=float, default=1.0)
     p.add_argument("--w_rnnt", type=float, default=1.0)
 
-    p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe，auto 会继承源 checkpoint")
+    p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe/transformer，auto 会继承源 checkpoint")
 
     p.add_argument("--audio_n_window", type=int, default=0)
     p.add_argument("--audio_n_window_infer", type=int, default=0)

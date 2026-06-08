@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="1,2,3,4,5,6,7"
 if [[ $# -gt 0 ]]; then
     gpu_ids="$1"
 fi
@@ -22,11 +22,11 @@ export OMP_NUM_THREADS=4
 
 # model_path="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-31/checkpoint-6642/"
 model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
-train_file="/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
+train_file="/cfs/data/private/WangYaoChi/train_data/all/train_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-36"
+output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-44"
 # output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-2"
-logging_dir="./logs/logs_ctc_36"
+logging_dir="./logs/logs_ctc_44"
 
 batch_size=32
 grad_acc=4
@@ -45,14 +45,14 @@ w_llm=0
 w_ctc=1
 w_rnnt=0
 
-# CTC adapter: auto 继承源 checkpoint；新 MoE 训练可设为 moe
-ctc_adapter="moe"
+# CTC adapter: auto 继承源 checkpoint；新 Transformer CTC 训练可设为 transformer
+ctc_adapter="transformer"
 
 audio_n_window=0
 audio_n_window_infer=0
-stream_train=0
+stream_train=1
 
-save_steps=1000
+save_steps=500
 num_workers=4
 master_port=$(shuf -n 1 -i 20000-65000)
 

@@ -4,11 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-rnnt-6/checkpoint-24000"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_rnnt_6/train_mode"
-mode="rnnt"
+ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-43"
+outdir="/cfs/data/private/WangYaoChi/test_out/qwen3-asr-ctc-joint-43/train_mask"
+mode="ctc"
 stage="all" 
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="1,2,3,4,5,6,7"
 batch_size=256
 dtype="bf16"
 skip_done=0
@@ -21,6 +21,7 @@ text_topk_badcases=300
 
 # 字段：name|wav.scp|text|language。language 为空或 None 时跳过 LID 统计。
 DATASETS=(
+    "eval|/cfs/data/private/WangYaoChi/train_data/all/eval.scp|/cfs/data/private/WangYaoChi/train_data/all/text|None"
     "mandarin2|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_wav_2.scp|/cfs/data/private/hubk/asr_test_set/VOYAH_Backflow/nlu_text_classify_2|Chinese"
     "yue|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav.scp|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text|Cantonese"
     "chuan|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/wav2.scp|/cfs/data/private/hubk/asr_data/sichuan_yue_vehicle/text2|Sichuanese"

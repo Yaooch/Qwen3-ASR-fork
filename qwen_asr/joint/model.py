@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+from contextlib import nullcontext
 from typing import Dict, Iterable, Optional, Union
 
 import torch
@@ -19,9 +20,25 @@ from .defaults import (
 )
 
 
+CTC_CFG_KEYS = (
+    "bottleneck_dim",
+    "transformer_dim",
+    "transformer_ffn_dim",
+    "transformer_layers",
+    "transformer_heads",
+    "transformer_layer_ffn_dim",
+    "blank_bias",
+)
+
+
 def ctc_cfg(cfg: Dict) -> Dict:
-    """从 joint_config 还原 CTC adapter，旧 checkpoint 默认使用 MLP。"""
-    return {"adapter_type": cfg.get("ctc_adapter", "mlp")}
+    """从 joint_config 还原 CTC 结构，旧 checkpoint 默认使用 MLP。"""
+    out = {"adapter_type": cfg.get("ctc_adapter", "mlp")}
+    for key in CTC_CFG_KEYS:
+        value = cfg.get(f"ctc_{key}")
+        if value is not None:
+            out[key] = value
+    return out
 
 
 def read_joint_cfg(path: Optional[str]) -> Dict:
@@ -36,10 +53,18 @@ def read_joint_cfg(path: Optional[str]) -> Dict:
 
 def save_ctc_cfg(cfg: Dict, ctc=None, source_cfg: Optional[Dict] = None) -> None:
     if ctc is None:
-        cfg["ctc_adapter"] = (source_cfg or {}).get("ctc_adapter", "mlp")
+        source_cfg = source_cfg or {}
+        cfg["ctc_adapter"] = source_cfg.get("ctc_adapter", "mlp")
+        for key in CTC_CFG_KEYS:
+            name = f"ctc_{key}"
+            if name in source_cfg:
+                cfg[name] = source_cfg[name]
         return
 
-    cfg["ctc_adapter"] = ctc.adapter_type
+    ctc_config = ctc.config()
+    cfg["ctc_adapter"] = ctc_config.pop("adapter_type")
+    for key, value in ctc_config.items():
+        cfg[f"ctc_{key}"] = value
 
 
 class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
@@ -230,6 +255,16 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         feat_lengths = (leave - 1) // 2 + 1
         return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
 
+    def _ctc_chunk_size(self) -> int:
+        return max(1, self._enc_len(self._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1)))
+
+    def _ctc_mask_kwargs(self, mask_mode: str) -> Dict:
+        return {
+            "mask_mode": mask_mode,
+            "chunk_size": self._ctc_chunk_size(),
+            "left_chunks": STREAM_LEFT_CHUNKS,
+        }
+
     def _enc_joint(
         self,
         input_features: torch.Tensor,
@@ -350,9 +385,19 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         pre_final = torch.cat(pieces, dim=0)
         return audio_tower.proj2(audio_tower.act(audio_tower.proj1(pre_final)))
 
-    def _aux_loss(self, name: str, hs_pad, out_lens, target_ids, target_lengths):
+    def _aux_loss(self, name: str, hs_pad, out_lens, target_ids, target_lengths, ctc_mask_mode: str = "offline"):
         if target_ids is None:
             return torch.tensor(0.0, device=hs_pad.device)
+        if name == "ctc":
+            ctx = torch.amp.autocast("cuda", enabled=False) if hs_pad.is_cuda else nullcontext()
+            with ctx:
+                return self.ctc(
+                    hs_pad.float(),
+                    out_lens,
+                    target_ids,
+                    target_lengths,
+                    **self._ctc_mask_kwargs(ctc_mask_mode),
+                )
         return self._head(name)(hs_pad, out_lens, target_ids, target_lengths)
 
     def forward(
@@ -373,8 +418,10 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         need_llm = "llm" in tasks
 
         audio_features_for_llm = None
+        ctc_mask_mode = "offline"
         if self.stream_train and aux_tasks:
             hs_pad, out_lens, _ = self._stream_train_mask(input_features, feature_attention_mask)
+            ctc_mask_mode = "chunk"
             if need_llm:
                 audio_features_for_llm = self._project_llm_features(hs_pad, out_lens)
         else:
@@ -388,11 +435,22 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         losses = []
         for name in aux_tasks:
             head_hs = hs_pad.to(self._head_dtype([name]))
-            cur_loss = self._aux_loss(name, head_hs, out_lens, ctc_target_ids, ctc_target_lengths)
+            cur_loss = self._aux_loss(
+                name,
+                head_hs,
+                out_lens,
+                ctc_target_ids,
+                ctc_target_lengths,
+                ctc_mask_mode=ctc_mask_mode,
+            )
             outputs[f"{name}_loss"] = cur_loss
             losses.append(self.loss_weights.get(name, 1.0) * cur_loss)
             if name == "ctc" and not self.training:
-                outputs["log_probs"] = self.ctc.log_softmax(head_hs, out_lens)
+                outputs["log_probs"] = self.ctc.log_softmax(
+                    head_hs,
+                    out_lens,
+                    **self._ctc_mask_kwargs(ctc_mask_mode),
+                )
 
         if need_llm:
             embeds = self.qwen_model.thinker.get_input_embeddings()(input_ids)

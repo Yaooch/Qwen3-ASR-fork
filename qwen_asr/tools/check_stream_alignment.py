@@ -157,12 +157,12 @@ def compare_one(model, wav_path: str) -> Dict:
     hs_infer_ctc = hs_infer.unsqueeze(0).to(head_dtype)
     train_lens = torch.tensor([hs_train.shape[0]], dtype=torch.long, device=hs_train.device)
     infer_lens = torch.tensor([hs_infer.shape[0]], dtype=torch.long, device=hs_infer.device)
-    ctc_train = model.ctc.log_softmax(hs_train_ctc, train_lens)[0]
-    ctc_infer = model.ctc.log_softmax(hs_infer_ctc, infer_lens)[0]
+    ctc_train = model.ctc.log_softmax(hs_train_ctc, train_lens, **model._ctc_mask_kwargs("chunk"))[0]
+    ctc_infer = model.ctc.log_softmax(hs_infer_ctc, infer_lens, **model._ctc_mask_kwargs("causal"))[0]
     ctc_len = min(ctc_train.shape[0], ctc_infer.shape[0])
     top1_match = (ctc_train[:ctc_len].argmax(dim=1) == ctc_infer[:ctc_len].argmax(dim=1)).float()
-    train_text = model._decode_head("ctc", hs_train_ctc, train_lens)[0]
-    infer_text = model._decode_head("ctc", hs_infer_ctc, infer_lens)[0]
+    train_text = model._decode_head("ctc", hs_train_ctc, train_lens, ctc_mask_mode="chunk")[0]
+    infer_text = model._decode_head("ctc", hs_infer_ctc, infer_lens, ctc_mask_mode="causal")[0]
 
     return {
         "mel_train_len": int(full_mel.shape[1]),
