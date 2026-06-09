@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import STREAM_CHUNK_SEC, STREAM_CNN_LEFT_FRAMES, STREAM_LEFT_CHUNKS
+from qwen_asr.joint.defaults import STREAM_CNN_LEFT_FRAMES
 from qwen_asr.joint.stream import StreamingFeatureState
 
 
@@ -43,7 +43,7 @@ def enc_len(length: int) -> int:
 def stream_mel(feature_extractor, wav) -> tuple[torch.Tensor, List[int]]:
     """复现线上增量 Mel，只返回每轮新增帧。"""
     state = StreamingFeatureState(feature_extractor)
-    chunk_samples = max(1, int(round(STREAM_CHUNK_SEC * state.sampling_rate)))
+    chunk_samples = max(1, int(round(0.64 * state.sampling_rate)))
     pieces = []
     lengths = []
     for start in range(0, len(wav), chunk_samples):
@@ -82,7 +82,7 @@ def stream_cnn(audio_tower, mel: torch.Tensor, chunk_lens: List[int]) -> torch.T
 def cache_encoder_from_cnn(audio_tower, cnn_states: torch.Tensor, chunk_out: int) -> torch.Tensor:
     """固定 CNN 输出，仅复现线上 Transformer KV cache。"""
     caches = [None] * len(audio_tower.layers)
-    cache_size = max(0, int(STREAM_LEFT_CHUNKS)) * chunk_out
+    cache_size = 7 * chunk_out
     pieces = []
     for start in range(0, cnn_states.shape[0], chunk_out):
         hidden_states = cnn_states[start:start + chunk_out]
@@ -146,7 +146,7 @@ def compare_one(model, wav_path: str) -> Dict:
     audio_tower = model.qwen_model.thinker.audio_tower
     cnn_full = audio_tower._conv_subsample_chunk(full_mel.to(device=ref.device, dtype=ref.dtype))
     cnn_stream = stream_cnn(audio_tower, full_mel.to(device=ref.device, dtype=ref.dtype), mel_chunk_lens)
-    chunk_out = enc_len(model._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1))
+    chunk_out = enc_len(model._sec_to_feature_count(0.64, min_value=1))
     hs_cache = cache_encoder_from_cnn(audio_tower, cnn_full, chunk_out)
 
     chunks_list, _ = model._encode_stream_waveforms([wav], need_llm=False)

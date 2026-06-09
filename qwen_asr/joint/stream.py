@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 import torch
 
-from .defaults import STREAM_CHUNK_SEC, STREAM_CNN_LEFT_FRAMES, STREAM_LEFT_CHUNKS
+from .defaults import STREAM_CNN_LEFT_FRAMES
 
 
 class StreamingFeatureState:
@@ -72,10 +72,10 @@ class StreamMixin:
         ref = next(self.qwen_model.parameters())
         feature_extractor = self.processor.feature_extractor
         sr = int(getattr(feature_extractor, "sampling_rate", 16000) or 16000)
-        chunk_samples = max(1, int(round(STREAM_CHUNK_SEC * sr)))
-        feature_chunk = self._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1)
+        chunk_samples = max(1, int(round(0.64 * sr)))
+        feature_chunk = self._sec_to_feature_count(0.64, min_value=1)
         cnn_left = STREAM_CNN_LEFT_FRAMES
-        cache_size = max(0, int(STREAM_LEFT_CHUNKS)) * self._enc_len(feature_chunk)
+        cache_size = 7 * self._enc_len(feature_chunk)
         audio_tower = self.qwen_model.thinker.audio_tower
 
         states = [{

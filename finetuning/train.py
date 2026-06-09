@@ -13,7 +13,7 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, STREAM_CHUNK_SEC, STREAM_LEFT_CHUNKS, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
+from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -228,17 +228,7 @@ class DataCollatorForJointTraining:
         return feature_len
 
     def stream_audio_len(self, feature_len: int) -> int:
-        hop_length = int(getattr(self.processor.feature_extractor, "hop_length", 160) or 160)
-        chunk = max(1, int(round(STREAM_CHUNK_SEC * self.sampling_rate / hop_length)))
-        left = max(0, int(STREAM_LEFT_CHUNKS)) * chunk
-        total = 0
-        start = 0
-        while start < feature_len:
-            end = min(feature_len, start + chunk)
-            win_start = max(0, start - left)
-            total += self.stream_conv_len(end - win_start) - self.stream_conv_len(start - win_start)
-            start = end
-        return max(1, total)
+        return max(1, self.stream_conv_len(feature_len))
 
     def tokenize_with_audio_len(self, texts: List[str], audio_lens: List[int]):
         audio_token = self.processor.audio_token

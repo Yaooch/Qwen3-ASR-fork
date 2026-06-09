@@ -7,7 +7,6 @@ from .defaults import (
     DEFAULT_PROMPT,
     ENCODER_BATCH_SIZE,
     RNNT_MAX_SYMBOLS,
-    STREAM_CHUNK_SEC,
     hotword_prompt,
 )
 

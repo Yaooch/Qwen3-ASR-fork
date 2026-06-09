@@ -830,10 +830,11 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         self,
         input_features: torch.Tensor,
         feature_lens: torch.Tensor,
-        chunk_size: int,
-        left_chunks: int,
+        left_frames: int,
+        current_frames: int,
+        right_frames: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """训练用 chunk mask encoder：当前 chunk 只能看自己和固定左侧 chunks。"""
+        """训练用 chunk mask encoder：当前帧组只能看固定左右上下文。"""
         padded_feature = input_features.unsqueeze(1)
         padded_embeds = []
         for chunk in padded_feature.split(self.conv_chunksize, dim=0):
@@ -852,14 +853,16 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         hidden_states = hidden_states + positional_embedding
 
         out_lens = self._stream_conv_lens(feature_lens)
-        chunk_out = int(self._stream_conv_lens(torch.tensor([chunk_size], device=feature_lens.device))[0].item())
-        chunk_out = max(1, chunk_out)
+        current_frames = max(1, int(current_frames))
+        left_frames = max(0, int(left_frames))
+        right_frames = max(0, int(right_frames))
         pos = torch.arange(t, device=hidden_states.device)
-        q_chunk = pos // chunk_out
+        q_chunk = pos // current_frames
         k_pos = pos.unsqueeze(0)
-        start = (q_chunk - max(0, int(left_chunks))) * chunk_out
+        block_start = q_chunk * current_frames
+        start = block_start - left_frames
         start = start.clamp_min(0).unsqueeze(1)
-        end = ((q_chunk + 1) * chunk_out).unsqueeze(1)
+        end = (block_start + current_frames + right_frames).unsqueeze(1)
         chunk_mask = (k_pos >= start) & (k_pos < end)
         valid = pos.unsqueeze(0) < out_lens.unsqueeze(1)
         attention_mask = chunk_mask.unsqueeze(0) & valid.unsqueeze(1) & valid.unsqueeze(2)

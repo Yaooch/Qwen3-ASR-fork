@@ -14,8 +14,9 @@ from .stream import StreamMixin
 from .defaults import (
     ENCODER_BATCH_SIZE,
     JOINT_CONFIG,
-    STREAM_CHUNK_SEC,
-    STREAM_LEFT_CHUNKS,
+    TRAIN_MASK_CURRENT_FRAMES,
+    TRAIN_MASK_LEFT_FRAMES,
+    TRAIN_MASK_RIGHT_FRAMES,
 )
 
 
@@ -326,7 +327,7 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         input_features: torch.Tensor,
         feature_attention_mask: Optional[torch.Tensor] = None,
     ):
-        """按 WeNet 式 chunk mask 编码整条音频，当前 chunk 只看左侧固定 chunks。"""
+        """按帧级 chunk mask 编码整条音频，当前帧组只看固定左右上下文。"""
         batch_size = input_features.shape[0]
         device = input_features.device
         if feature_attention_mask is not None:
@@ -334,13 +335,13 @@ class Qwen3ASRJointModel(StreamMixin, DecodeMixin, nn.Module):
         else:
             feat_lens = torch.full((batch_size,), input_features.shape[2], dtype=torch.long, device=device)
 
-        chunk = self._sec_to_feature_count(STREAM_CHUNK_SEC, min_value=1)
         audio_tower = self.qwen_model.thinker.audio_tower
         hs_pad, out_lens = audio_tower.forward_stream_mask(
             input_features,
             feat_lens,
-            chunk_size=chunk,
-            left_chunks=STREAM_LEFT_CHUNKS,
+            left_frames=TRAIN_MASK_LEFT_FRAMES,
+            current_frames=TRAIN_MASK_CURRENT_FRAMES,
+            right_frames=TRAIN_MASK_RIGHT_FRAMES,
         )
         return hs_pad, out_lens, feat_lens
 
