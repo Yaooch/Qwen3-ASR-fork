@@ -166,8 +166,8 @@ class CTC(nn.Module):
         return self.ctc_loss(log_probs, targets, hs_lengths, target_lengths)
 
     @torch.no_grad()
-    def greedy_decode(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor):
-        """CTC 贪心解码。
+    def greedy_decode(self, hs_pad: torch.Tensor, hs_lengths: torch.Tensor, max_symbols_per_step: int = 0):
+        """CTC 贪心解码（max_symbols_per_step 仅用于接口统一，CTC 忽略）。
 
         返回：
         - List[List[int]]

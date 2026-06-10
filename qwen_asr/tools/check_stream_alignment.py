@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import STREAM_CNN_LEFT_FRAMES
-from qwen_asr.joint.stream import StreamingFeatureState
+from qwen_asr.joint.inference import StreamingFeatureState
 
 
 def parse_args():

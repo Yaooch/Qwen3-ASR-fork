@@ -15,9 +15,7 @@ qwen_asr/inference/qwen3_asr.py              通用 ASR 推理封装
 qwen_asr/inference/qwen3_forced_aligner.py   forced aligner 推理
 qwen_asr/inference/utils.py                  推理工具函数
 qwen_asr/inference/assets/                   推理所需词典等资源
-qwen_asr/joint/model.py                      联合 CTC/RNNT 模型
-qwen_asr/joint/stream.py                     流式窗口和 chunk 特征
-qwen_asr/joint/decode.py                     联合模型推理入口
+qwen_asr/joint/model.py                      联合 CTC/RNNT 模型、训练 forward 和主推理入口
 qwen_asr/joint/ctc.py                        CTC 辅助头
 qwen_asr/joint/rnnt.py                       RNNT 辅助头和 cached greedy 解码
 qwen_asr/joint/hotword.py                    热词召回
@@ -47,6 +45,8 @@ assets/                                      项目文档资源
 - `finetuning/` 只放训练、推理、评估入口脚本，不放核心模型。
 - 官方包能力优先放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
 - 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`。
+- 联合模型训练和推理主逻辑集中在 `qwen_asr/joint/model.py`，不再通过 Mixin/MRO 扩展推理入口。
+- `Qwen3ASRJointModel` 显式提供 `decode_feats/transcribe` 等入口，不再保留单独的 joint inference 兼容文件。
 - 工具类评估脚本放在 `qwen_asr/tools/`，shell 包装脚本放在 `finetuning/`。
 - 函数名尽量短，具体逻辑用中文注释说明。
 - 打印输出使用简洁中文。
