@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--hotword_file", default=None)
     parser.add_argument("--hotword_topk", type=int, default=10)
+    parser.add_argument("--keep_origin_llm", type=int, choices=[0, 1], default=1)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
     parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
     parser.add_argument("--stream", action="store_const", const="stream", dest="encoder_mode")
@@ -151,6 +152,7 @@ def joint_records(model, batch: List[Dict], args, hotword) -> List[Dict]:
         prompt=args.prompt or DEFAULT_PROMPT,
         hotword_retriever=hotword,
         hotword_topk=args.hotword_topk,
+        keep_origin_llm=bool(args.keep_origin_llm),
         encoder_mode=args.encoder_mode,
     )
     if not isinstance(outs, list):

@@ -16,6 +16,7 @@ qwen_asr/inference/qwen3_forced_aligner.py   forced aligner 推理
 qwen_asr/inference/utils.py                  推理工具函数
 qwen_asr/inference/assets/                   推理所需词典等资源
 qwen_asr/joint/model.py                      联合 CTC/RNNT 模型、训练 forward 和主推理入口
+qwen_asr/joint/encoder.py                    联合模型专用 Encoder 路径、长度换算和流式 KV cache
 qwen_asr/joint/ctc.py                        CTC 辅助头
 qwen_asr/joint/rnnt.py                       RNNT 辅助头和 cached greedy 解码
 qwen_asr/joint/hotword.py                    热词召回
@@ -45,8 +46,8 @@ assets/                                      项目文档资源
 - `finetuning/` 只放训练、推理、评估入口脚本，不放核心模型。
 - 官方包能力优先放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
 - 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`。
-- 联合模型训练和推理主逻辑集中在 `qwen_asr/joint/model.py`，不再通过 Mixin/MRO 扩展推理入口。
-- `Qwen3ASRJointModel` 显式提供 `decode_feats/transcribe` 等入口，不再保留单独的 joint inference 兼容文件。
+- 联合模型训练和推理主逻辑集中在 `qwen_asr/joint/model.py`，Encoder 细节集中在 `qwen_asr/joint/encoder.py`，不再通过 Mixin/MRO 扩展推理入口，也不把 joint 实验逻辑塞进官方 backend。
+- `Qwen3ASRJointModel` 显式提供 `transcribe` 主推理入口；训练验证直接复用 `encoder.py` 与 `decode_aux`，不再保留单独的 joint inference 兼容文件。
 - 工具类评估脚本放在 `qwen_asr/tools/`，shell 包装脚本放在 `finetuning/`。
 - 函数名尽量短，具体逻辑用中文注释说明。
 - 打印输出使用简洁中文。
@@ -60,18 +61,18 @@ assets/                                      项目文档资源
 - 训练不再使用额外窗口参数；短窗口由 `audio_n_window/audio_n_window_infer` 控制。
 - CTC/RNNT 可通过 `finetuning/train.py --stream_train 1` 启用流式一致训练；默认关闭，训练侧使用 WeNet-like 帧级 chunk mask：整条 feature 过 CNN 后按 encoder 帧计数，默认左看 24 帧、当前 6 帧、右看 2 帧，不使用 FA2 packed-window 折中；若同时训练 LLM，则复用该流式 encoder 输出再过 `proj1/act/proj2`，不额外重跑整条 encoder；训练 batch 不携带未使用的 raw waveform；CTC-only 训练不构造 LLM `input_ids/labels`；训练期验证样例和 CER 也必须走同一 stream mask 路径。
 - 批量推理使用 `--encoder_mode offline/stream/train_mask` 选择 Encoder 路径，兼容保留 `--stream/--no_stream` 作为 `stream/offline` 别名；`train_mask` 仅用于评测流式训练路径的理论上限：整条音频批量提 Mel 后复用训练侧 chunk mask Encoder，不代表线上真实流式行为；`infer_all.sh` 默认使用 `train_mask`，其他推理入口保持原默认值。
-- 推理流式细节固定在 `qwen_asr/joint/defaults.py`；真实流式批量推理需把 batch 内窗口合批送 encoder，CTC/RNNT 流式解码需先拼接 batch 内 chunk 后批量 greedy，避免逐条音频小 batch 导致 GPU 空转。
+- 推理流式常量固定在 `qwen_asr/joint/defaults.py`，流式 Encoder 执行细节放在 `qwen_asr/joint/encoder.py`；真实流式批量推理需把 batch 内窗口合批送 encoder，CTC/RNNT 流式解码需先拼接 batch 内 chunk 后批量 greedy，避免逐条音频小 batch 导致 GPU 空转。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径和 WER 脚本路径统一放在 `qwen_asr/joint/defaults.py`。
 - 新 joint checkpoint 使用 `joint_config.json` 记录 `heads` 等结构信息；`--train` 只控制训练/loss，不训练的已有头不加载、保存时从源 checkpoint 复制。
 - 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件，并保持 `config.json` 与 `joint_config.json` 的 audio window 参数一致。
 - 训练 TensorBoard 日志路径通过 `finetuning/train.py --logging_dir` 控制，`finetuning/train.sh` 顶部保留 `logging_dir` 变量；训练期验证需记录 `eval_ctc_cer/eval_rnnt_cer`。
 - 热词召回固定使用 pinyin，缺少 `pypinyin` 直接报错，不做静默兜底。
-- 热词评估只比较默认 LLM 与热词 prompt LLM；推理热词库和评估目标热词分开，评估目标文件使用 `utt_id<TAB>热词1,热词2` 格式；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
+- 热词推理可用 `--keep_origin_llm 0/1` 控制是否保留默认 LLM 输出，默认保留；热词评估只比较默认 LLM 与热词 prompt LLM；推理热词库和评估目标热词分开，评估目标文件使用 `utt_id<TAB>热词1,热词2` 格式；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
 - 热词测试集按语言拆分时，`wav.scp/text/utt_hotword.txt` 按 `utt_id` 或音频路径判断语言，默认输出到测试集目录下的 `Mandarin/` 和 `English/`，`hotword.txt` 从拆分后的目标热词重新生成。
 - 拼音评估需兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本` 两种格式；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。
 - WER 阶段需同时生成文本 badcase，输出 `utt_id/WER/ref/hyp` 四项；shell 脚本不再传自定义 prompt，统一使用 `qwen_asr/joint/defaults.py` 中默认值。
 - 训练集统计优先使用随机 seek 抽样和 badcase 关键词定向检索，避免对千万级 jsonl 做全量扫描。
-- 流式特征状态、单条/批量返回、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
+- 流式特征状态、Encoder 长度换算、单条/批量返回、评测 badcase 分类等重复逻辑优先复用现有 helper，不在入口函数里重新展开。
 - `--encoder_mode stream`（或 `--stream`）推理每 640ms 处理一个 waveform chunk：前端仅保留 20ms raw tail 并提交全部新增 Mel，接受末帧约 2.5ms STFT 右上下文缺失的近似；CNN 保留 8 帧左侧 Mel overlap 并丢掉重复的 1 个 CNN token；batch 内 active chunk 合批送 encoder KV cache；CTC 固定使用 batched greedy，`--mode ctc,llm --stream` 在音频结束后复用 encoder 输出一次性 LLM 解码。
 - 流式对齐检查使用 `qwen_asr/tools/check_stream_alignment.py`，依次比较整条/增量 Mel、整条/overlap CNN、chunk mask/KV cache Encoder 和最终 CTC 输出。
 - 批量推理入口需在 worker 写入 `tmp_rank*.jsonl` 前创建输出目录；多 GPU `spawn` 只传轻量 rank/world size 等参数，由子进程自行读取 scp 并分片，避免通过启动 pipe 传递大 shard 导致 worker 串行拉起。

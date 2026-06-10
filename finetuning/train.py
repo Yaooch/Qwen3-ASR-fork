@@ -13,7 +13,11 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH
+from qwen_asr.joint.defaults import (
+    DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_LEFT_FRAMES,
+    TRAIN_MASK_RIGHT_FRAMES, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH,
+)
+from qwen_asr.joint.encoder import encode_offline, encode_train_mask, feature_lens
 from safetensors.torch import load_model as load_safetensors_model
 from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -370,11 +374,21 @@ class JointTrainer(Trainer):
             with torch.no_grad():
                 for batch in dataloader:
                     inputs = self._prepare_inputs(batch)
-                    preds = base.decode_feats(
-                        inputs["input_features"],
-                        inputs.get("feature_attention_mask"),
-                        head=head,
-                    )
+                    ref_param = next(base.qwen_model.parameters())
+                    feats = inputs["input_features"].to(device=ref_param.device, dtype=ref_param.dtype)
+                    mask = inputs.get("feature_attention_mask")
+                    mask = mask.to(device=ref_param.device) if mask is not None else None
+                    lens_in = feature_lens(feats, mask)
+                    tower = base.qwen_model.thinker.audio_tower
+                    if base.stream_train:
+                        hs, _, lens = encode_train_mask(
+                            tower, feats, lens_in,
+                            TRAIN_MASK_LEFT_FRAMES, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_RIGHT_FRAMES,
+                            False,
+                        )
+                    else:
+                        hs, _, lens = encode_offline(tower, feats, lens_in, False)
+                    preds = base.decode_aux(head, hs, lens)
                     for pred, ref in zip(preds, inputs.get("texts", [])):
                         ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
                         ref = "".join(self.data_collator.sp_model.encode_as_pieces(ref.upper())).replace("▁", " ").strip().lower()

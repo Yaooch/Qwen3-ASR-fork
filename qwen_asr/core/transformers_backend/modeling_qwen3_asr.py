@@ -474,104 +474,6 @@ class Qwen3ASRAudioAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
-    def forward_mask(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Batched chunk-mask attention，输入 [B, T, D]。"""
-        batch_size, seq_length, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states).reshape(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).reshape(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).reshape(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask.unsqueeze(1),
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            scale=self.scaling,
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, -1).contiguous()
-        return self.out_proj(attn_output)
-
-    def forward_batch_chunk(
-        self,
-        hidden_states_list: list[torch.Tensor],
-        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]],
-        cache_size: int = 0,
-        detach_cache: bool = True,
-    ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor]]]:
-        """批量当前 chunk attend 各自历史 KV cache。"""
-        batch_size = len(hidden_states_list)
-        if batch_size == 0:
-            return [], []
-
-        q_lens = [int(x.shape[0]) for x in hidden_states_list]
-        max_q = max(q_lens)
-        if max_q == 0:
-            empty = [x for x in hidden_states_list]
-            return empty, kv_caches
-
-        cur = torch.cat(hidden_states_list, dim=0)
-        query_all = self.q_proj(cur).reshape(cur.shape[0], self.num_heads, -1)
-        key_cur_all = self.k_proj(cur).reshape(cur.shape[0], self.num_heads, -1)
-        value_cur_all = self.v_proj(cur).reshape(cur.shape[0], self.num_heads, -1)
-        query_split = query_all.split(q_lens, dim=0)
-        key_cur_split = key_cur_all.split(q_lens, dim=0)
-        value_cur_split = value_cur_all.split(q_lens, dim=0)
-
-        key_list = []
-        value_list = []
-        k_lens = []
-        new_caches = []
-        for key_cur, value_cur, cache in zip(key_cur_split, value_cur_split, kv_caches):
-            if cache is not None:
-                key_all = torch.cat([cache[0].to(key_cur.dtype), key_cur], dim=0)
-                value_all = torch.cat([cache[1].to(value_cur.dtype), value_cur], dim=0)
-            else:
-                key_all = key_cur
-                value_all = value_cur
-            key_list.append(key_all)
-            value_list.append(value_all)
-            k_lens.append(int(key_all.shape[0]))
-
-            if cache_size is not None and cache_size > 0:
-                new_key = key_all[-cache_size:]
-                new_value = value_all[-cache_size:]
-            else:
-                new_key = key_all[:0]
-                new_value = value_all[:0]
-            if detach_cache:
-                new_key = new_key.detach()
-                new_value = new_value.detach()
-            new_caches.append((new_key, new_value))
-
-        max_k = max(k_lens)
-        q = query_all.new_zeros((batch_size, self.num_heads, max_q, self.head_dim))
-        k = query_all.new_zeros((batch_size, self.num_heads, max_k, self.head_dim))
-        v = query_all.new_zeros((batch_size, self.num_heads, max_k, self.head_dim))
-        attn_mask = torch.zeros((batch_size, 1, 1, max_k), dtype=torch.bool, device=query_all.device)
-        for i, (query, key, value, q_len, k_len) in enumerate(zip(query_split, key_list, value_list, q_lens, k_lens)):
-            q[i, :, :q_len] = query.transpose(0, 1)
-            k[i, :, :k_len] = key.transpose(0, 1)
-            v[i, :, :k_len] = value.transpose(0, 1)
-            attn_mask[i, :, :, :k_len] = True
-
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            scale=self.scaling,
-        )
-        outputs = []
-        for i, q_len in enumerate(q_lens):
-            cur_out = attn_output[i, :, :q_len].transpose(0, 1).reshape(q_len, -1).contiguous()
-            outputs.append(self.out_proj(cur_out))
-        return outputs, new_caches
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -630,53 +532,6 @@ class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-
-    def forward_mask(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn.forward_mask(hidden_states, attention_mask)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = residual + hidden_states
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-        return hidden_states
-
-    def forward_batch_chunk(
-        self,
-        hidden_states_list: list[torch.Tensor],
-        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]],
-        cache_size: int = 0,
-        detach_cache: bool = True,
-    ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor]]]:
-        residuals = hidden_states_list
-        normed = [self.self_attn_layer_norm(x) for x in hidden_states_list]
-        attn_outputs, new_caches = self.self_attn.forward_batch_chunk(
-            normed,
-            kv_caches=kv_caches,
-            cache_size=cache_size,
-            detach_cache=detach_cache,
-        )
-        hidden_states_list = [residual + attn for residual, attn in zip(residuals, attn_outputs)]
-
-        outputs = []
-        for hidden_states in hidden_states_list:
-            residual = hidden_states
-            hidden_states = self.final_layer_norm(hidden_states)
-            hidden_states = self.fc1(hidden_states)
-            hidden_states = self.activation_fn(hidden_states)
-            hidden_states = self.fc2(hidden_states)
-            hidden_states = residual + hidden_states
-            if hidden_states.dtype == torch.float16:
-                clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-                hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-            outputs.append(hidden_states)
-        return outputs, new_caches
 
     def forward(
         self,
@@ -810,127 +665,6 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
         return attention_mask
 
-    @staticmethod
-    def _stream_conv_lens(lengths: torch.Tensor) -> torch.Tensor:
-        lengths = (lengths + 1) // 2
-        lengths = (lengths + 1) // 2
-        lengths = (lengths + 1) // 2
-        return lengths
-
-    def _conv_subsample_chunk(self, input_features: torch.Tensor) -> torch.Tensor:
-        """对单个 feature 窗口做 3 层 CNN subsampling，输入 [F, T]。"""
-        x = input_features.unsqueeze(0).unsqueeze(1)
-        x = F.gelu(self.conv2d1(x))
-        x = F.gelu(self.conv2d2(x))
-        x = F.gelu(self.conv2d3(x))
-        b, c, f, t = x.size()
-        return self.conv_out(x.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))[0]
-
-    def forward_stream_mask(
-        self,
-        input_features: torch.Tensor,
-        feature_lens: torch.Tensor,
-        left_frames: int,
-        current_frames: int,
-        right_frames: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """训练用 chunk mask encoder：当前帧组只能看固定左右上下文。"""
-        padded_feature = input_features.unsqueeze(1)
-        padded_embeds = []
-        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-            padded_embed = F.gelu(self.conv2d1(chunk))
-            padded_embed = F.gelu(self.conv2d2(padded_embed))
-            padded_embed = F.gelu(self.conv2d3(padded_embed))
-            padded_embeds.append(padded_embed)
-        padded_embed = torch.cat(padded_embeds, dim=0)
-        b, c, f, t = padded_embed.size()
-        hidden_states = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
-        positional_embedding = (
-            self.positional_embedding.positional_embedding[:t, :]
-            .unsqueeze(0)
-            .to(hidden_states.device, dtype=hidden_states.dtype)
-        )
-        hidden_states = hidden_states + positional_embedding
-
-        out_lens = self._stream_conv_lens(feature_lens)
-        current_frames = max(1, int(current_frames))
-        left_frames = max(0, int(left_frames))
-        right_frames = max(0, int(right_frames))
-        pos = torch.arange(t, device=hidden_states.device)
-        q_chunk = pos // current_frames
-        k_pos = pos.unsqueeze(0)
-        block_start = q_chunk * current_frames
-        start = block_start - left_frames
-        start = start.clamp_min(0).unsqueeze(1)
-        end = (block_start + current_frames + right_frames).unsqueeze(1)
-        chunk_mask = (k_pos >= start) & (k_pos < end)
-        valid = pos.unsqueeze(0) < out_lens.unsqueeze(1)
-        attention_mask = chunk_mask.unsqueeze(0) & valid.unsqueeze(1) & valid.unsqueeze(2)
-
-        for encoder_layer in self.layers:
-            hidden_states = encoder_layer.forward_mask(hidden_states, attention_mask)
-        hidden_states = self.ln_post(hidden_states)
-        return hidden_states, out_lens
-
-    def forward_stream_batch_chunks(
-        self,
-        input_features: torch.Tensor,
-        feature_lens: torch.Tensor,
-        drop_prefixes: torch.Tensor,
-        kv_caches: Optional[list] = None,
-        cache_size: int = 0,
-        detach_cache: bool = True,
-        position_offsets: Optional[torch.Tensor] = None,
-    ) -> tuple[list[torch.Tensor], list]:
-        """批量流式 encoder chunk，丢掉 overlap CNN token 后推进独立 KV cache。"""
-        batch_size = input_features.shape[0]
-        if batch_size == 0:
-            return [], []
-        if kv_caches is None:
-            kv_caches = [[None] * len(self.layers) for _ in range(batch_size)]
-        else:
-            kv_caches = [cache if cache is not None else [None] * len(self.layers) for cache in kv_caches]
-
-        feature_lens_after_cnn = self._stream_conv_lens(feature_lens)
-        padded_feature = input_features.unsqueeze(1)
-        padded_embeds = []
-        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-            padded_embed = F.gelu(self.conv2d1(chunk))
-            padded_embed = F.gelu(self.conv2d2(padded_embed))
-            padded_embed = F.gelu(self.conv2d3(padded_embed))
-            padded_embeds.append(padded_embed)
-        padded_embed = torch.cat(padded_embeds, dim=0)
-        b, c, f, t = padded_embed.size()
-        padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
-        if position_offsets is None:
-            position_offsets = torch.zeros(batch_size, dtype=torch.long, device=input_features.device)
-
-        hidden_states_list = []
-        for idx, length in enumerate(feature_lens_after_cnn.tolist()):
-            cur_len = int(length)
-            start = max(0, min(int(drop_prefixes[idx].item()), cur_len))
-            hidden_states = padded_embed[idx, start:cur_len]
-            pos_start = max(0, int(position_offsets[idx].item()))
-            pos_end = pos_start + hidden_states.shape[0]
-            positional_embedding = self.positional_embedding.positional_embedding[pos_start:pos_end, :]
-            hidden_states = hidden_states + positional_embedding.to(hidden_states.device, dtype=hidden_states.dtype)
-            hidden_states_list.append(hidden_states)
-
-        new_all_caches = [[None] * len(self.layers) for _ in range(batch_size)]
-        for layer_idx, encoder_layer in enumerate(self.layers):
-            layer_caches = [cache[layer_idx] for cache in kv_caches]
-            hidden_states_list, new_layer_caches = encoder_layer.forward_batch_chunk(
-                hidden_states_list,
-                kv_caches=layer_caches,
-                cache_size=cache_size,
-                detach_cache=detach_cache,
-            )
-            for item_idx, layer_cache in enumerate(new_layer_caches):
-                new_all_caches[item_idx][layer_idx] = layer_cache
-
-        hidden_states_list = [self.ln_post(x) for x in hidden_states_list]
-        return hidden_states_list, new_all_caches
-
     @auto_docstring
     def forward(
         self,
@@ -938,7 +672,6 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         feature_lens=None,
         aftercnn_lens=None,
         return_pre_proj=False,
-        ctc_layer_idx=None,   # 新增，按人类习惯传 1~24
     ):
         r"""
         feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
@@ -947,8 +680,6 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             mel length after cnn
         return_pre_proj (`bool`, *optional*, defaults to `False`):
             return ln_post features before proj1/proj2 for auxiliary heads.
-        ctc_layer_idx (`int`, *optional*):
-            return hidden states from the given encoder layer for CTC-style auxiliary heads.
         """
         aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
@@ -997,36 +728,18 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
-        # for encoder_layer in self.layers:
-        #     layer_outputs = encoder_layer(
-        #         hidden_states,
-        #         cu_seqlens,
-        #     )
-
-        #     hidden_states = layer_outputs[0]
-
-        ctc_hidden_states_lay = None
-
-        for layer_id, encoder_layer in enumerate(self.layers, start=1):
-            layer_outputs = encoder_layer(hidden_states, cu_seqlens)
+        for encoder_layer in self.layers:
+            layer_outputs = encoder_layer(
+                hidden_states,
+                cu_seqlens,
+            )
             hidden_states = layer_outputs[0]
 
-            if ctc_layer_idx is not None and layer_id == ctc_layer_idx:
-                ctc_hidden_states_lay = hidden_states
-
         hidden_states = self.ln_post(hidden_states)
-        if ctc_layer_idx == 24:
-            ctc_hidden_states_lay = hidden_states
-
-        # 这是最终层、proj1/proj2 之前的特征
-        pre_final = hidden_states
-
         if return_pre_proj:
-            if ctc_layer_idx is not None:
-                return BaseModelOutput(last_hidden_state=pre_final), ctc_hidden_states_lay
-            return BaseModelOutput(last_hidden_state=pre_final), pre_final
+            return BaseModelOutput(last_hidden_state=hidden_states), hidden_states
 
-        hidden_states = self.proj1(pre_final)
+        hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
         return BaseModelOutput(last_hidden_state=hidden_states)
