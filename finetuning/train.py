@@ -14,89 +14,20 @@ from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import (
-    DEFAULT_PROMPT, JOINT_CONFIG, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_LEFT_FRAMES,
+    DEFAULT_ATTN_IMPLEMENTATION, DEFAULT_PROMPT, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_LEFT_FRAMES,
     TRAIN_MASK_RIGHT_FRAMES, TRAIN_SP_MODEL_PATH, TRAIN_VOCAB_PATH,
 )
-from qwen_asr.joint.encoder import encode_offline, encode_train_mask, feature_lens
+from qwen_asr.joint.encoder import conv_len, encode_offline, encode_train_mask, feature_lens
+from qwen_asr.joint.model import names, read_cfg
 from safetensors.torch import load_model as load_safetensors_model
-from transformers import GenerationConfig, Trainer, TrainerCallback, TrainingArguments
+from transformers import Trainer, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
-
-
-DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
 
 
 TASKS = {"llm", "proj", "encoder", "ctc", "rnnt"}
 PROJ_MODULES = ("proj1", "act", "proj2")
 PROJ_PARAM_KEYS = tuple(f".{name}." for name in PROJ_MODULES)
 
-
-def read_joint_cfg(path: str) -> Dict:
-    cfg_path = os.path.join(path or "", JOINT_CONFIG)
-    if not os.path.exists(cfg_path):
-        return {}
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def resolve_ctc_cfg(args, source_cfg: Dict) -> None:
-    if args.ctc_adapter == "auto":
-        args.ctc_adapter = source_cfg.get("ctc_adapter", "mlp")
-
-
-def ctc_train_cfg(args) -> Dict:
-    return {"adapter_type": args.ctc_adapter}
-
-
-def sync_audio_attention(qwen_model) -> None:
-    audio_tower = qwen_model.thinker.audio_tower
-    audio_tower.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-    qwen_model.config.thinker_config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-    qwen_model.thinker.config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-
-
-def csv_set(value: str, allowed: set, name: str) -> tuple:
-    out = []
-    for part in (value or "").split(","):
-        item = part.strip().lower()
-        if not item:
-            continue
-        if item not in allowed:
-            raise ValueError(f"不支持的 {name}: {item}")
-        if item not in out:
-            out.append(item)
-    if not out:
-        raise ValueError(f"{name} 不能为空")
-    return tuple(out)
-
-
-def patch_outer_forward(model):
-    cls = model.__class__
-    if getattr(cls, "_forward_patched", False):
-        return
-    if not hasattr(model, "thinker") or not hasattr(model.thinker, "forward"):
-        raise RuntimeError("Cannot patch forward: model has no `.thinker.forward`.")
-
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        input_features=None,
-        feature_attention_mask=None,
-        labels=None,
-        **kwargs,
-    ):
-        return self.thinker.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            input_features=input_features,
-            feature_attention_mask=feature_attention_mask,
-            labels=labels,
-            **kwargs,
-        )
-
-    cls.forward = forward
-    cls._forward_patched = True
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
@@ -114,44 +45,6 @@ def latest_checkpoint(output_dir: str) -> Optional[str]:
     return best[1] if best else None
 
 
-def load_audio(path: str, sr: int = 16000, max_duration: float = 30.0):
-    try:
-        wav, _ = librosa.load(path, sr=sr, mono=True)
-        if len(wav) / sr > max_duration:
-            print(f"音频过长，跳过：{path}")
-            return None
-        return wav
-    except Exception as exc:
-        print(f"音频读取失败，跳过：{path}，{exc}")
-        return None
-
-
-def build_prefix_messages(prompt: str, audio_array):
-    return [
-        {"role": "system", "content": prompt or DEFAULT_PROMPT},
-        {"role": "user", "content": [{"type": "audio", "audio": audio_array}]},
-    ]
-
-
-def make_preprocess_fn(processor):
-    def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = ex.get("prompt") or DEFAULT_PROMPT
-        target = ex.get("target") or ex.get("text") or ""
-        prefix_text = processor.apply_chat_template(
-            [build_prefix_messages(prompt, None)],
-            add_generation_prompt=True,
-            tokenize=False,
-        )[0]
-        return {
-            "audio": ex["audio"],
-            "prompt": prompt,
-            "target": target,
-            "prefix_text": prefix_text,
-        }
-
-    return _preprocess
-
-
 @dataclass
 class DataCollatorForJointTraining:
     processor: Any
@@ -167,29 +60,48 @@ class DataCollatorForJointTraining:
     def __call__(self, features: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         rows = []
         for item in features:
-            wav = load_audio(item["audio"], sr=self.sampling_rate)
-            if wav is not None:
-                item = dict(item)
-                item["_audio"] = wav
-                rows.append(item)
+            try:
+                wav, _ = librosa.load(item["audio"], sr=self.sampling_rate, mono=True)
+            except Exception as exc:
+                print(f"音频读取失败，跳过：{item['audio']}，{exc}")
+                continue
+            if len(wav) / self.sampling_rate > 30.0:
+                print(f"音频过长，跳过：{item['audio']}")
+                continue
+            rows.append((item, wav))
         if not rows:
             return None
 
-        targets = [x["target"] for x in rows]
-        audios = [x["_audio"] for x in rows]
+        audios = [wav for _, wav in rows]
+        targets = [(item.get("target") or item.get("text") or "") for item, _ in rows]
         if self.need_llm:
-            prefix_texts = [x["prefix_text"] for x in rows]
+            prefix_texts = [
+                self.processor.apply_chat_template(
+                    [[
+                        {"role": "system", "content": item.get("prompt") or DEFAULT_PROMPT},
+                        {"role": "user", "content": [{"type": "audio", "audio": None}]},
+                    ]],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )[0]
+                for item, _ in rows
+            ]
             eos = self.processor.tokenizer.eos_token or ""
             full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
             full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
             prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
             if self.stream_train:
-                stream_lens = [self.stream_audio_len(int(x)) for x in full["feature_attention_mask"].sum(dim=1).tolist()]
-                full_tok = self.tokenize_with_audio_len(full_texts, stream_lens)
-                prefix_tok = self.tokenize_with_audio_len(prefix_texts, stream_lens)
-                for key, value in full_tok.items():
-                    full[key] = value
-                prefix = prefix_tok
+                stream_lens = [max(1, int(conv_len(int(x)))) for x in full["feature_attention_mask"].sum(dim=1).tolist()]
+                audio_token = self.processor.audio_token
+                full_tok = self.processor.tokenizer(
+                    [text.replace(audio_token, audio_token * length, 1) for text, length in zip(full_texts, stream_lens)],
+                    return_tensors="pt", padding=True, truncation=False,
+                )
+                prefix = self.processor.tokenizer(
+                    [text.replace(audio_token, audio_token * length, 1) for text, length in zip(prefix_texts, stream_lens)],
+                    return_tensors="pt", padding=True, truncation=False,
+                )
+                full.update(full_tok)
 
             labels = full["input_ids"].clone()
             for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
@@ -200,12 +112,8 @@ class DataCollatorForJointTraining:
             full["labels"] = labels
         else:
             full = self.processor.feature_extractor(
-                audios,
-                sampling_rate=self.sampling_rate,
-                return_tensors="pt",
-                padding=True,
-                truncation=False,
-                return_attention_mask=True,
+                audios, sampling_rate=self.sampling_rate, return_tensors="pt",
+                padding=True, truncation=False, return_attention_mask=True,
             )
             full["feature_attention_mask"] = full.pop("attention_mask")
 
@@ -222,25 +130,6 @@ class DataCollatorForJointTraining:
         full["texts"] = targets
         return full
 
-    @staticmethod
-    def stream_conv_len(feature_len: int) -> int:
-        if feature_len <= 0:
-            return 0
-        feature_len = (feature_len + 1) // 2
-        feature_len = (feature_len + 1) // 2
-        feature_len = (feature_len + 1) // 2
-        return feature_len
-
-    def stream_audio_len(self, feature_len: int) -> int:
-        return max(1, self.stream_conv_len(feature_len))
-
-    def tokenize_with_audio_len(self, texts: List[str], audio_lens: List[int]):
-        audio_token = self.processor.audio_token
-        expanded = []
-        for text, length in zip(texts, audio_lens):
-            expanded.append(text.replace(audio_token, audio_token * int(length), 1))
-        return self.processor.tokenizer(expanded, return_tensors="pt", padding=True, truncation=False)
-
     def text_to_ids(self, text: str) -> List[int]:
         if "<asr_text>" in text:
             text = text.split("<asr_text>")[-1]
@@ -254,46 +143,28 @@ class DataCollatorForJointTraining:
         return ids
 
 
-def module_set_trainable(module, enabled: bool) -> None:
-    if module is None or not hasattr(module, "parameters"):
-        return
-    for param in module.parameters():
-        param.requires_grad = enabled
-
-
-def set_proj_trainable(audio_tower, enabled: bool) -> None:
-    for name in PROJ_MODULES:
-        module_set_trainable(getattr(audio_tower, name, None), enabled)
-
-
 def set_trainable(model: Qwen3ASRJointModel, tasks: Iterable[str]) -> None:
+    def set_module(module, enabled: bool) -> None:
+        if module is not None and hasattr(module, "parameters"):
+            for param in module.parameters():
+                param.requires_grad = enabled
+
     tasks = set(tasks)
-    module_set_trainable(model, False)
     audio_tower = model.qwen_model.thinker.audio_tower
-
+    set_module(model, False)
     if "llm" in tasks:
-        module_set_trainable(model.qwen_model, True)
-        module_set_trainable(audio_tower, False)
+        set_module(model.qwen_model, True)
+        set_module(audio_tower, False)
     if "encoder" in tasks:
-        module_set_trainable(audio_tower, True)
+        set_module(audio_tower, True)
         if "proj" not in tasks:
-            set_proj_trainable(audio_tower, False)
+            for name in PROJ_MODULES:
+                set_module(getattr(audio_tower, name, None), False)
     if "proj" in tasks:
-        set_proj_trainable(audio_tower, True)
-    if "ctc" in tasks:
-        module_set_trainable(model.ctc, True)
-    if "rnnt" in tasks:
-        module_set_trainable(model.rnnt, True)
-
-
-def group_name(param_name: str) -> str:
-    if param_name.startswith(("ctc.", "module.ctc.")):
-        return "ctc"
-    if param_name.startswith(("rnnt.", "module.rnnt.")):
-        return "rnnt"
-    if ".audio_tower." in param_name:
-        return "proj" if any(x in param_name for x in PROJ_PARAM_KEYS) else "encoder"
-    return "llm"
+        for name in PROJ_MODULES:
+            set_module(getattr(audio_tower, name, None), True)
+    set_module(model.ctc, "ctc" in tasks)
+    set_module(model.rnnt, "rnnt" in tasks)
 
 
 class JointTrainer(Trainer):
@@ -308,6 +179,15 @@ class JointTrainer(Trainer):
     def create_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
+
+        def group_name(param_name: str) -> str:
+            if param_name.startswith(("ctc.", "module.ctc.")):
+                return "ctc"
+            if param_name.startswith(("rnnt.", "module.rnnt.")):
+                return "rnnt"
+            if ".audio_tower." in param_name:
+                return "proj" if any(x in param_name for x in PROJ_PARAM_KEYS) else "encoder"
+            return "llm"
 
         decay_names = self.get_decay_parameter_names(self.model)
         groups = {}
@@ -430,65 +310,19 @@ class JointTrainer(Trainer):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         base = self.model.module if hasattr(self.model, "module") else self.model
-        copy_hf_files(self.head_source, output_dir)
-        sync_audio_window_config(base.qwen_model)
+        for name in (
+            "config.json", "generation_config.json", "preprocessor_config.json",
+            "processor_config.json", "tokenizer_config.json", "tokenizer.json",
+            "special_tokens_map.json", "chat_template.json", "merges.txt", "vocab.json",
+        ):
+            src = os.path.join(self.head_source, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(output_dir, name))
         base.qwen_model.save_pretrained(output_dir, safe_serialization=True)
         base.save_aux(output_dir, heads=self.save_heads, copy_heads_from=self.head_source)
         old = os.path.join(output_dir, "pytorch_model.bin")
         if os.path.exists(old):
             os.remove(old)
-
-
-def copy_hf_files(src_dir: str, dst_dir: str):
-    os.makedirs(dst_dir, exist_ok=True)
-    for name in (
-        "config.json",
-        "generation_config.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "special_tokens_map.json",
-        "chat_template.json",
-        "merges.txt",
-        "vocab.json",
-    ):
-        src = os.path.join(src_dir, name)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(dst_dir, name))
-
-
-class InferableCheckpointCallback(TrainerCallback):
-    def __init__(self, base_model_path: str, save_heads=()):
-        self.base_model_path = base_model_path
-        self.save_heads = tuple(save_heads)
-
-    def on_save(self, args: TrainingArguments, state, control, **kwargs):
-        if args.process_index != 0:
-            return control
-        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        copy_hf_files(self.base_model_path, ckpt_dir)
-        model = kwargs.get("model")
-        if model is not None:
-            base = model.module if hasattr(model, "module") else model
-            sync_audio_window_config(base.qwen_model)
-            base.qwen_model.config.save_pretrained(ckpt_dir)
-            base.save_aux(ckpt_dir, heads=self.save_heads, copy_heads_from=self.base_model_path)
-        return control
-
-
-def sync_audio_window_config(qwen_model, n_window: Optional[int] = None, n_window_infer: Optional[int] = None):
-    audio_tower = qwen_model.thinker.audio_tower
-    audio_config = qwen_model.config.thinker_config.audio_config
-    n_window = audio_tower.n_window if n_window is None else n_window
-    n_window_infer = audio_tower.n_window_infer if n_window_infer is None else n_window_infer
-    audio_tower.n_window = n_window
-    audio_tower.config.n_window = n_window
-    audio_config.n_window = n_window
-    audio_tower.n_window_infer = n_window_infer
-    audio_tower.config.n_window_infer = n_window_infer
-    audio_config.n_window_infer = n_window_infer
-    return audio_tower
 
 
 def load_heads(model: Qwen3ASRJointModel, path: str, heads=None, is_main: bool = True, strict: bool = True):
@@ -505,14 +339,6 @@ def load_heads(model: Qwen3ASRJointModel, path: str, heads=None, is_main: bool =
                 print(f"缺少参数：{missing}")
             if unexpected:
                 print(f"多余参数：{unexpected}")
-
-
-def existing_heads(path: str) -> tuple:
-    return tuple(
-        name
-        for name in ("ctc", "rnnt")
-        if os.path.exists(os.path.join(path, f"{name}_head.pt"))
-    )
 
 
 def parse_args():
@@ -544,8 +370,6 @@ def parse_args():
 
     p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe，auto 会继承源 checkpoint")
 
-    p.add_argument("--audio_n_window", type=int, default=0)
-    p.add_argument("--audio_n_window_infer", type=int, default=0)
     p.add_argument("--stream_train", type=int, default=0, help="1 表示 CTC/RNNT 按流式窗口特征训练")
 
     p.add_argument("--num_workers", type=int, default=4)
@@ -558,15 +382,22 @@ def parse_args():
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
     args = p.parse_args()
-    source_cfg = read_joint_cfg(args.model_path)
-    resolve_ctc_cfg(args, source_cfg)
-    args.tasks = csv_set(args.train, TASKS, "train")
+    source_cfg = read_cfg(args.model_path)
+    if args.ctc_adapter == "auto":
+        args.ctc_adapter = source_cfg.get("ctc_adapter", "mlp")
+    args.tasks = names(args.train, TASKS, "train")
+    if not args.tasks:
+        raise ValueError("train 不能为空")
     if "proj" in args.tasks and "llm" not in args.tasks:
         raise ValueError("proj 只作用于 LLM 路径，请和 llm 一起训练。")
     args.loss_tasks = tuple(x for x in args.tasks if x not in ("encoder", "proj"))
     if not args.loss_tasks:
         raise ValueError("--train 至少需要包含 llm/ctc/rnnt 之一；encoder/proj 只能配合这些 loss 一起训练。")
-    save_heads = [*existing_heads(args.model_path)]
+    save_heads = [
+        name
+        for name in ("ctc", "rnnt")
+        if os.path.exists(os.path.join(args.model_path, f"{name}_head.pt"))
+    ]
     active_heads = []
     for name in args.loss_tasks:
         if name in ("ctc", "rnnt"):
@@ -578,27 +409,21 @@ def parse_args():
     return args
 
 
-def load_vocab(path: str):
-    vocab = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                vocab[parts[0]] = int(parts[1])
-    return vocab
-
-
 def main():
     args = parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main = local_rank == 0
 
     import sentencepiece as spm
-    from accelerate import PartialState
 
     sp_model = spm.SentencePieceProcessor()
     sp_model.load(args.sp_model_path)
-    vocab = load_vocab(args.vocab_path)
+    vocab = {}
+    with open(args.vocab_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                vocab[parts[0]] = int(parts[1])
     assert vocab.get("<blank>") == 0, "vocab must have <blank>: 0"
     assert vocab.get("<unk>") == 1, "vocab must have <unk>: 1"
 
@@ -624,20 +449,8 @@ def main():
         attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
     )
     qwen_model = wrapper.model
-    sync_audio_attention(qwen_model)
     processor = wrapper.processor
-    audio_tower = sync_audio_window_config(
-        qwen_model,
-        n_window=args.audio_n_window if args.audio_n_window > 0 else None,
-        n_window_infer=args.audio_n_window_infer if args.audio_n_window_infer > 0 else None,
-    )
-    if audio_tower.n_window_infer < audio_tower.n_window * 2:
-        raise ValueError("audio_n_window_infer 必须 >= audio_n_window * 2")
-    if is_main:
-        print(f"Audio 窗口：n_window={audio_tower.n_window}，n_window_infer={audio_tower.n_window_infer}")
 
-    patch_outer_forward(qwen_model)
-    qwen_model.generation_config = GenerationConfig.from_model_config(qwen_model.config)
     if hasattr(qwen_model, "gradient_checkpointing_enable"):
         try:
             qwen_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -653,7 +466,7 @@ def main():
         heads=args.active_heads,
         train_tasks=args.loss_tasks,
         loss_weights={"llm": args.w_llm, "ctc": args.w_ctc, "rnnt": args.w_rnnt},
-        ctc_config=ctc_train_cfg(args),
+        ctc_config={"adapter_type": args.ctc_adapter},
         stream_train=(args.stream_train == 1),
     )
     model.processor = processor
@@ -665,14 +478,11 @@ def main():
         total = sum(p.numel() for p in model.parameters())
         print(f"可训练参数：{trainable:,} / {total:,}")
 
-    with PartialState().main_process_first():
-        raw_ds = load_dataset(
-            "json",
-            data_files={"train": args.train_file, **({"validation": args.eval_file} if args.eval_file else {})},
-        )
-        ds = raw_ds.map(make_preprocess_fn(processor), num_proc=16, desc="Preprocessing dataset")
-
-    keep = {"prompt", "audio", "target", "prefix_text"}
+    ds = load_dataset(
+        "json",
+        data_files={"train": args.train_file, **({"validation": args.eval_file} if args.eval_file else {})},
+    )
+    keep = {"prompt", "audio", "target", "text"}
     for split in ds.keys():
         drop = [col for col in ds[split].column_names if col not in keep]
         if drop:
@@ -729,7 +539,6 @@ def main():
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[InferableCheckpointCallback(base_model_path=args.model_path, save_heads=args.heads)],
     )
 
     resume_from = (args.resume_from or "").strip()

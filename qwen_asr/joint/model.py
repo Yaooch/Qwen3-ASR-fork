@@ -99,24 +99,13 @@ class Qwen3ASRJointModel(nn.Module):
         load_heads: bool = True,
         **kwargs,
     ) -> "Qwen3ASRJointModel":
-        base = Qwen3ASRModel.from_pretrained(model_path, dtype=dtype, device_map=device_map, **kwargs)
         cfg = read_cfg(model_path)
         if not cfg:
             raise FileNotFoundError(f"未找到配置：{os.path.join(model_path, JOINT_CONFIG)}")
         if "heads" not in cfg:
             raise ValueError(f"joint checkpoint 配置缺少 heads：{os.path.join(model_path, JOINT_CONFIG)}")
 
-        tower = base.model.thinker.audio_tower
-        audio_cfg = base.model.config.thinker_config.audio_config
-        # checkpoint 里的窗口参数要同步到运行时 audio tower 和 HF config。
-        for key in ("audio_n_window", "audio_n_window_infer"):
-            value = cfg.get(key, 0)
-            if value > 0:
-                attr = key.replace("audio_", "")
-                setattr(tower, attr, value)
-                setattr(tower.config, attr, value)
-                setattr(audio_cfg, attr, value)
-
+        base = Qwen3ASRModel.from_pretrained(model_path, dtype=dtype, device_map=device_map, **kwargs)
         model = cls(
             qwen_model=base.model,
             vocab_size=cfg["vocab_size"],

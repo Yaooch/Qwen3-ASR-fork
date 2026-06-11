@@ -20,7 +20,7 @@ qwen3_asr_sft.py  原始 SFT baseline
 bash train.sh "0,1,2,3"
 ```
 
-常用配置直接改 `train.sh` 顶部变量。`--train` 只控制训练和 loss，不训练的已有 CTC/RNNT 头不加载，保存时原样复制。训练不再暴露额外窗口参数，短窗口由 `audio_n_window/audio_n_window_infer` 控制。
+常用配置直接改 `train.sh` 顶部变量。`--train` 只控制训练和 loss，不训练的已有 CTC/RNNT 头不加载，保存时原样复制。Audio window 使用模型配置默认值。
 默认词表路径、SentencePiece 路径和 WER 脚本路径在 `qwen_asr/joint/defaults.py` 中维护。
 
 ## 推理

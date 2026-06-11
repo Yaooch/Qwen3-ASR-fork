@@ -56,9 +56,10 @@ assets/                                      项目文档资源
 - CTC adapter 支持 `mlp/moe` 配置，外部 head 仍固定叫 `ctc`，`joint_config.json` 只记录 `ctc_adapter`，旧 checkpoint 默认 `mlp`。
 - CTC/RNNT 新训练固定接在 `ln_post` 后、`proj1/proj2` 前。
 - 推理不再使用 `joint` 模式；`--mode` 只接受 `llm/ctc/rnnt` 的逗号组合。
-- 联合训练和批量推理入口默认显式传入 `attn_implementation="flash_attention_2"`，并同步 audio encoder 配置，确保 packed batch 的 `cu_seqlens` 分段由 FA2 隔离；未安装 flash-attn 时不要盲目调大 encoder batch。
+- 联合训练和批量推理入口默认从 `qwen_asr/joint/defaults.py` 读取 `DEFAULT_ATTN_IMPLEMENTATION="flash_attention_2"` 并传入加载入口，确保 packed batch 的 `cu_seqlens` 分段由 FA2 隔离；未安装 flash-attn 时不要盲目调大 encoder batch。
 - 训练不再使用 `train_mode/aux_loss_type`；`--train` 只接受 `llm/proj/encoder/ctc/rnnt` 的逗号组合，`proj` 对应 `audio_tower.proj1/act/proj2`。
-- 训练不再使用额外窗口参数；短窗口由 `audio_n_window/audio_n_window_infer` 控制。
+- 训练/推理入口复用 `qwen_asr/joint/defaults.py` 的默认常量、`qwen_asr/joint/model.py` 的配置读取/逗号解析 helper 和 `qwen_asr/joint/encoder.py` 的长度换算 helper，不重复定义这些小工具；训练入口不再 patch 外层 Qwen forward，不做 dataset map 预处理，collator 直接从原始 json 字段构造 batch，checkpoint 保存统一走 `JointTrainer.save_model`。
+- 训练不再暴露 `audio_n_window/audio_n_window_infer` 参数；Audio window 使用模型配置默认值。
 - CTC/RNNT 可通过 `finetuning/train.py --stream_train 1` 启用流式一致训练；默认关闭，训练侧使用 WeNet-like 帧级 chunk mask：整条 feature 过 CNN 后按 encoder 帧计数，默认左看 24 帧、当前 6 帧、右看 2 帧，不使用 FA2 packed-window 折中；若同时训练 LLM，则复用该流式 encoder 输出再过 `proj1/act/proj2`，不额外重跑整条 encoder；训练 batch 不携带未使用的 raw waveform；CTC-only 训练不构造 LLM `input_ids/labels`；训练期验证样例和 CER 也必须走同一 stream mask 路径。
 - 批量推理使用 `--encoder_mode offline/stream/train_mask` 选择 Encoder 路径，兼容保留 `--stream/--no_stream` 作为 `stream/offline` 别名；`train_mask` 仅用于评测流式训练路径的理论上限：整条音频批量提 Mel 后复用训练侧 chunk mask Encoder，不代表线上真实流式行为；`infer_all.sh` 默认使用 `train_mask`，其他推理入口保持原默认值。
 - 推理流式常量固定在 `qwen_asr/joint/defaults.py`，流式 Encoder 执行细节放在 `qwen_asr/joint/encoder.py`；真实流式批量推理需把 batch 内窗口合批送 encoder，CTC/RNNT 流式解码需先拼接 batch 内 chunk 后批量 greedy，避免逐条音频小 batch 导致 GPU 空转。

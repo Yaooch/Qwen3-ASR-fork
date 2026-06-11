@@ -1,6 +1,7 @@
 DEFAULT_PROMPT = ""
 HOTWORD_PROMPT = "转写语音，专属名词优先按列表原文输出。"
 JOINT_CONFIG = "joint_config.json"
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
 
 TRAIN_VOCAB_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/lang_char_large_yue.txt"
 TRAIN_SP_MODEL_PATH = "/nfsdir/hubk/sensevoice_training/wenet/examples/voyah/s0/data/dict/train_960_unigram5000.model"

@@ -9,26 +9,12 @@ import torch
 
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import HotwordRetriever, Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_PROMPT, JOINT_CONFIG
+from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION, DEFAULT_PROMPT, JOINT_CONFIG
+from qwen_asr.joint.model import names
 
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
-
-def parse_csv(value: str, allowed: set, name: str) -> tuple:
-    items = []
-    for part in (value or "").split(","):
-        item = part.strip().lower()
-        if not item:
-            continue
-        if item not in allowed:
-            raise ValueError(f"不支持的 {name}: {item}")
-        if item not in items:
-            items.append(item)
-    if not items:
-        raise ValueError(f"{name} 不能为空")
-    return tuple(items)
 
 
 def parse_args():
@@ -50,29 +36,10 @@ def parse_args():
     parser.add_argument("--stream", action="store_const", const="stream", dest="encoder_mode")
     parser.add_argument("--no_stream", action="store_const", const="offline", dest="encoder_mode")
     args = parser.parse_args()
-    args.modes = parse_csv(args.mode, {"llm", "ctc", "rnnt"}, "mode")
+    args.modes = names(args.mode, {"llm", "ctc", "rnnt"}, "mode")
+    if not args.modes:
+        raise ValueError("mode 不能为空")
     return args
-
-
-DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
-
-
-def torch_dtype(name: str):
-    return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[name]
-
-
-def sync_audio_attention(qwen_model) -> None:
-    audio_tower = qwen_model.thinker.audio_tower
-    audio_tower.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-    qwen_model.config.thinker_config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-    qwen_model.thinker.config.audio_config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
-
-
-def gpu_ids(value: str) -> List[int]:
-    ids = [int(x.strip()) for x in value.split(",") if x.strip()]
-    if not ids:
-        raise ValueError("gpu_ids 不能为空")
-    return ids
 
 
 def load_scp(path: str, default_language: str = None) -> List[Dict]:
@@ -98,10 +65,6 @@ def batches(items: List[Dict], size: int):
         yield items[start: start + size]
 
 
-def is_joint_checkpoint(path: str) -> bool:
-    return os.path.exists(os.path.join(path, JOINT_CONFIG))
-
-
 def make_hotword(args):
     if not args.hotword_file:
         return None
@@ -110,92 +73,59 @@ def make_hotword(args):
     return HotwordRetriever.from_file(args.hotword_file, pinyin_style=args.hotword_pinyin_style)
 
 
-def asr_fields(obj):
-    if obj is None:
-        return "", None
-    if isinstance(obj, str):
-        return obj, None
-    if isinstance(obj, dict):
-        return obj.get("text") or "", obj.get("language")
-    text = getattr(obj, "text", None)
-    return (str(text), getattr(obj, "language", None)) if text is not None else (str(obj), None)
-
-
-def raw_llm_records(model, batch: List[Dict], args) -> List[Dict]:
-    audios = [x["audio"] for x in batch]
-    languages = [x.get("language") for x in batch]
-    outs = model.transcribe(audios, language=languages, context=args.prompt or DEFAULT_PROMPT)
-    if not isinstance(outs, list):
-        outs = [outs]
-    records = []
-    for item, out in zip(batch, outs):
-        text, language = asr_fields(out)
-        records.append({
-            "utt_id": item["utt_id"],
-            "audio": item["audio"],
-            "input_language": item.get("language"),
-            "language": language or item.get("language") or "unknown",
-            "mode": ",".join(args.modes),
-            "text": text,
-            "llm_text": text,
-            "encoder_mode": args.encoder_mode,
-            "stream": False,
-        })
-    return records
-
-
-def joint_records(model, batch: List[Dict], args, hotword) -> List[Dict]:
-    outs = model.transcribe(
-        [x["audio"] for x in batch],
-        modes=args.modes,
-        language=[x.get("language") for x in batch],
-        prompt=args.prompt or DEFAULT_PROMPT,
-        hotword_retriever=hotword,
-        hotword_topk=args.hotword_topk,
-        keep_origin_llm=bool(args.keep_origin_llm),
-        encoder_mode=args.encoder_mode,
-    )
-    if not isinstance(outs, list):
-        outs = [outs]
-    records = []
-    for item, out in zip(batch, outs):
-        out.update({
-            "utt_id": item["utt_id"],
-            "audio": item["audio"],
-            "input_language": item.get("language"),
-            "language": out.get("language") or item.get("language") or "unknown",
-            "mode": ",".join(args.modes),
-            "encoder_mode": args.encoder_mode,
-            "stream": args.encoder_mode == "stream",
-        })
-        records.append(out)
-    return records
-
-
 def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
     shard = load_scp(args.input_scp, default_language=args.language)[rank::world_size]
     if not torch.cuda.is_available():
         raise RuntimeError("当前环境不可用 CUDA。")
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
-    dtype = torch_dtype(args.dtype)
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
-    if is_joint_checkpoint(args.ckpt):
+    rows = []
+    if os.path.exists(os.path.join(args.ckpt, JOINT_CONFIG)):
+        # ---- joint checkpoint 分支 ----
         model = Qwen3ASRJointModel.from_pretrained(
             args.ckpt,
             dtype=dtype,
             device_map=None,
             attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
         ).to(device)
-        sync_audio_attention(model.qwen_model)
         model.eval()
         missing = [name for name in args.modes if name in ("ctc", "rnnt") and name not in model.heads]
         if missing:
             raise RuntimeError(f"checkpoint 没有这些头：{','.join(missing)}")
         hotword = make_hotword(args)
-        infer_batch = lambda batch: joint_records(model, batch, args, hotword)
+
+        with torch.no_grad():
+            for idx, batch in enumerate(batches(shard, args.batch_size), 1):
+                if idx == 1 or idx % 10 == 0:
+                    log(f"进程{rank}推理 batch {idx}")
+                outs = model.transcribe(
+                    [x["audio"] for x in batch],
+                    modes=args.modes,
+                    language=[x.get("language") for x in batch],
+                    prompt=args.prompt or DEFAULT_PROMPT,
+                    hotword_retriever=hotword,
+                    hotword_topk=args.hotword_topk,
+                    keep_origin_llm=bool(args.keep_origin_llm),
+                    encoder_mode=args.encoder_mode,
+                )
+                if not isinstance(outs, list):
+                    outs = [outs]
+                for item, out in zip(batch, outs):
+                    out.update({
+                        "utt_id": item["utt_id"],
+                        "audio": item["audio"],
+                        "input_language": item.get("language"),
+                        "language": out.get("language") or item.get("language") or "unknown",
+                        "mode": ",".join(args.modes),
+                        "encoder_mode": args.encoder_mode,
+                        "stream": args.encoder_mode == "stream",
+                    })
+                    rows.append(out)
     else:
+        # ---- 原始 Qwen checkpoint 分支（仅 LLM） ----
         if args.modes != ("llm",):
             raise RuntimeError("原始 Qwen checkpoint 只支持 --mode llm。")
         if args.encoder_mode != "offline":
@@ -208,36 +138,44 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
             max_inference_batch_size=args.batch_size,
         )
         model.model = model.model.to(device)
-        sync_audio_attention(model.model)
         model.model.eval()
         model.device = torch.device(device)
-        infer_batch = lambda batch: raw_llm_records(model, batch, args)
 
-    rows = []
-    with torch.no_grad():
-        for idx, batch in enumerate(batches(shard, args.batch_size), 1):
-            if idx == 1 or idx % 10 == 0:
-                log(f"进程{rank}推理 batch {idx}")
-            rows.extend(infer_batch(batch))
+        with torch.no_grad():
+            for idx, batch in enumerate(batches(shard, args.batch_size), 1):
+                if idx == 1 or idx % 10 == 0:
+                    log(f"进程{rank}推理 batch {idx}")
+                audios = [x["audio"] for x in batch]
+                languages = [x.get("language") for x in batch]
+                outs = model.transcribe(audios, language=languages, context=args.prompt or DEFAULT_PROMPT)
+                if not isinstance(outs, list):
+                    outs = [outs]
+                for item, out in zip(batch, outs):
+                    if out is None:
+                        text, lang = "", None
+                    elif isinstance(out, str):
+                        text, lang = out, None
+                    elif isinstance(out, dict):
+                        text, lang = out.get("text") or "", out.get("language")
+                    else:
+                        t = getattr(out, "text", None)
+                        text, lang = (str(t), getattr(out, "language", None)) if t is not None else (str(out), None)
+                    rows.append({
+                        "utt_id": item["utt_id"],
+                        "audio": item["audio"],
+                        "input_language": item.get("language"),
+                        "language": lang or item.get("language") or "unknown",
+                        "mode": ",".join(args.modes),
+                        "text": text,
+                        "llm_text": text,
+                        "encoder_mode": args.encoder_mode,
+                        "stream": False,
+                    })
 
     with open(tmp_path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     log(f"进程{rank}完成")
-
-
-def result_specs(rows: List[Dict]):
-    specs = []
-    for name, field in (
-        ("llm", "llm_text"),
-        ("hotword_llm", "hotword_llm_text"),
-        ("ctc", "ctc_text"),
-        ("rnnt", "rnnt_text"),
-    ):
-        if any(row.get(field) for row in rows):
-            specs.append((name, f"results_{name}.txt", field))
-    return specs or [("text", "results_text.txt", "text")]
-
 
 def merge(tmp_files: List[str], output_dir: str, encoder_mode: str):
     os.makedirs(output_dir, exist_ok=True)
@@ -251,9 +189,22 @@ def merge(tmp_files: List[str], output_dir: str, encoder_mode: str):
             rows.extend(json.loads(line) for line in f if line.strip())
     rows.sort(key=lambda x: x["utt_id"])
 
+    # 根据结果中实际存在的字段确定输出规格
+    specs = []
+    for name, field in (
+        ("llm", "llm_text"),
+        ("hotword_llm", "hotword_llm_text"),
+        ("ctc", "ctc_text"),
+        ("rnnt", "rnnt_text"),
+    ):
+        if any(row.get(field) for row in rows):
+            specs.append((name, f"results_{name}.txt", field))
+    if not specs:
+        specs = [("text", "results_text.txt", "text")]
+
     paths = {}
     files = []
-    for name, filename, field in result_specs(rows):
+    for name, filename, field in specs:
         path = os.path.join(output_dir, filename)
         paths[name] = path
         files.append((field, open(path, "w", encoding="utf-8")))
@@ -283,7 +234,9 @@ def main():
     items = load_scp(args.input_scp, default_language=args.language)
     if not items:
         raise ValueError(f"scp 文件中没有可用样本：{args.input_scp}")
-    ids = gpu_ids(args.gpu_ids)
+    ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip()]
+    if not ids:
+        raise ValueError("gpu_ids 不能为空")
     os.makedirs(args.output_dir, exist_ok=True)
     tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
 
