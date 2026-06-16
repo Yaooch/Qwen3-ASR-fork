@@ -318,6 +318,9 @@ class JointTrainer(Trainer):
             src = os.path.join(self.head_source, name)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(output_dir, name))
+        gen = getattr(base.qwen_model, "generation_config", None)
+        if gen is not None and not getattr(gen, "do_sample", False):
+            gen.temperature = None
         base.qwen_model.save_pretrained(output_dir, safe_serialization=True)
         base.save_aux(output_dir, heads=self.save_heads, copy_heads_from=self.head_source)
         old = os.path.join(output_dir, "pytorch_model.bin")

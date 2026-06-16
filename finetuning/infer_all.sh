@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-rnnt-6/checkpoint-24000"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_rnnt_6/train_mode"
-mode="rnnt"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/train_mode"
+mode="llm,ctc"
 stage="all" 
 gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=256

@@ -272,7 +272,12 @@ class Qwen3ASRJointModel(nn.Module):
                 )
             else:
                 hs, llm, lens = encode_offline(tower, feats, feat_lengths, need_llm)
-            llm_list = [] if not need_llm else [llm[sum(lens[:i]).item():sum(lens[:i + 1]).item()] for i in range(len(lens))]
+            if need_llm:
+                ends = lens.cumsum(0).tolist()
+                starts = [0] + ends[:-1]
+                llm_list = [llm[start:end] for start, end in zip(starts, ends)]
+            else:
+                llm_list = []
 
         for name in ("ctc", "rnnt"):
             if name in modes:
