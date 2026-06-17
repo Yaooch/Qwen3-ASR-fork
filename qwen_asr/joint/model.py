@@ -18,6 +18,7 @@ from .defaults import (
     hotword_prompt,
 )
 from .encoder import encode_offline, encode_stream, encode_train_mask, feature_lens
+from .hotword_scorer import batch_tokenize_hotwords
 from .rnnt import RNNT
 
 ENCODER_MODES = {"offline", "stream", "train_mask"}
@@ -209,7 +210,12 @@ class Qwen3ASRJointModel(nn.Module):
         language: Optional[Union[str, List[str]]] = None,
         prompt: Optional[str] = None,
         hotword_retriever=None,
+        hotword_scorer=None,
+        hotword_list: Optional[List[str]] = None,
         hotword_topk: int = 10,
+        hotword_threshold: float = 0.5,
+        max_hotwords: int = 0,
+        hotword_chunk_size: int = 256,
         keep_origin_llm: bool = True,
         stream: bool = False,
         encoder_mode: Optional[str] = None,
@@ -285,12 +291,58 @@ class Qwen3ASRJointModel(nn.Module):
                     rec[f"{name}_text"] = text
 
         base_prompt = prompt or DEFAULT_PROMPT
-        if need_llm and (hotword_retriever is None or keep_origin_llm):
+        if need_llm and ((hotword_retriever is None and hotword_scorer is None) or keep_origin_llm):
             for rec, out in zip(records, self.decode_llm(llm_list, [base_prompt] * len(wavs), langs, kwargs.get("max_new_tokens"))):
                 rec["llm_text"] = out["text"]
                 rec["language"] = out["language"] or rec["language"]
 
-        if need_llm and hotword_retriever is not None:
+        if need_llm and hotword_scorer is not None:
+            words_all = list(hotword_list or [])
+            if words_all:
+                scorer_device = next(hotword_scorer.parameters()).device
+                ids, token_mask, valid = batch_tokenize_hotwords(
+                    self.processor.tokenizer,
+                    [words_all] * len(records),
+                    max_len=hotword_scorer.max_hotword_len,
+                    device=scorer_device,
+                )
+                emb_device = next(self.qwen_model.parameters()).device
+                embeds = self.qwen_model.thinker.get_input_embeddings()(ids.to(emb_device))
+                embeds = embeds.detach().to(scorer_device)
+                logits = hotword_scorer(
+                    hs.to(scorer_device),
+                    lens.to(scorer_device),
+                    embeds,
+                    token_mask,
+                    valid,
+                    chunk_size=hotword_chunk_size,
+                )
+                probs = torch.sigmoid(logits).detach().cpu()
+                valid_cpu = valid.detach().cpu()
+            else:
+                probs = None
+                valid_cpu = None
+
+            contexts = []
+            for idx, rec in enumerate(records):
+                pairs = []
+                if probs is not None:
+                    for pos, word in enumerate(words_all):
+                        if bool(valid_cpu[idx, pos]) and float(probs[idx, pos]) >= float(hotword_threshold):
+                            pairs.append((word, float(probs[idx, pos])))
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                if max_hotwords and max_hotwords > 0:
+                    pairs = pairs[:max_hotwords]
+                words = [word for word, _score in pairs]
+                rec["hotwords"] = words
+                rec["hotword_scores"] = {word: score for word, score in pairs}
+                rec["hotword_source"] = "scorer"
+                contexts.append(hotword_prompt(words, base_prompt))
+            for rec, out in zip(records, self.decode_llm(llm_list, contexts, langs, kwargs.get("max_new_tokens"))):
+                rec["hotword_llm_text"] = out["text"]
+                rec["language"] = out["language"] or rec["language"]
+
+        elif need_llm and hotword_retriever is not None:
             contexts = []
             for rec in records:
                 src = next((name for name in ("ctc", "rnnt") if rec.get(f"{name}_text")), "")

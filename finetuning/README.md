@@ -6,8 +6,10 @@
 
 ```text
 train.py          联合训练入口
+train_hotword_scorer.py Encoder 热词打分器训练入口
 infer.py          批量推理入口
 train.sh          训练启动脚本
+train_hotword_scorer.sh Encoder 热词打分器训练脚本
 infer.sh          推理 + WER + 拼音评估脚本
 infer_all.sh      多数据集批量推理和汇总脚本
 hotword_eval.sh   热词专项评估脚本
@@ -22,6 +24,7 @@ bash train.sh "0,1,2,3"
 
 常用配置直接改 `train.sh` 顶部变量。`--train` 只控制训练和 loss，不训练的已有 CTC/RNNT 头不加载，保存时原样复制。Audio window 使用模型配置默认值。
 默认词表路径、SentencePiece 路径和 WER 脚本路径在 `qwen_asr/joint/defaults.py` 中维护。
+Encoder 热词打分器训练使用 `train_hotword_scorer.sh`，需要传 `--model_path/--train_file/--output_dir`；多 GPU 会自动用 `torch.distributed.run`，`--batch_size` 是每卡 batch，TensorBoard 日志目录通过 `--logging_dir` 设置。
 
 ## 推理
 
@@ -37,7 +40,7 @@ bash infer.sh \
 
 `--mode` 只支持 `llm/ctc/rnnt` 的逗号组合，不再支持 `joint`。`--encoder_mode` 支持 `offline/stream/train_mask`：`offline` 使用整条音频离线前向，`stream` 使用真实 chunk-wise 流式路径，`train_mask` 使用与流式训练一致的整条 Mel + chunk mask Encoder 路径评测理论上限。`--stream/--no_stream` 分别兼容映射到 `stream/offline`。具体窗口参数在 `qwen_asr/joint/defaults.py` 中修改。
 
-热词评估会同时输出默认 LLM 和热词 prompt LLM，并比较两者的热词识别变化。
+热词评估会同时输出默认 LLM 和热词 prompt LLM，并比较两者的热词识别变化。传 `--hotword_scorer_ckpt` 时，推理直接用 Encoder 热词打分器按 `--hotword_threshold` 从 `--hotword_file` 中筛选热词，`--max_hotwords 0` 表示不限制数量。
 
 ## 批量推理
 

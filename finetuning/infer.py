@@ -10,6 +10,7 @@ import torch
 from qwen_asr import Qwen3ASRModel
 from qwen_asr.joint import HotwordRetriever, Qwen3ASRJointModel
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION, DEFAULT_PROMPT, JOINT_CONFIG
+from qwen_asr.joint.hotword_scorer import HotwordScorer, read_hotwords
 from qwen_asr.joint.model import names
 
 
@@ -30,6 +31,10 @@ def parse_args():
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--hotword_file", default=None)
     parser.add_argument("--hotword_topk", type=int, default=10)
+    parser.add_argument("--hotword_scorer_ckpt", default=None)
+    parser.add_argument("--hotword_threshold", type=float, default=0.5)
+    parser.add_argument("--max_hotwords", type=int, default=0, help="0 表示不限制，只按阈值筛选")
+    parser.add_argument("--hotword_chunk_size", type=int, default=256)
     parser.add_argument("--keep_origin_llm", type=int, choices=[0, 1], default=1)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
     parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
@@ -66,11 +71,27 @@ def batches(items: List[Dict], size: int):
 
 
 def make_hotword(args):
+    if args.hotword_scorer_ckpt:
+        return None
     if not args.hotword_file:
         return None
     if "llm" not in args.modes or not ({"ctc", "rnnt"} & set(args.modes)):
-        raise ValueError("热词 prompt 需要同时跑 llm 和 ctc/rnnt，例如 --mode llm,ctc")
+        raise ValueError("拼音热词 prompt 需要同时跑 llm 和 ctc/rnnt，例如 --mode llm,ctc")
     return HotwordRetriever.from_file(args.hotword_file, pinyin_style=args.hotword_pinyin_style)
+
+
+def make_hotword_scorer(args, device):
+    if not args.hotword_scorer_ckpt:
+        return None, []
+    if "llm" not in args.modes:
+        raise ValueError("热词 scorer 需要启用 llm，用于热词 prompt 二次解码。")
+    if not args.hotword_file:
+        raise ValueError("热词 scorer 需要 --hotword_file 提供候选热词库。")
+    scorer, extra = HotwordScorer.load(args.hotword_scorer_ckpt, map_location="cpu")
+    scorer.to(device).eval()
+    words = read_hotwords(args.hotword_file)
+    log(f"已加载热词 scorer：{args.hotword_scorer_ckpt}，热词数 {len(words)}，训练信息 {extra}")
+    return scorer, words
 
 
 def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
@@ -96,6 +117,7 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
         if missing:
             raise RuntimeError(f"checkpoint 没有这些头：{','.join(missing)}")
         hotword = make_hotword(args)
+        hotword_scorer, hotword_list = make_hotword_scorer(args, device)
 
         with torch.no_grad():
             for idx, batch in enumerate(batches(shard, args.batch_size), 1):
@@ -107,7 +129,12 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
                     language=[x.get("language") for x in batch],
                     prompt=args.prompt or DEFAULT_PROMPT,
                     hotword_retriever=hotword,
+                    hotword_scorer=hotword_scorer,
+                    hotword_list=hotword_list,
                     hotword_topk=args.hotword_topk,
+                    hotword_threshold=args.hotword_threshold,
+                    max_hotwords=args.max_hotwords,
+                    hotword_chunk_size=args.hotword_chunk_size,
                     keep_origin_llm=bool(args.keep_origin_llm),
                     encoder_mode=args.encoder_mode,
                 )
@@ -126,6 +153,8 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
                     rows.append(out)
     else:
         # ---- 原始 Qwen checkpoint 分支（仅 LLM） ----
+        if args.hotword_scorer_ckpt:
+            raise RuntimeError("原始 Qwen checkpoint 不支持热词 scorer，请使用 joint checkpoint。")
         if args.modes != ("llm",):
             raise RuntimeError("原始 Qwen checkpoint 只支持 --mode llm。")
         if args.encoder_mode != "offline":

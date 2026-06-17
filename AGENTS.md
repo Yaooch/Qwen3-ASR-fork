@@ -19,7 +19,8 @@ qwen_asr/joint/model.py                      联合 CTC/RNNT 模型、训练 for
 qwen_asr/joint/encoder.py                    联合模型专用 Encoder 路径、长度换算和流式 KV cache
 qwen_asr/joint/ctc.py                        CTC 辅助头
 qwen_asr/joint/rnnt.py                       RNNT 辅助头和 cached greedy 解码
-qwen_asr/joint/hotword.py                    热词召回
+qwen_asr/joint/hotword.py                    拼音热词召回
+qwen_asr/joint/hotword_scorer.py             Encoder 热词打分器
 qwen_asr/joint/defaults.py                   默认提示词和内部推理常量
 qwen_asr/tools/hotword_eval.py               热词评估
 qwen_asr/tools/pinyin_eval.py                拼音评估
@@ -30,9 +31,11 @@ qwen_asr/tools/cut_contextasr_dialogue.py    ContextASR Dialogue 按时间戳切
 qwen_asr/tools/split_contextasr_dialogue_eval.py ContextASR Dialogue 抽取热词测试集和验证集
 qwen_asr/tools/split_hotword_test_by_lang.py 热词测试集按中文/英文拆分
 finetuning/train.py                          联合训练入口
+finetuning/train_hotword_scorer.py           Encoder 热词打分器训练入口
 finetuning/infer.py                          批量推理入口
 finetuning/qwen3_asr_sft.py                  原始 SFT baseline
 finetuning/train.sh                          训练脚本
+finetuning/train_hotword_scorer.sh           Encoder 热词打分器训练脚本
 finetuning/infer.sh                          推理脚本
 finetuning/infer_all.sh                      多数据集批量推理脚本
 finetuning/hotword_eval.sh                   热词评估脚本
@@ -67,7 +70,8 @@ assets/                                      项目文档资源
 - 新 joint checkpoint 使用 `joint_config.json` 记录 `heads` 等结构信息；`--train` 只控制训练/loss，不训练的已有头不加载、保存时从源 checkpoint 复制。
 - 训练输出根目录和 `checkpoint-*` 都必须可直接推理，保存时需要包含 processor/tokenizer 相关配置文件，并保持 `config.json` 与 `joint_config.json` 的 audio window 参数一致。
 - 训练 TensorBoard 日志路径通过 `finetuning/train.py --logging_dir` 控制，`finetuning/train.sh` 顶部保留 `logging_dir` 变量；训练期验证需记录 `eval_ctc_cer/eval_rnnt_cer`。
-- 热词召回固定使用 pinyin，缺少 `pypinyin` 直接报错，不做静默兜底。
+- 拼音热词召回保留在 `qwen_asr/joint/hotword.py`，缺少 `pypinyin` 直接报错，不做静默兜底。
+- Encoder 热词打分器放在 `qwen_asr/joint/hotword_scorer.py`，通过 `finetuning/train_hotword_scorer.py` 使用真实 `encode_stream` 产出的 `hs` 训练，shell 入口为 `finetuning/train_hotword_scorer.sh`，多 GPU 时自动用 `torch.distributed.run` 启动且 `--batch_size` 表示每卡 batch，TensorBoard 日志目录通过 `--logging_dir` 控制；推理传 `--hotword_scorer_ckpt` 后直接用 scorer 对 `--hotword_file` 全库按阈值筛选热词，不再依赖 CTC/RNNT 文本召回，`--max_hotwords 0` 表示不限制数量。
 - 热词推理可用 `--keep_origin_llm 0/1` 控制是否保留默认 LLM 输出，默认保留；热词评估只比较默认 LLM 与热词 prompt LLM；推理热词库和评估目标热词分开，评估目标文件使用 `utt_id<TAB>热词1,热词2` 格式；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
 - 热词测试集按语言拆分时，`wav.scp/text/utt_hotword.txt` 按 `utt_id` 或音频路径判断语言，默认输出到测试集目录下的 `Mandarin/` 和 `English/`，`hotword.txt` 从拆分后的目标热词重新生成。
 - 拼音评估需兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本` 两种格式；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。

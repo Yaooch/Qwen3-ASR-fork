@@ -18,6 +18,10 @@ dtype="bf16"
 language=""
 hotword_file=""
 hotword_topk=5
+hotword_scorer_ckpt=""
+hotword_threshold=0.5
+max_hotwords=0
+hotword_chunk_size=256
 hotword_pinyin_style="normal"
 encoder_mode="stream"
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
@@ -30,6 +34,8 @@ declare -A arg_map=(
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
     [--dtype]=dtype [--language]=language
     [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--hotword_scorer_ckpt]=hotword_scorer_ckpt [--hotword_threshold]=hotword_threshold
+    [--max_hotwords]=max_hotwords [--hotword_chunk_size]=hotword_chunk_size
     [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script
     [--pinyin_style]=pinyin_style [--pinyin_topk_badcases]=pinyin_topk_badcases
@@ -59,7 +65,11 @@ usage() {
     echo "  --dtype               模型精度：bf16 / fp16 / fp32"
     echo "  --language            默认语种，可不传"
     echo "  --hotword_file        热词文件，可不传"
-    echo "  --hotword_topk        热词召回数量"
+    echo "  --hotword_topk        拼音热词召回数量"
+    echo "  --hotword_scorer_ckpt Encoder 热词打分器 checkpoint，可不传"
+    echo "  --hotword_threshold   scorer 概率阈值，默认 0.5"
+    echo "  --max_hotwords        scorer 最大热词数，0 表示不限制"
+    echo "  --hotword_chunk_size  scorer 热词分块大小"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
     echo "  --encoder_mode        Encoder 路径：offline / stream / train_mask"
     echo "  --stream              等价于 --encoder_mode stream"
@@ -202,6 +212,12 @@ if [[ -n "${hotword_file}" ]]; then
     infer_cmd+=(--hotword_file "${hotword_file}")
     infer_cmd+=(--hotword_topk "${hotword_topk}")
     infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
+fi
+if [[ -n "${hotword_scorer_ckpt}" ]]; then
+    infer_cmd+=(--hotword_scorer_ckpt "${hotword_scorer_ckpt}")
+    infer_cmd+=(--hotword_threshold "${hotword_threshold}")
+    infer_cmd+=(--max_hotwords "${max_hotwords}")
+    infer_cmd+=(--hotword_chunk_size "${hotword_chunk_size}")
 fi
 
 collect_result_targets() {
