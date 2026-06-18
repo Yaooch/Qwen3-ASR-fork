@@ -12,24 +12,26 @@ gpu_ids="0,1,2,3,4,5,6,7"
 model_path="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/contextasr/eval_contextasr.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_hotword_scorer"
+output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_hotword_scorer_2"
 
 sr=16000
 batch_size=32
-epochs=1
-lr=1e-3
+epochs=5
+lr=1e-4
 weight_decay=0.01
-pos_weight=6.0
+pos_weight=1.0
 threshold=0.5
 max_audio_sec=100000
 max_hotword_len=24
+scorer_dim=384
 num_heads=8
+num_layers=2
 ffn_mult=2
 dropout=0.1
 chunk_hotwords=256
 num_workers=0
 log_steps=20
-logging_dir="./logs/logs_ctc_50_hotword_scorer"
+logging_dir="./logs/logs_ctc_50_hotword_scorer_2"
 
 declare -A arg_map=(
     [--python_bin]=python_bin [--gpu_ids]=gpu_ids
@@ -37,7 +39,8 @@ declare -A arg_map=(
     [--output_dir]=output_dir [--sr]=sr [--batch_size]=batch_size [--epochs]=epochs
     [--lr]=lr [--weight_decay]=weight_decay [--pos_weight]=pos_weight [--threshold]=threshold
     [--max_audio_sec]=max_audio_sec [--max_hotword_len]=max_hotword_len
-    [--num_heads]=num_heads [--ffn_mult]=ffn_mult [--dropout]=dropout
+    [--scorer_dim]=scorer_dim [--num_heads]=num_heads [--num_layers]=num_layers
+    [--ffn_mult]=ffn_mult [--dropout]=dropout
     [--chunk_hotwords]=chunk_hotwords [--num_workers]=num_workers [--log_steps]=log_steps
     [--logging_dir]=logging_dir
 )
@@ -134,7 +137,9 @@ train_args=(
     --threshold "${threshold}"
     --max_audio_sec "${max_audio_sec}"
     --max_hotword_len "${max_hotword_len}"
+    --scorer_dim "${scorer_dim}"
     --num_heads "${num_heads}"
+    --num_layers "${num_layers}"
     --ffn_mult "${ffn_mult}"
     --dropout "${dropout}"
     --chunk_hotwords "${chunk_hotwords}"

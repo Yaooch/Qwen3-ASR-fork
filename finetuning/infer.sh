@@ -6,23 +6,16 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 stage="all"
 mode="llm,ctc"
 input_scp="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/wav.scp"
 ref_dir="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/text"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_1/hotword_aishell/ctc_no_hotword"
-gpu_ids="0,1,2,3"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/hotword_aishell/"
+gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=128
 dtype="bf16"
 language=""
-hotword_file=""
-hotword_topk=5
-hotword_scorer_ckpt=""
-hotword_threshold=0.5
-max_hotwords=0
-hotword_chunk_size=256
-hotword_pinyin_style="normal"
 encoder_mode="stream"
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
 pinyin_style="tone3"
@@ -33,9 +26,6 @@ declare -A arg_map=(
     [--ckpt]=ckpt [--stage]=stage [--mode]=mode [--input_scp]=input_scp
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
     [--dtype]=dtype [--language]=language
-    [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
-    [--hotword_scorer_ckpt]=hotword_scorer_ckpt [--hotword_threshold]=hotword_threshold
-    [--max_hotwords]=max_hotwords [--hotword_chunk_size]=hotword_chunk_size
     [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script
     [--pinyin_style]=pinyin_style [--pinyin_topk_badcases]=pinyin_topk_badcases
@@ -64,13 +54,6 @@ usage() {
     echo "  --batch_size          每个进程的 batch size"
     echo "  --dtype               模型精度：bf16 / fp16 / fp32"
     echo "  --language            默认语种，可不传"
-    echo "  --hotword_file        热词文件，可不传"
-    echo "  --hotword_topk        拼音热词召回数量"
-    echo "  --hotword_scorer_ckpt Encoder 热词打分器 checkpoint，可不传"
-    echo "  --hotword_threshold   scorer 概率阈值，默认 0.5"
-    echo "  --max_hotwords        scorer 最大热词数，0 表示不限制"
-    echo "  --hotword_chunk_size  scorer 热词分块大小"
-    echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
     echo "  --encoder_mode        Encoder 路径：offline / stream / train_mask"
     echo "  --stream              等价于 --encoder_mode stream"
     echo "  --no_stream           等价于 --encoder_mode offline"
@@ -208,18 +191,6 @@ if [[ -n "${language}" ]]; then
     infer_cmd+=(--language "${language}")
 fi
 
-if [[ -n "${hotword_file}" ]]; then
-    infer_cmd+=(--hotword_file "${hotword_file}")
-    infer_cmd+=(--hotword_topk "${hotword_topk}")
-    infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
-fi
-if [[ -n "${hotword_scorer_ckpt}" ]]; then
-    infer_cmd+=(--hotword_scorer_ckpt "${hotword_scorer_ckpt}")
-    infer_cmd+=(--hotword_threshold "${hotword_threshold}")
-    infer_cmd+=(--max_hotwords "${max_hotwords}")
-    infer_cmd+=(--hotword_chunk_size "${hotword_chunk_size}")
-fi
-
 collect_result_targets() {
     targets=()
     if [[ -f "${output_dir}/results_ctc.txt" ]]; then
@@ -230,9 +201,6 @@ collect_result_targets() {
     fi
     if [[ -f "${output_dir}/results_llm.txt" ]]; then
         targets+=("llm:${output_dir}/results_llm.txt")
-    fi
-    if [[ -f "${output_dir}/results_hotword_llm.txt" ]]; then
-        targets+=("hotword_llm:${output_dir}/results_hotword_llm.txt")
     fi
 }
 

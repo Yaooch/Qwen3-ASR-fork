@@ -5,22 +5,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
-# baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
+baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
 # baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
 
 stage="all"
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-4"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_4/aishell_hotword"
-gpu_ids="0,1,2,3,4,5,6,7"
-batch_size=64
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/pinyin/ContextASR"
+gpu_ids="0,1,2,3"
+batch_size=32
 dtype="bf16"
-hotword_topk=5
+hotword_topk=10
 hotword_pinyin_style="normal"
+# hotword_scorer_ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50/hotword_scorer_best.pt"
+hotword_scorer_ckpt=""
+hotword_threshold=0.5
+max_hotwords=30
+hotword_chunk_size=32
 encoder_mode="stream"
 
 declare -A arg_map=(
@@ -30,13 +35,17 @@ declare -A arg_map=(
     [--output_dir]=output_dir
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
     [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--hotword_scorer_ckpt]=hotword_scorer_ckpt [--hotword_threshold]=hotword_threshold
+    [--max_hotwords]=max_hotwords [--hotword_chunk_size]=hotword_chunk_size
     [--encoder_mode]=encoder_mode
 )
 
 usage() {
     echo "用法：bash $0 --ckpt CKPT --input_scp wav.scp --ref_path text --hotword_file hotwords.txt --target_hotword_file utt_hotword.txt --output_dir out"
-    echo "可选：--stage all|infer|eval"
-    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --encoder_mode offline|stream|train_mask"
+    echo "可选：--stage all|infer|eval --gpu_ids 0,1 --batch_size 8"
+    echo "      --hotword_topk 5 --hotword_pinyin_style normal|tone3"
+    echo "      --hotword_scorer_ckpt scorer.pt --hotword_threshold 0.5 --max_hotwords 0"
+    echo "      --encoder_mode offline|stream|train_mask"
 }
 
 set_arg() {
@@ -103,10 +112,18 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --batch_size "${batch_size}"
         --dtype "${dtype}"
         --encoder_mode "${encoder_mode}"
-        --hotword_file "${hotword_file}"
-        --hotword_topk "${hotword_topk}"
-        --hotword_pinyin_style "${hotword_pinyin_style}"
     )
+    if [[ -n "${hotword_scorer_ckpt}" ]]; then
+        infer_cmd+=(--hotword_scorer_ckpt "${hotword_scorer_ckpt}")
+        infer_cmd+=(--hotword_threshold "${hotword_threshold}")
+        infer_cmd+=(--max_hotwords "${max_hotwords}")
+        infer_cmd+=(--hotword_chunk_size "${hotword_chunk_size}")
+        infer_cmd+=(--hotword_file "${hotword_file}")
+    else
+        infer_cmd+=(--hotword_file "${hotword_file}")
+        infer_cmd+=(--hotword_topk "${hotword_topk}")
+        infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
+    fi
     echo "运行热词提示推理：${output_dir}"
     "${infer_cmd[@]}"
 fi

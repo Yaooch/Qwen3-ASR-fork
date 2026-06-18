@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import librosa
@@ -22,6 +23,11 @@ from .hotword_scorer import batch_tokenize_hotwords
 from .rnnt import RNNT
 
 ENCODER_MODES = {"offline", "stream", "train_mask"}
+
+
+def sync_cuda_for_timing(device):
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def names(values, allowed, label):
@@ -215,7 +221,7 @@ class Qwen3ASRJointModel(nn.Module):
         hotword_topk: int = 10,
         hotword_threshold: float = 0.5,
         max_hotwords: int = 0,
-        hotword_chunk_size: int = 256,
+        hotword_chunk_size: int = 64,
         keep_origin_llm: bool = True,
         stream: bool = False,
         encoder_mode: Optional[str] = None,
@@ -298,33 +304,41 @@ class Qwen3ASRJointModel(nn.Module):
 
         if need_llm and hotword_scorer is not None:
             words_all = list(hotword_list or [])
+            scorer_device = next(hotword_scorer.parameters()).device
+            sync_cuda_for_timing(scorer_device)
+            hotword_t0 = time.perf_counter()
             if words_all:
-                scorer_device = next(hotword_scorer.parameters()).device
                 ids, token_mask, valid = batch_tokenize_hotwords(
                     self.processor.tokenizer,
-                    [words_all] * len(records),
+                    [words_all],
                     max_len=hotword_scorer.max_hotword_len,
                     device=scorer_device,
                 )
                 emb_device = next(self.qwen_model.parameters()).device
                 embeds = self.qwen_model.thinker.get_input_embeddings()(ids.to(emb_device))
                 embeds = embeds.detach().to(scorer_device)
-                logits = hotword_scorer(
-                    hs.to(scorer_device),
-                    lens.to(scorer_device),
-                    embeds,
-                    token_mask,
-                    valid,
-                    chunk_size=hotword_chunk_size,
-                )
-                probs = torch.sigmoid(logits).detach().cpu()
-                valid_cpu = valid.detach().cpu()
+                hs_scorer = hs.to(scorer_device)
+                lens_scorer = lens.to(scorer_device)
+                probs_rows = []
+                for idx in range(len(records)):
+                    logits = hotword_scorer(
+                        hs_scorer[idx:idx + 1],
+                        lens_scorer[idx:idx + 1],
+                        embeds,
+                        token_mask,
+                        valid,
+                        chunk_size=hotword_chunk_size,
+                    )
+                    probs_rows.append(torch.sigmoid(logits).detach().cpu())
+                sync_cuda_for_timing(scorer_device)
+                probs = torch.cat(probs_rows, dim=0)
+                valid_cpu = valid.detach().cpu().expand(len(records), -1)
             else:
                 probs = None
                 valid_cpu = None
 
-            contexts = []
-            for idx, rec in enumerate(records):
+            selected = []
+            for idx in range(len(records)):
                 pairs = []
                 if probs is not None:
                     for pos, word in enumerate(words_all):
@@ -333,10 +347,19 @@ class Qwen3ASRJointModel(nn.Module):
                 pairs.sort(key=lambda x: x[1], reverse=True)
                 if max_hotwords and max_hotwords > 0:
                     pairs = pairs[:max_hotwords]
+                selected.append(pairs)
+            hotword_batch_ms = (time.perf_counter() - hotword_t0) * 1000.0
+            hotword_ms = hotword_batch_ms / max(1, len(records))
+
+            contexts = []
+            for rec, pairs in zip(records, selected):
                 words = [word for word, _score in pairs]
                 rec["hotwords"] = words
                 rec["hotword_scores"] = {word: score for word, score in pairs}
                 rec["hotword_source"] = "scorer"
+                rec["hotword_retrieval_ms"] = hotword_ms
+                rec["hotword_retrieval_batch_ms"] = hotword_batch_ms
+                rec["hotword_candidate_count"] = len(words_all)
                 contexts.append(hotword_prompt(words, base_prompt))
             for rec, out in zip(records, self.decode_llm(llm_list, contexts, langs, kwargs.get("max_new_tokens"))):
                 rec["hotword_llm_text"] = out["text"]
@@ -344,11 +367,16 @@ class Qwen3ASRJointModel(nn.Module):
 
         elif need_llm and hotword_retriever is not None:
             contexts = []
+            candidate_count = len(getattr(hotword_retriever, "hotwords", []))
             for rec in records:
                 src = next((name for name in ("ctc", "rnnt") if rec.get(f"{name}_text")), "")
+                hotword_t0 = time.perf_counter()
                 words = hotword_retriever.retrieve(rec.get(f"{src}_text", ""), topk=hotword_topk) if src else []
+                hotword_ms = (time.perf_counter() - hotword_t0) * 1000.0
                 rec["hotwords"] = words
                 rec["hotword_source"] = src
+                rec["hotword_retrieval_ms"] = hotword_ms
+                rec["hotword_candidate_count"] = candidate_count
                 contexts.append(hotword_prompt(words, base_prompt))
             for rec, out in zip(records, self.decode_llm(llm_list, contexts, langs, kwargs.get("max_new_tokens"))):
                 rec["hotword_llm_text"] = out["text"]

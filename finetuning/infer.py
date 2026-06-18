@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument("--hotword_scorer_ckpt", default=None)
     parser.add_argument("--hotword_threshold", type=float, default=0.5)
     parser.add_argument("--max_hotwords", type=int, default=0, help="0 表示不限制，只按阈值筛选")
-    parser.add_argument("--hotword_chunk_size", type=int, default=256)
+    parser.add_argument("--hotword_chunk_size", type=int, default=64)
     parser.add_argument("--keep_origin_llm", type=int, choices=[0, 1], default=1)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
     parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
@@ -80,7 +80,7 @@ def make_hotword(args):
     return HotwordRetriever.from_file(args.hotword_file, pinyin_style=args.hotword_pinyin_style)
 
 
-def make_hotword_scorer(args, device):
+def make_hotword_scorer(args, device, dtype):
     if not args.hotword_scorer_ckpt:
         return None, []
     if "llm" not in args.modes:
@@ -88,7 +88,7 @@ def make_hotword_scorer(args, device):
     if not args.hotword_file:
         raise ValueError("热词 scorer 需要 --hotword_file 提供候选热词库。")
     scorer, extra = HotwordScorer.load(args.hotword_scorer_ckpt, map_location="cpu")
-    scorer.to(device).eval()
+    scorer.to(device=device, dtype=dtype).eval()
     words = read_hotwords(args.hotword_file)
     log(f"已加载热词 scorer：{args.hotword_scorer_ckpt}，热词数 {len(words)}，训练信息 {extra}")
     return scorer, words
@@ -117,7 +117,7 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
         if missing:
             raise RuntimeError(f"checkpoint 没有这些头：{','.join(missing)}")
         hotword = make_hotword(args)
-        hotword_scorer, hotword_list = make_hotword_scorer(args, device)
+        hotword_scorer, hotword_list = make_hotword_scorer(args, device, dtype)
 
         with torch.no_grad():
             for idx, batch in enumerate(batches(shard, args.batch_size), 1):

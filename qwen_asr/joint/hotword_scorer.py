@@ -96,6 +96,31 @@ def read_hotwords(path: str) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+class HotwordBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, ffn_mult: int, dropout: float):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * ffn_mult, dim),
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, key: torch.Tensor, key_pad: torch.Tensor) -> torch.Tensor:
+        attn, _ = self.cross_attn(x, key, key, key_padding_mask=key_pad, need_weights=False)
+        x = self.attn_norm(x + self.drop(attn))
+        return self.ffn_norm(x + self.drop(self.ffn(x)))
+
+
 class HotwordScorer(nn.Module):
     """轻量 cross-attention 热词分类器。
 
@@ -106,7 +131,9 @@ class HotwordScorer(nn.Module):
         self,
         encoder_dim: int,
         embed_dim: int,
+        scorer_dim: int = 384,
         num_heads: int = 8,
+        num_layers: int = 2,
         ffn_mult: int = 2,
         dropout: float = 0.1,
         max_hotword_len: int = 24,
@@ -114,40 +141,44 @@ class HotwordScorer(nn.Module):
         super().__init__()
         self.encoder_dim = int(encoder_dim)
         self.embed_dim = int(embed_dim)
+        self.scorer_dim = int(scorer_dim)
         self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
         self.ffn_mult = int(ffn_mult)
         self.dropout_p = float(dropout)
         self.max_hotword_len = int(max_hotword_len)
 
-        self.audio_adapter = nn.Linear(self.encoder_dim, self.embed_dim)
-        self.pos = nn.Parameter(torch.zeros(self.max_hotword_len, self.embed_dim))
-        self.cross_attn = nn.MultiheadAttention(
-            self.embed_dim,
-            self.num_heads,
-            dropout=self.dropout_p,
-            batch_first=True,
+        self.audio_adapter = nn.Sequential(
+            nn.LayerNorm(self.encoder_dim),
+            nn.Linear(self.encoder_dim, self.scorer_dim),
+            nn.GELU(),
+            nn.Linear(self.scorer_dim, self.scorer_dim),
         )
-        self.attn_norm = nn.LayerNorm(self.embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim * self.ffn_mult),
-            nn.SiLU(),
-            nn.Dropout(self.dropout_p),
-            nn.Linear(self.embed_dim * self.ffn_mult, self.embed_dim),
+        self.hotword_adapter = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, self.scorer_dim),
+            nn.GELU(),
+            nn.Linear(self.scorer_dim, self.scorer_dim),
         )
-        self.ffn_norm = nn.LayerNorm(self.embed_dim)
-        self.drop = nn.Dropout(self.dropout_p)
+        self.pos = nn.Parameter(torch.zeros(self.max_hotword_len, self.scorer_dim))
+        self.blocks = nn.ModuleList([
+            HotwordBlock(self.scorer_dim, self.num_heads, self.ffn_mult, self.dropout_p)
+            for _ in range(self.num_layers)
+        ])
         self.classifier = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim),
-            nn.SiLU(),
+            nn.Linear(self.scorer_dim, self.scorer_dim),
+            nn.GELU(),
             nn.Dropout(self.dropout_p),
-            nn.Linear(self.embed_dim, 1),
+            nn.Linear(self.scorer_dim, 1),
         )
 
     def config(self) -> Dict:
         return {
             "encoder_dim": self.encoder_dim,
             "embed_dim": self.embed_dim,
+            "scorer_dim": self.scorer_dim,
             "num_heads": self.num_heads,
+            "num_layers": self.num_layers,
             "ffn_mult": self.ffn_mult,
             "dropout": self.dropout_p,
             "max_hotword_len": self.max_hotword_len,
@@ -173,7 +204,8 @@ class HotwordScorer(nn.Module):
         if n_words == 0:
             return hs.new_zeros((bsz, 0), dtype=torch.float32)
 
-        audio = self.audio_adapter(hs.float())
+        dtype = self.pos.dtype
+        audio = self.audio_adapter(hs.to(dtype))
         t = audio.shape[1]
         audio_pad = torch.arange(t, device=audio.device).unsqueeze(0) >= lens.to(audio.device).unsqueeze(1)
         logits = []
@@ -181,18 +213,19 @@ class HotwordScorer(nn.Module):
         for start in range(0, n_words, step):
             end = min(n_words, start + step)
             cur_k = end - start
-            q = hotword_embeds[:, start:end].float()
-            q = q + self.pos[:n_tokens].view(1, 1, n_tokens, dim)
-            q = q.reshape(bsz * cur_k, n_tokens, dim)
-            key = audio.unsqueeze(1).expand(bsz, cur_k, t, dim).reshape(bsz * cur_k, t, dim)
+            q = hotword_embeds[:, start:end].to(dtype)
+            q = self.hotword_adapter(q)
+            q = q + self.pos[:n_tokens].view(1, 1, n_tokens, self.scorer_dim)
+            q = q.reshape(bsz * cur_k, n_tokens, self.scorer_dim)
+            key = audio.unsqueeze(1).expand(bsz, cur_k, t, self.scorer_dim).reshape(bsz * cur_k, t, self.scorer_dim)
             key_pad = audio_pad.unsqueeze(1).expand(bsz, cur_k, t).reshape(bsz * cur_k, t)
 
-            attn, _ = self.cross_attn(q, key, key, key_padding_mask=key_pad, need_weights=False)
-            x = self.attn_norm(q + self.drop(attn))
-            x = self.ffn_norm(x + self.drop(self.ffn(x)))
+            x = q
+            for block in self.blocks:
+                x = block(x, key, key_pad)
 
             mask = hotword_token_mask[:, start:end].reshape(bsz * cur_k, n_tokens).to(x.device)
-            weight = mask.unsqueeze(-1).float()
+            weight = mask.unsqueeze(-1).to(dtype)
             pooled = (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
             cur_logits = self.classifier(pooled).view(bsz, cur_k)
             logits.append(cur_logits)

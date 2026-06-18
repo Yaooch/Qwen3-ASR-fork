@@ -29,6 +29,10 @@ class Counts:
     corrected: int = 0
     regressed: int = 0
     false_final: int = 0
+    retrieval_ms_sum: float = 0.0
+    retrieval_ms_count: int = 0
+    candidate_count_sum: int = 0
+    candidate_count_count: int = 0
 
 
 def parse_args():
@@ -128,6 +132,14 @@ def evaluate(args):
             continue
 
         counts.samples += 1
+        retrieval_ms = obj.get("hotword_retrieval_ms")
+        if isinstance(retrieval_ms, (int, float)):
+            counts.retrieval_ms_sum += float(retrieval_ms)
+            counts.retrieval_ms_count += 1
+        candidate_count = obj.get("hotword_candidate_count")
+        if isinstance(candidate_count, int):
+            counts.candidate_count_sum += candidate_count
+            counts.candidate_count_count += 1
         base_text = obj.get("llm_text") or ""
         final_text = obj.get("hotword_llm_text") or obj.get("text") or ""
         retrieved = obj.get("hotwords") or []
@@ -192,6 +204,16 @@ def write_summary(path: str, counts: Counts, missing: int):
         print(f"R@10：{percent(counts.top10, counts.target_total)}", file=f)
         print(f"召回准确率：{precision}", file=f)
         print(f"误召回数：{counts.retrieved_false}", file=f)
+        if counts.retrieval_ms_count:
+            avg_ms = counts.retrieval_ms_sum / counts.retrieval_ms_count
+            total_sec = counts.retrieval_ms_sum / 1000.0
+            print("", file=f)
+            print("耗时：", file=f)
+            print(f"热词检索平均耗时：{avg_ms:.2f} ms/条", file=f)
+            print(f"热词检索累计耗时：{total_sec:.2f} s", file=f)
+            if counts.candidate_count_count:
+                avg_cands = counts.candidate_count_sum / counts.candidate_count_count
+                print(f"平均候选热词数：{avg_cands:.1f}", file=f)
         print("", file=f)
         print("识别：", file=f)
         print(f"默认 LLM 热词识别率：{percent(counts.base_hit, counts.target_total)}", file=f)

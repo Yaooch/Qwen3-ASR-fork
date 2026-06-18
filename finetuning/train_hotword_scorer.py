@@ -102,7 +102,9 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--max_audio_sec", type=float, default=30.0)
     p.add_argument("--max_hotword_len", type=int, default=24)
+    p.add_argument("--scorer_dim", type=int, default=384)
     p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--ffn_mult", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--chunk_hotwords", type=int, default=256)
@@ -282,12 +284,14 @@ def main():
 
     embed = model.qwen_model.thinker.get_input_embeddings()
     embed_dim = int(embed.weight.shape[1])
-    if embed_dim % args.num_heads != 0:
-        raise ValueError(f"embed_dim={embed_dim} 不能被 num_heads={args.num_heads} 整除")
+    if args.scorer_dim % args.num_heads != 0:
+        raise ValueError(f"scorer_dim={args.scorer_dim} 不能被 num_heads={args.num_heads} 整除")
     scorer = HotwordScorer(
         encoder_dim=model.encoder_output_size,
         embed_dim=embed_dim,
+        scorer_dim=args.scorer_dim,
         num_heads=args.num_heads,
+        num_layers=args.num_layers,
         ffn_mult=args.ffn_mult,
         dropout=args.dropout,
         max_hotword_len=args.max_hotword_len,
@@ -329,6 +333,8 @@ def main():
         print(f"每卡 batch：{args.batch_size}")
         print(f"有效 batch：{args.batch_size * world_size}")
         print(f"热词 token 上限：{args.max_hotword_len}")
+        print(f"scorer 维度：{args.scorer_dim}")
+        print(f"scorer 层数：{args.num_layers}")
         print(f"阈值：{args.threshold}")
         if args.logging_dir:
             print(f"TensorBoard：{args.logging_dir}")
