@@ -118,6 +118,7 @@ def evaluate(args):
     details = read_details(args.detail_path)
     target_map = read_target_hotwords(args.target_hotword_file)
     counts = Counts()
+    retrieve_ms: List[float] = []
     badcases = []
     missing = 0
 
@@ -128,6 +129,9 @@ def evaluate(args):
             continue
 
         counts.samples += 1
+        ms = obj.get("hotword_retrieve_ms")
+        if ms is not None:
+            retrieve_ms.append(float(ms))
         base_text = obj.get("llm_text") or ""
         final_text = obj.get("hotword_llm_text") or obj.get("text") or ""
         retrieved = obj.get("hotwords") or []
@@ -172,10 +176,10 @@ def evaluate(args):
                 "targets": target_rows,
             })
 
-    return counts, badcases, missing
+    return counts, badcases, missing, retrieve_ms
 
 
-def write_summary(path: str, counts: Counts, missing: int):
+def write_summary(path: str, counts: Counts, missing: int, retrieve_ms: List[float]):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     precision = ratio(counts.retrieved_true, counts.retrieved_total)
     with open(path, "w", encoding="utf-8") as f:
@@ -200,6 +204,21 @@ def write_summary(path: str, counts: Counts, missing: int):
         print(f"新增修对数：{counts.corrected}", file=f)
         print(f"改坏数：{counts.regressed}", file=f)
         print(f"误注入识别热词数：{counts.false_final}", file=f)
+        print("", file=f)
+        print("检索耗时：", file=f)
+        if retrieve_ms:
+            sv = sorted(retrieve_ms)
+            n = len(sv)
+            p50 = sv[min(n - 1, int(n * 0.5))]
+            p95 = sv[min(n - 1, int(n * 0.95))]
+            print(f"样本数：{n}", file=f)
+            print(f"mean：{sum(sv) / n:.3f}ms", file=f)
+            print(f"p50：{p50:.3f}ms", file=f)
+            print(f"p95：{p95:.3f}ms", file=f)
+            print(f"max：{sv[-1]:.3f}ms", file=f)
+            print(f"总耗时：{sum(sv):.1f}ms", file=f)
+        else:
+            print("无检索耗时记录（detail 缺 hotword_retrieve_ms 字段）", file=f)
 
 
 BADCASE_GROUPS = [
@@ -263,8 +282,8 @@ def write_badcases(path: str, rows: List[dict], topk: int):
 
 def main():
     args = parse_args()
-    counts, badcases, missing = evaluate(args)
-    write_summary(args.output_path, counts, missing)
+    counts, badcases, missing, retrieve_ms = evaluate(args)
+    write_summary(args.output_path, counts, missing, retrieve_ms)
     write_badcases(args.badcase_path, badcases, args.topk_badcases)
     print(f"热词评测完成：{args.output_path}")
 

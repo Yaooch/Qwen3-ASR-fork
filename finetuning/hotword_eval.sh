@@ -21,6 +21,7 @@ batch_size=64
 dtype="bf16"
 hotword_topk=5
 hotword_pinyin_style="normal"
+hotword_retriever="pinyin"
 encoder_mode="stream"
 
 declare -A arg_map=(
@@ -30,6 +31,7 @@ declare -A arg_map=(
     [--output_dir]=output_dir
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
     [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--hotword_retriever]=hotword_retriever
     [--encoder_mode]=encoder_mode
 )
 
@@ -106,6 +108,7 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --hotword_file "${hotword_file}"
         --hotword_topk "${hotword_topk}"
         --hotword_pinyin_style "${hotword_pinyin_style}"
+        --hotword_retriever "${hotword_retriever}"
     )
     echo "运行热词提示推理：${output_dir}"
     "${infer_cmd[@]}"
