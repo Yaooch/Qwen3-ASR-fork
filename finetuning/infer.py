@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--hotword_topk", type=int, default=10)
     parser.add_argument("--keep_origin_llm", type=int, choices=[0, 1], default=1)
     parser.add_argument("--hotword_pinyin_style", choices=["normal", "tone3"], default="normal")
+    parser.add_argument("--hotword_retriever", choices=["pinyin", "asr_hotword"], default="pinyin")
     parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
     parser.add_argument("--stream", action="store_const", const="stream", dest="encoder_mode")
     parser.add_argument("--no_stream", action="store_const", const="offline", dest="encoder_mode")
@@ -70,6 +71,9 @@ def make_hotword(args):
         return None
     if "llm" not in args.modes or not ({"ctc", "rnnt"} & set(args.modes)):
         raise ValueError("热词 prompt 需要同时跑 llm 和 ctc/rnnt，例如 --mode llm,ctc")
+    if args.hotword_retriever == "asr_hotword":
+        from qwen_asr.joint.asr_hotword import AsrHotwordRetriever
+        return AsrHotwordRetriever.from_file(args.hotword_file)
     return HotwordRetriever.from_file(args.hotword_file, pinyin_style=args.hotword_pinyin_style)
 
 
