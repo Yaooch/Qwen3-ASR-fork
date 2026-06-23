@@ -23,3 +23,5 @@ wheels/
 venv/
 env/
 finetuning/logs
+.claude
+.opencode
