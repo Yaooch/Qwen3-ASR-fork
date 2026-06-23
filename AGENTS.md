@@ -6,6 +6,7 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 
 - 官方能力放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
 - 联合 CTC/RNNT/拼音 CTC 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe` 主推理入口，`encoder.py` 负责 Encoder、长度换算和流式 KV cache，`ctc.py/rnnt.py/hotword.py/defaults.py` 分别放对应核心逻辑。
+- `qwen_asr/joint/asr_hotword/` 子包复现自 asr-hotword 的音素级两层检索（粗筛 `FastRAG` + 精筛边界约束 DP），经 `AsrHotwordRetriever` adapter 对齐 `HotwordRetriever` 接口，仅在 `--hotword_retriever asr_hotword` 时启用。
 - `finetuning/` 只放训练、推理、评估入口脚本；通用评估和数据处理工具放在 `qwen_asr/tools/`。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr/joint/defaults.py`。
 
@@ -37,11 +38,12 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 
 ## 热词和评估约定
 
-- 热词召回固定使用 pinyin，缺少 `pypinyin` 直接报错；推理结果包含 `ctc_pinyin_text` 时，热词检索优先使用该有调拼音序列。
+- 热词召回默认使用 pinyin retriever（`HotwordRetriever`），缺少 `pypinyin` 直接报错；推理结果包含 `ctc_pinyin_text` 时，热词检索优先使用该有调拼音序列。`infer.py` 经 `--hotword_retriever {pinyin,asr_hotword}` 可切换到复现的音素级 `AsrHotwordRetriever`（默认 pinyin）。
 - 热词推理可用 `--keep_origin_llm 0/1` 控制是否保留默认 LLM 输出，默认保留；热词库和评估目标热词分开，评估目标格式为 `utt_id<TAB>热词1,热词2`。
 - 热词测试集按语言拆分输出到测试集目录下的 `Mandarin/` 和 `English/`，`hotword.txt` 从拆分后的目标热词重新生成。
 - 拼音评估兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本`；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。
 - WER 阶段同时生成文本 badcase，输出 `utt_id/WER/ref/hyp`；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
+- 启用热词检索时，`Qwen3ASRJointModel.transcribe` 每条记录 `hotword_retrieve_ms`（毫秒）写入 detail jsonl，`qwen_asr/tools/hotword_eval.py` 汇总 mean/p50/p95/max。
 
 ## 脚本和验证
 

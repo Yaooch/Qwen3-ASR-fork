@@ -42,12 +42,12 @@
 **Interfaces:**
 - Produces: `Phoneme`（dataclass，`info` 属性返回七元组）、`get_phoneme_info(text)->List[Phoneme]`
 
-- [ ] **Step 1: 验证当前状态（应失败：模块不存在）**
+- [x] **Step 1: 验证当前状态（应失败：模块不存在）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.phoneme import get_phoneme_info; get_phoneme_info('撒贝宁')"`
 Expected: `ModuleNotFoundError`
 
-- [ ] **Step 2: 创建空包 `__init__.py`**
+- [x] **Step 2: 创建空包 `__init__.py`**
 
 文件 `qwen_asr/joint/asr_hotword/__init__.py` 内容（本 task 仅占位，Task 4 填导出）：
 
@@ -55,7 +55,7 @@ Expected: `ModuleNotFoundError`
 """asr-hotword 两层检索复现：粗筛 FastRAG + 精筛边界约束 DP。"""
 ```
 
-- [ ] **Step 3: 创建 `phoneme.py`（移植自对方 algo_phoneme.py，去 logger/__main__/未用函数）**
+- [x] **Step 3: 创建 `phoneme.py`（移植自对方 algo_phoneme.py，去 logger/__main__/未用函数）**
 
 文件 `qwen_asr/joint/asr_hotword/phoneme.py` 完整内容：
 
@@ -169,12 +169,12 @@ def _process_en_num(text: str, pos: int, seq: List[Phoneme], split_char: bool) -
     return end_pos
 ```
 
-- [ ] **Step 4: 验证音素转换正确（三字 → 三个字起点）**
+- [x] **Step 4: 验证音素转换正确（三字 → 三个字起点）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.phoneme import get_phoneme_info; ps=get_phoneme_info('撒贝宁'); assert len(ps)>=6 and sum(p.is_word_start for p in ps)==3, [p.value for p in ps]; print('OK', [p.value for p in ps])"`
 Expected: `OK ['s', 'a', '1', 'b', 'ei', '4', 'n', 'ing', '2']`（声调数字可能因 pypinyin 版本略有不同，断言只验三个字起点）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add qwen_asr/joint/asr_hotword/__init__.py qwen_asr/joint/asr_hotword/phoneme.py
@@ -192,12 +192,12 @@ git commit -m "移植 asr-hotword 音素转换 phoneme.py"
 - Consumes: `from .phoneme import Phoneme`
 - Produces: `SIMILAR_PHONEMES`、`fuzzy_substring_search_constrained(hw_info, input_info, threshold)->List[(score, start_idx, end_idx)]`
 
-- [ ] **Step 1: 验证当前状态（应失败）**
+- [x] **Step 1: 验证当前状态（应失败）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.calc import fuzzy_substring_search_constrained"`
 Expected: `ModuleNotFoundError`
 
-- [ ] **Step 2: 创建 `calc.py`（移植自对方 algo_calc.py，import 路径改为本子包；删未接入的 `get_phoneme_cost`/`find_best_match`）**
+- [x] **Step 2: 创建 `calc.py`（移植自对方 algo_calc.py，import 路径改为本子包；删未接入的 `get_phoneme_cost`/`find_best_match`）**
 
 文件 `qwen_asr/joint/asr_hotword/calc.py` 完整内容：
 
@@ -339,12 +339,12 @@ def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tu
     return sorted(used_ends.values(), key=lambda x: x[0], reverse=True)
 ```
 
-- [ ] **Step 3: 验证精筛能定位子串（「贝宁」在「撒贝宁」中高分匹配）**
+- [x] **Step 3: 验证精筛能定位子串（「贝宁」在「撒贝宁」中高分匹配）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.calc import fuzzy_substring_search_constrained as f; from qwen_asr.joint.asr_hotword.phoneme import get_phoneme_info; hw=[p.info[:5] for p in get_phoneme_info('贝宁')]; inp=[p.info for p in get_phoneme_info('撒贝宁')]; r=f(hw, inp, 0.6); assert r and r[0][0] > 0.8, r; print('OK', r)"`
 Expected: `OK [(1.0, ...)]`（「贝宁」是「撒贝宁」子串，应近满分）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add qwen_asr/joint/asr_hotword/calc.py
@@ -362,12 +362,12 @@ git commit -m "移植 asr-hotword 精筛 DP calc.py"
 - Consumes: `from .phoneme import Phoneme`
 - Produces: `PhonemeEncoder`、`FastRAG(threshold)`，`FastRAG.add_hotwords({word: [[Phoneme]]})`、`FastRAG.search(input_phonemes, top_k=0)->List[(hw, score, approx_end_pos)]`
 
-- [ ] **Step 1: 验证当前状态（应失败）**
+- [x] **Step 1: 验证当前状态（应失败）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.fast_rag import FastRAG"`
 Expected: `ModuleNotFoundError`
 
-- [ ] **Step 2: 创建 `fast_rag.py`（合并对方 rag_fast.py 的 PhonemeEncoder + rag_fast_batch.py 的 FastRAG，去计时/logger/__main__）**
+- [x] **Step 2: 创建 `fast_rag.py`（合并对方 rag_fast.py 的 PhonemeEncoder + rag_fast_batch.py 的 FastRAG，去计时/logger/__main__）**
 
 文件 `qwen_asr/joint/asr_hotword/fast_rag.py` 完整内容：
 
@@ -464,12 +464,12 @@ class FastRAG:
         return results if top_k <= 0 else results[:top_k]
 ```
 
-- [ ] **Step 3: 验证粗筛召回（「撒贝你主持」召回到「撒贝宁」）**
+- [x] **Step 3: 验证粗筛召回（「撒贝你主持」召回到「撒贝宁」）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword.fast_rag import FastRAG; from qwen_asr.joint.asr_hotword.phoneme import get_phoneme_info; rag=FastRAG(0.55); rag.add_hotwords({'撒贝宁':[get_phoneme_info('撒贝宁')],'康辉':[get_phoneme_info('康辉')]}); r=rag.search(get_phoneme_info('撒贝你主持'), top_k=5); assert any(hw=='撒贝宁' for hw,_,_ in r), r; print('OK', r)"`
 Expected: `OK [('撒贝宁', <score>, <pos>), ...]`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add qwen_asr/joint/asr_hotword/fast_rag.py
@@ -489,12 +489,12 @@ git commit -m "移植 asr-hotword 粗筛 fast_rag.py"
 - Consumes: `get_phoneme_info`（phoneme）、`fuzzy_substring_search_constrained`（calc）、`FastRAG`（fast_rag）
 - Produces: `AsrHotwordRetriever.from_file(path)->AsrHotwordRetriever`、`retrieve(query, topk=10)->List[str]`
 
-- [ ] **Step 1: 验证当前状态（应失败）**
+- [x] **Step 1: 验证当前状态（应失败）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword import AsrHotwordRetriever"`
 Expected: `ImportError`
 
-- [ ] **Step 2: 创建 `retriever.py`（adapter，复用对方 _find_matches 精筛编排，只取召回分数）**
+- [x] **Step 2: 创建 `retriever.py`（adapter，复用对方 _find_matches 精筛编排，只取召回分数）**
 
 文件 `qwen_asr/joint/asr_hotword/retriever.py` 完整内容：
 
@@ -570,7 +570,7 @@ class AsrHotwordRetriever:
         return [w for w, _ in ranked[:topk]]
 ```
 
-- [ ] **Step 3: 填子包 `__init__.py` 导出**
+- [x] **Step 3: 填子包 `__init__.py` 导出**
 
 文件 `qwen_asr/joint/asr_hotword/__init__.py` 完整内容（覆盖 Task 1 的占位）：
 
@@ -581,7 +581,7 @@ from .retriever import AsrHotwordRetriever
 __all__ = ["AsrHotwordRetriever"]
 ```
 
-- [ ] **Step 4: 顶层 `qwen_asr/joint/__init__.py` 增加导出**
+- [x] **Step 4: 顶层 `qwen_asr/joint/__init__.py` 增加导出**
 
 在 `from .hotword import HotwordRetriever` 下一行加：
 
@@ -617,12 +617,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 5: 端到端验证（recall「撒贝宁」并过阈值）**
+- [x] **Step 5: 端到端验证（recall「撒贝宁」并过阈值）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint import AsrHotwordRetriever as R; r=R(['撒贝宁','康辉','周涛','东方财富']); out=r.retrieve('撒贝你主持的节目', topk=3); assert '撒贝宁' in out, out; print('OK', out)"`
 Expected: `OK ['撒贝宁']`（或含其他高分词，但「撒贝宁」必须在内）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add qwen_asr/joint/asr_hotword/retriever.py qwen_asr/joint/asr_hotword/__init__.py qwen_asr/joint/__init__.py
@@ -640,7 +640,7 @@ git commit -m "新增 AsrHotwordRetriever adapter 并接入 joint 包导出"
 - Consumes: `AsrHotwordRetriever`（lazy import）、现有 `HotwordRetriever`
 - Produces: CLI 参数 `--hotword_retriever {pinyin,asr_hotword}` 默认 `pinyin`
 
-- [ ] **Step 1: 加 CLI 参数**
+- [x] **Step 1: 加 CLI 参数**
 
 在 `finetuning/infer.py` 的 `parse_args()` 中，`--hotword_pinyin_style` 那行（第 34 行）之后加一行：
 
@@ -648,7 +648,7 @@ git commit -m "新增 AsrHotwordRetriever adapter 并接入 joint 包导出"
     parser.add_argument("--hotword_retriever", choices=["pinyin", "asr_hotword"], default="pinyin")
 ```
 
-- [ ] **Step 2: 改 `make_hotword` 分流**
+- [x] **Step 2: 改 `make_hotword` 分流**
 
 将 `finetuning/infer.py:68-73` 的 `make_hotword` 函数替换为：
 
@@ -664,17 +664,17 @@ def make_hotword(args):
     return HotwordRetriever.from_file(args.hotword_file, pinyin_style=args.hotword_pinyin_style)
 ```
 
-- [ ] **Step 3: 验证参数生效**
+- [x] **Step 3: 验证参数生效**
 
 Run: `PYTHONPATH=. python3 finetuning/infer.py --help | grep -A2 hotword_retriever`
 Expected: 输出包含 `--hotword_retriever {pinyin,asr_hotword}` 且 default 为 `pinyin`
 
-- [ ] **Step 4: 验证 asr_hotword 路径能加载热词（用真实热词文件，若不存在则跳过）**
+- [x] **Step 4: 验证 asr_hotword 路径能加载热词（用真实热词文件，若不存在则跳过）**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.asr_hotword import AsrHotwordRetriever; r=AsrHotwordRetriever.from_file('/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/hotword.txt') if __import__('os').path.exists('/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test/hotword.txt') else None; print('loaded', len(r.hotwords) if r else 'skip')" 2>&1 | tail -1`
 Expected: `loaded <N>`（若热词文件存在）或 `skip`（不存在则跳过，不阻断）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add finetuning/infer.py
@@ -691,7 +691,7 @@ git commit -m "infer.py 加 --hotword_retriever 开关支持 asr_hotword"
 **Interfaces:**
 - Produces: 每条 record 新增字段 `hotword_retrieve_ms`（float，毫秒），随 transcribe 返回值进 detail jsonl
 
-- [ ] **Step 1: 顶部加 `import time`**
+- [x] **Step 1: 顶部加 `import time`**
 
 在 `qwen_asr/joint/model.py:2`（`import json` 上一行或 `import os` 附近）加：
 
@@ -713,7 +713,7 @@ import shutil
 import time
 ```
 
-- [ ] **Step 2: transcribe 热词分支打点**
+- [x] **Step 2: transcribe 热词分支打点**
 
 将 `qwen_asr/joint/model.py:293-300` 的热词分支：
 
@@ -747,12 +747,12 @@ import time
                 contexts.append(hotword_prompt(words, base_prompt))
 ```
 
-- [ ] **Step 3: 验证 import 无误**
+- [x] **Step 3: 验证 import 无误**
 
 Run: `PYTHONPATH=. python3 -c "from qwen_asr.joint.model import Qwen3ASRJointModel; print('import OK')"`
 Expected: `import OK`
 
-- [ ] **Step 4: 验证打点逻辑（mock retriever 走 transcribe 热词分支）**
+- [x] **Step 4: 验证打点逻辑（mock retriever 走 transcribe 热词分支）**
 
 Run: `PYTHONPATH=. python3 -c "
 class _MockRet:
@@ -765,7 +765,7 @@ print('打点已写入 transcribe')
 "`
 Expected: `打点已写入 transcribe`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add qwen_asr/joint/model.py
@@ -784,7 +784,7 @@ git commit -m "model.py 记录每条音频热词检索耗时到 hotword_retrieve
 - Consumes: detail jsonl 每条 `hotword_retrieve_ms`（Task 6 产出）
 - Produces: summary 新增「检索耗时」小节（mean/p50/p95/max/总/样本数）
 
-- [ ] **Step 1: evaluate 收集 `hotword_retrieve_ms`**
+- [x] **Step 1: evaluate 收集 `hotword_retrieve_ms`**
 
 在 `qwen_asr/tools/hotword_eval.py` 的 `evaluate(args)` 函数中，`counts = Counts()` 下一行加：
 
@@ -806,7 +806,7 @@ git commit -m "model.py 记录每条音频热词检索耗时到 hotword_retrieve
     return counts, badcases, missing, retrieve_ms
 ```
 
-- [ ] **Step 2: main 适配返回值并传给 write_summary**
+- [x] **Step 2: main 适配返回值并传给 write_summary**
 
 将 `qwen_asr/tools/hotword_eval.py` 的 `main()` 中：
 
@@ -822,7 +822,7 @@ git commit -m "model.py 记录每条音频热词检索耗时到 hotword_retrieve
     write_summary(args.output_path, counts, missing, retrieve_ms)
 ```
 
-- [ ] **Step 3: write_summary 加检索耗时统计**
+- [x] **Step 3: write_summary 加检索耗时统计**
 
 在 `qwen_asr/tools/hotword_eval.py` 的 `write_summary(path, counts, missing)` 函数签名改为：
 
@@ -850,7 +850,7 @@ def write_summary(path: str, counts: Counts, missing: int, retrieve_ms: List[flo
         print("无检索耗时记录（detail 缺 hotword_retrieve_ms 字段）", file=f)
 ```
 
-- [ ] **Step 4: 验证耗时统计（造一条假 detail）**
+- [x] **Step 4: 验证耗时统计（造一条假 detail）**
 
 Run: `PYTHONPATH=. python3 -c "
 import json, os, tempfile
@@ -873,7 +873,7 @@ print(out[out.index('检索耗时'):])
 "`
 Expected: `OK 统计写入` 且输出含 mean/p50/p95/max
 
-- [ ] **Step 5: hotword_eval.sh 声明并透传开关**
+- [x] **Step 5: hotword_eval.sh 声明并透传开关**
 
 在 `finetuning/hotword_eval.sh` 的 `hotword_pinyin_style="normal"` 下一行（第 23 行后）加：
 
@@ -893,12 +893,12 @@ hotword_retriever="pinyin"
         --hotword_retriever "${hotword_retriever}"
 ```
 
-- [ ] **Step 6: 验证 sh 语法**
+- [x] **Step 6: 验证 sh 语法**
 
 Run: `bash -n finetuning/hotword_eval.sh && echo "syntax OK"`
 Expected: `syntax OK`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add qwen_asr/tools/hotword_eval.py finetuning/hotword_eval.sh
