@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import librosa
@@ -294,7 +295,13 @@ class Qwen3ASRJointModel(nn.Module):
             contexts = []
             for rec in records:
                 src = next((name for name in ("ctc", "rnnt") if rec.get(f"{name}_text")), "")
-                words = hotword_retriever.retrieve(rec.get(f"{src}_text", ""), topk=hotword_topk) if src else []
+                if src:
+                    t0 = time.perf_counter()
+                    words = hotword_retriever.retrieve(rec.get(f"{src}_text", ""), topk=hotword_topk)
+                    rec["hotword_retrieve_ms"] = round((time.perf_counter() - t0) * 1000, 3)
+                else:
+                    words = []
+                    rec["hotword_retrieve_ms"] = 0.0
                 rec["hotwords"] = words
                 rec["hotword_source"] = src
                 contexts.append(hotword_prompt(words, base_prompt))
