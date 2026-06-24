@@ -20,8 +20,8 @@ echo "==========================================================="
 export CUDA_VISIBLE_DEVICES=$gpu_ids
 export OMP_NUM_THREADS=4
 
-# model_path="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-31/checkpoint-6642/"
-model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
+model_path="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
+# model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/train_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
 output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50"

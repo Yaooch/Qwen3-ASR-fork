@@ -5,24 +5,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
-# baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
+baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
 # baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
 
 stage="all"
-ckpt="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-4"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_14_hotword_4/aishell_hotword"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/pinyin/ContextASR"
 gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=64
 dtype="bf16"
-hotword_topk=5
+hotword_topk=10
 hotword_pinyin_style="normal"
 hotword_retriever="pinyin"
-encoder_mode="stream"
+encoder_mode="train_mask"
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path
