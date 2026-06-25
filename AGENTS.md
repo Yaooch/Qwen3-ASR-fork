@@ -45,6 +45,16 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 - WER 阶段同时生成文本 badcase，输出 `utt_id/WER/ref/hyp`；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
 - 启用热词检索时，`Qwen3ASRJointModel.transcribe` 每条记录 `hotword_retrieve_ms`（毫秒）写入 detail jsonl，`qwen_asr/tools/hotword_eval.py` 汇总 mean/p50/p95/max。
 
+## 热词 GRPO 强化学习
+
+- 目标：让 talker 在注入「真热词 + 干扰词」混合列表时选对并原样输出真热词、不误注入干扰词、非热词部分不退化。详见 `docs/sdd/specs/2026-06-25-hotword-grpo-rl-design.md` 与计划 `docs/sdd/plans/2026-06-25-hotword-grpo-rl.md`，分支 `rl/hotword-grpo`。
+- 训练数据用 ContextASR（`train_contextasr2.jsonl`，每条 `text` 为 ground-truth、`prompt` 已含混合热词列表）；候选列表直接用数据预给列表，不与 retriever 耦合。
+- 奖励纯函数在 `qwen_asr/tools/hotword_reward.py`：`parse_text_field` 剥 `language X<asr_text>` 前缀并去标点，`split_truth` 按子串划真热词/干扰词，`compute_reward = w_r·recall − w_f·fp − w_c·non_hotword_cer − w_fmt·(1−fmt)`。
+- 训练组件在 `finetuning/grpo_*.py`：`grpo_data.py` 读样本切 eval、`grpo_math.py` 组内优势 + clip surrogate + KL、`grpo_lora.py` 用正则把 LoRA 只挂 `thinker.model.layers` 文本解码器（排除 audio_tower 同名层）、`grpo_rollout.py` 音频 embedding 缓存 + G 路采样 + ref/train logprob、`grpo_train.py` 主循环、`grpo_eval.py` 评测。
+- 模型加载统一 `from_pretrained(..., load_heads=False, attn_implementation=...).to("cuda")`（GRPO 只用 LLM + audio_tower，不加载 CTC/RNNT 头）；LoRA 评测经 `PeftModel.from_pretrained(joint, lora)` 包整个 joint，与训练的 adapter key 对齐。
+- 训练 `bash finetuning/grpo_train.sh`，评测 `bash finetuning/grpo_eval.sh [LORA_DIR] [LIMIT]`（不传 LORA_DIR 评基线）。成功标准：热词召回升、误注入降、非热词 CER 不劣化（≤基线 +0.5% 绝对），三者同时达成。
+- 纯函数与数学单测在 `tests/tools/test_hotword_reward.py`、`tests/finetuning/test_grpo_{data,math}.py`；模型相关集成测试标 `@pytest.mark.integration` 默认跳过（`pytest.ini`），手动 `pytest -m integration` 跑。
+
 ## 脚本和验证
 
 - Shell 参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。

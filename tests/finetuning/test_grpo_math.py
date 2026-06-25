@@ -18,6 +18,6 @@ def test_grpo_loss_finite_and_sign():
     loss = grpo_loss(logp, old, adv, ref, beta=0.04)
     assert torch.isfinite(loss)
     # 正优势 + logp==old → ratio=1 → surrogate=adv，loss=-mean(adv) < 0
-    assert float(loss) < 0
+    assert float(loss.detach()) < 0
     loss.backward()
     assert logp.grad is not None
