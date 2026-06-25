@@ -17,7 +17,7 @@ from qwen_asr.tools.hotword_reward import (
     normalize,
     split_truth,
 )
-from finetuning.grpo_data import load_samples
+from finetuning.grpo_core import load_samples
 
 CKPT_DEFAULT = "/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
 DATA_DEFAULT = "/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2.jsonl"
