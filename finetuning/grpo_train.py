@@ -164,8 +164,8 @@ def main():
             else:
                 print(f"step {step} all-skipped (world={world})")
 
-        # 周期保存：崩溃不丢进度，可从最近 checkpoint 评测/续训
-        if is_main and args.save_steps > 0 and step % args.save_steps == 0:
+        # 周期保存：崩溃不丢进度，可从最近 checkpoint 评测/续训（step 0 不保存，无意义）
+        if is_main and args.save_steps > 0 and step > 0 and step % args.save_steps == 0:
             ckpt_dir = os.path.join(args.output_dir, f"lora-step{step}")
             peft.save_pretrained(ckpt_dir)
             print(f"saved LoRA checkpoint at step {step} to {ckpt_dir}")

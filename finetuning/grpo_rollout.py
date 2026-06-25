@@ -44,6 +44,9 @@ class RolloutSampler:
         self.max_new_tokens = max_new_tokens
         self.device = device
         self._audio_cache = {}
+        # 显式 pad_token_id，避免 generate 时 "Setting pad_token_id to eos" 告警刷屏
+        eos = getattr(self.joint.qwen_model.generation_config, "eos_token_id", None)
+        self.pad_token_id = eos[0] if isinstance(eos, (list, tuple)) else eos
 
     def clear_audio_cache(self) -> None:
         """跨样本清理音频 embedding 缓存，避免长训练 OOM。"""
@@ -111,6 +114,7 @@ class RolloutSampler:
             do_sample=True,
             temperature=self.temperature,
             top_p=0.95,
+            pad_token_id=self.pad_token_id,
         )
         seq = gen.sequences
         gen_ids = seq[0, input_ids.shape[1]:]
