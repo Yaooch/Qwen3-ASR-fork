@@ -85,12 +85,14 @@ def main():
         )
         if float(rewards.std().item()) < 1e-6:
             # 组内无区分（如简单样本 4 路全对），无学习信号，跳过且不计入 max_steps
+            sampler.clear_audio_cache()
             continue
         adv = group_advantages(rewards.unsqueeze(0)).squeeze(0)  # (G,)
 
         opt.zero_grad()
         loss_acc = 0.0
         for r, a in zip(rollouts, adv):
+            # on-policy 单步：old_logp 取当前策略 logp 的 detach，ratio≡1、clip 为多 epoch 占位
             logp = sampler.token_logp(sample, r.ids)  # (T,) LoRA-on 带梯度
             old_logp = logp.detach()
             loss_acc = loss_acc + grpo_loss(
@@ -100,6 +102,7 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
+        sampler.clear_audio_cache()
 
         if step % 10 == 0 or args.smoke:
             print(

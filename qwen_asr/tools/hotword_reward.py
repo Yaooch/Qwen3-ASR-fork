@@ -3,6 +3,8 @@
 import re
 from typing import List, Sequence, Set, Tuple
 
+import editdistance
+
 # CJK + ASCII 标点（保留字母数字汉字与空格）
 _PUNCT_RE = re.compile(r"[!-/:-@\[-`{-~　-〿＀-￯ -⁯]")
 _WS_RE = re.compile(r"\s+")
@@ -88,8 +90,6 @@ def non_hotword_cer(output: str, gt_text: str, hotwords: Sequence[str]) -> float
     ref = _mask_all(gt_text, hotwords)
     if not ref:
         return 0.0
-    import editdistance
-
     return editdistance.eval(pred, ref) / len(ref)
 
 

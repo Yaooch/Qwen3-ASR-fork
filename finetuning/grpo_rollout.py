@@ -45,6 +45,10 @@ class RolloutSampler:
         self.device = device
         self._audio_cache = {}
 
+    def clear_audio_cache(self) -> None:
+        """跨样本清理音频 embedding 缓存，避免长训练 OOM。"""
+        self._audio_cache = {}
+
     def audio_embedding(self, audio_path: str) -> torch.Tensor:
         """返回该音频的 LLM 输入 embedding (n_audio_tokens, hidden)，缓存。"""
         if audio_path in self._audio_cache:
@@ -118,6 +122,8 @@ class RolloutSampler:
         """前向算 gen_ids 的 token logprob。use_lora=False 时关 LoRA（ref，detach）。"""
         thinker = self.joint.qwen_model.thinker
         gen_ids = gen_ids.to(self.device)
+        if gen_ids.numel() == 0:
+            return torch.zeros(0, device=self.device, dtype=torch.float32)
         full_ids = torch.cat([input_ids, gen_ids.unsqueeze(0)], dim=1)
         full_attn = torch.ones_like(full_ids)
         inputs_embeds = thinker.get_input_embeddings()(full_ids)
@@ -141,7 +147,7 @@ class RolloutSampler:
         # 位置 i 的 logits 预测 token i+1；生成段预测位置 [prompt_len-1 : prompt_len-1+G]
         log_logits = F.log_softmax(logits[:, prompt_len - 1:-1, :], dim=-1)
         logp = log_logits.gather(-1, gen_ids.unsqueeze(0).unsqueeze(-1)).squeeze(-1)
-        return logp.squeeze(0)
+        return logp.squeeze(0).reshape(-1)  # (T_gen,)
 
     @torch.no_grad()
     def sample(self, sample) -> List[RolloutResult]:
