@@ -3,7 +3,7 @@
 # 用法: bash finetuning/grpo_eval.sh [LORA_DIR] [LIMIT]
 #   不传 LORA_DIR → 评基线
 set -euo pipefail
-CKPT="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
+CKPT="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 DATA="/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2.jsonl"
 LORA="${1:-}"
 LIMIT="${2:-200}"

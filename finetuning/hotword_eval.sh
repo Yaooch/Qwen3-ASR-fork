@@ -6,8 +6,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 # baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
-baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
 # baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
+baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET_perturb"
 
 stage="all"
 ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
@@ -15,13 +16,13 @@ input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/pinyin/ContextASR"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/asr_hotword/voyah_error"
 gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=64
 dtype="bf16"
 hotword_topk=10
 hotword_pinyin_style="normal"
-hotword_retriever="pinyin"
+hotword_retriever="asr_hotword"
 encoder_mode="train_mask"
 
 declare -A arg_map=(

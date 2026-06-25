@@ -13,9 +13,10 @@ TEXT_DECODER_TARGETS = [
     "up_proj",
     "down_proj",
 ]
-# peft 用 re.fullmatch 匹配整条模块路径；前缀 .* 吸收 peft 包装层与 qwen_model 路径。
+# peft 用 re.fullmatch 匹配整条模块路径。前缀可选：训练时包 joint（有 base_model.model.qwen_model. 前缀），
+# 评测时包 qwen_model（无前缀，键为 thinker.model...），两种都需命中；audio_tower 同名层靠 `.model.layers` 排除。
 TEXT_DECODER_TARGET_REGEX = (
-    r".*\.thinker\.model\.layers\.\d+\."
+    r"(?:.*\.)?thinker\.model\.layers\.\d+\."
     r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
     r"|mlp\.(?:gate_proj|up_proj|down_proj))"
 )
