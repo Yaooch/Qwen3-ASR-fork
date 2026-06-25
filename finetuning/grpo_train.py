@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.04)
     p.add_argument("--max_steps", type=int, default=1000)
+    p.add_argument("--save_steps", type=int, default=100, help="每 N 步保存一次 LoRA 到 lora-step{N}；0 表示不周期保存")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--eval_ratio", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=42)
@@ -162,6 +163,12 @@ def main():
                 )
             else:
                 print(f"step {step} all-skipped (world={world})")
+
+        # 周期保存：崩溃不丢进度，可从最近 checkpoint 评测/续训
+        if is_main and args.save_steps > 0 and step % args.save_steps == 0:
+            ckpt_dir = os.path.join(args.output_dir, f"lora-step{step}")
+            peft.save_pretrained(ckpt_dir)
+            print(f"saved LoRA checkpoint at step {step} to {ckpt_dir}")
         step += 1
 
     if is_main:
