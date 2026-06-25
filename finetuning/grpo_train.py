@@ -10,6 +10,7 @@ LoRA 梯度跨卡 all-reduce 求平均后同步步进；apply_lora 前固定种�
 """
 import argparse
 import os
+from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -107,6 +108,7 @@ def main():
 
     step = 0
     idx = 0
+    reward_history = deque(maxlen=50)  # 滚动 reward 均值，平滑样本难度噪声看真趋势
     while step < max_steps and idx < len(train_local):
         opt.zero_grad()
         last_loss = 0.0
@@ -151,18 +153,23 @@ def main():
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                 p.grad.mul_(1.0 / world)
 
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        # clip_grad_norm_ 返回裁剪前的总范数，用来确认梯度在流动（loss 前向值恒≈0，看 grad_norm 才有意义）
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, 1.0))
         opt.step()
+        if last_rewards is not None:
+            reward_history.append(float(last_rewards.mean()))
 
         if is_main and (step % 10 == 0 or args.smoke):
             if last_rewards is not None:
+                roll_mean = sum(reward_history) / len(reward_history) if reward_history else 0.0
                 print(
-                    f"step {step} loss {last_loss:.4f} "
-                    f"reward mean {float(last_rewards.mean()):.3f} std {float(last_rewards.std()):.3f} "
-                    f"(world={world} accum={accum} eff_batch={world * accum})"
+                    f"step {step} loss {last_loss:.4f} grad_norm {grad_norm:.4f} "
+                    f"reward {float(last_rewards.mean()):.3f} std {float(last_rewards.std()):.3f} "
+                    f"reward_avg{len(reward_history)} {roll_mean:.3f} "
+                    f"(eff_batch={world * accum})"
                 )
             else:
-                print(f"step {step} all-skipped (world={world})")
+                print(f"step {step} all-skipped (eff_batch={world * accum})")
 
         # 周期保存：崩溃不丢进度，可从最近 checkpoint 评测/续训（step 0 不保存，无意义）
         if is_main and args.save_steps > 0 and step > 0 and step % args.save_steps == 0:
