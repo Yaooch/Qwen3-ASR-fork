@@ -133,6 +133,7 @@ def evaluate(args):
         if ms is not None:
             retrieve_ms.append(float(ms))
         base_text = obj.get("llm_text") or ""
+        ctc_text = obj.get("ctc_text") or ""
         final_text = obj.get("hotword_llm_text") or obj.get("text") or ""
         retrieved = obj.get("hotwords") or []
         target_words = target_map.get(utt_id, [])
@@ -163,10 +164,15 @@ def evaluate(args):
             counts.regressed += int(base_hit and not final_hit)
             target_rows.append({"word": word, "rank": rank, "base_hit": base_hit, "final_hit": final_hit})
 
-        if false_retrieved or false_final or any(not row["final_hit"] for row in target_rows):
+        # badcase 判定：目标热词未召回、或召回但LLM没识别对、或改坏、或误注入干扰词；
+        # 仅误召回但LLM正确未注入不算 badcase（LLM 抗住检索噪声是好行为）
+        if false_final or any(
+            (t["rank"] is None) or (not t["final_hit"]) for t in target_rows
+        ):
             badcases.append({
                 "utt_id": utt_id,
                 "ref": ref_text,
+                "ctc": ctc_text,
                 "llm": base_text,
                 "hotword_llm": final_text,
                 "target": target_words,
@@ -222,30 +228,32 @@ def write_summary(path: str, counts: Counts, missing: int, retrieve_ms: List[flo
 
 
 BADCASE_GROUPS = [
-    ("false_final", "误召回且注入输出"),
-    ("false_retrieved", "误召回但未注入"),
-    ("retrieved_miss", "目标热词已召回但仍未识别"),
-    ("regressed", "默认识别正确但热词后改坏"),
-    ("missed_recall", "目标热词未召回且未识别"),
+    ("regressed", "改坏（默认LLM对、加热词后错）"),
+    ("retrieved_miss", "召回但LLM未修对"),
+    ("missed_recall", "检索未召回"),
+    ("false_final", "误注入干扰词"),
 ]
 
 
 def badcase_groups(row: dict) -> Dict[str, List[str]]:
+    """按目标热词分 3 类（+误注入）：
+    - regressed 改坏: 召回了、默认LLM对、加 prompt 后错（prompt 帮倒忙）
+    - retrieved_miss 召回但LLM未修对: 召回了、默认也错、最终仍错（LLM 注入失败）
+    - missed_recall 检索未召回: 没召回（检索器漏，含最终碰巧对的）
+    - false_final 误注入: 干扰词被写进输出（不在目标热词维度）
+    """
     groups = {key: [] for key, _ in BADCASE_GROUPS}
-    false_final = set(row["false_final"])
     groups["false_final"] = row["false_final"]
-    groups["false_retrieved"] = [w for w in row["false_retrieved"] if w not in false_final]
-
     for item in row["targets"]:
         word = item["word"]
-        if item["final_hit"]:
-            continue
-        if item["base_hit"]:
-            groups["regressed"].append(word)
-        elif item["rank"] is None:
-            groups["missed_recall"].append(word)
-        else:
-            groups["retrieved_miss"].append(word)
+        if item["rank"] is None:
+            groups["missed_recall"].append(word)   # 未召回 → 检索问题（不论最终对错）
+        elif not item["final_hit"]:
+            if item["base_hit"]:
+                groups["regressed"].append(word)   # 召回+base对+final错 → 改坏
+            else:
+                groups["retrieved_miss"].append(word)  # 召回+base错+final错 → LLM未修对
+        # else: 召回且最终对 → good
     return groups
 
 
@@ -254,6 +262,7 @@ def print_badcase(f, row: dict):
     print("target: " + ",".join(row["target"]), file=f)
     print("retrieved: " + ",".join(row["retrieved"]), file=f)
     print(f"{'ref':<5}: {row['ref']}", file=f)
+    print(f"{'ctc':<5}: {row['ctc']}", file=f)
     print(f"{'llm':<5}: {row['llm']}", file=f)
     print(f"{'final':<5}: {row['hotword_llm']}", file=f)
     print("", file=f)

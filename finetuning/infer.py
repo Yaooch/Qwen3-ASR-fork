@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--encoder_mode", choices=["offline", "stream", "train_mask"], default="offline")
     parser.add_argument("--stream", action="store_const", const="stream", dest="encoder_mode")
     parser.add_argument("--no_stream", action="store_const", const="offline", dest="encoder_mode")
+    parser.add_argument("--lora", default=None, help="加载 RL 训出的 LoRA 目录（仅 joint checkpoint 分支）")
     args = parser.parse_args()
     args.modes = names(args.mode, {"llm", "ctc", "rnnt"}, "mode")
     if not args.modes:
@@ -95,6 +96,9 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
             device_map=None,
             attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
         ).to(device)
+        if args.lora:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, args.lora)
         model.eval()
         missing = [name for name in args.modes if name in ("ctc", "rnnt") and name not in model.heads]
         if missing:

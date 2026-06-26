@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
 # baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
-# baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
+baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
 # baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET_perturb"
 
 stage="all"
@@ -16,14 +16,15 @@ input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/pinyin/aishell_hotword"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_1/asr_hotword/voyah"
 gpu_ids="0,1,2,3,4,5,6,7"
 batch_size=64
 dtype="bf16"
 hotword_topk=10
 hotword_pinyin_style="normal"
-hotword_retriever="pinyin"
+hotword_retriever="asr_hotword"
 encoder_mode="train_mask"
+lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_1/lora-step700"
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path
@@ -34,6 +35,7 @@ declare -A arg_map=(
     [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
     [--hotword_retriever]=hotword_retriever
     [--encoder_mode]=encoder_mode
+    [--lora]=lora
 )
 
 usage() {
@@ -111,6 +113,9 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --hotword_pinyin_style "${hotword_pinyin_style}"
         --hotword_retriever "${hotword_retriever}"
     )
+    if [[ -n "${lora}" ]]; then
+        infer_cmd+=(--lora "${lora}")
+    fi
     echo "运行热词提示推理：${output_dir}"
     "${infer_cmd[@]}"
 fi
