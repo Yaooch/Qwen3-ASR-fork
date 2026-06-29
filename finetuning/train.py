@@ -481,9 +481,16 @@ def main():
         total = sum(p.numel() for p in model.parameters())
         print(f"可训练参数：{trainable:,} / {total:,}")
 
+    # 多进程下各 rank 同时 load_dataset 会竞态写同一 HF cache 目录(.incomplete 互相覆盖/删除)。
+    # 进程组要到后续 Trainer 才初始化，此处无法用 dist.barrier 同步，改为每 rank 独立 cache_dir 互不冲突。
+    rank_cache = os.path.join(
+        os.environ.get("HF_DATASETS_CACHE", os.path.expanduser("~/.cache/huggingface/datasets")),
+        f"json_rank{local_rank}",
+    )
     ds = load_dataset(
         "json",
         data_files={"train": args.train_file, **({"validation": args.eval_file} if args.eval_file else {})},
+        cache_dir=rank_cache,
     )
     keep = {"prompt", "audio", "target", "text"}
     for split in ds.keys():
