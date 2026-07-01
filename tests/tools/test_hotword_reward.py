@@ -5,6 +5,7 @@ from qwen_asr.tools.hotword_reward import (
     split_truth,
     hotword_recall,
     false_injection_rate,
+    hybrid_injection_rate,
     non_hotword_cer,
     compute_reward,
 )
@@ -40,6 +41,28 @@ def test_recall_and_fp():
     assert false_injection_rate(out, D) == 0.0
     out2 = "你们看高志森那部伊佐美纪了吗"
     assert false_injection_rate(out2, D) == 1.0
+
+
+def test_hybrid_injection_rate_catches_mixed_chinese_hotword_parts():
+    T = {"刘圆圆"}
+    D = {"汪媛媛", "张媛媛"}
+    assert hybrid_injection_rate("Call 刘媛媛以六二一的电话", T, D) == 1.0
+
+    T = {"俞志强"}
+    D = {"余志琪", "牛志强", "郑强元", "吴建强"}
+    assert hybrid_injection_rate("Call 余志强18三四的电话", T, D) == 1.0
+
+
+def test_hybrid_injection_rate_ignores_non_cjk_or_different_length_words():
+    assert hybrid_injection_rate("clint firefox", {"clint"}, {"firefox"}) == 0.0
+    assert hybrid_injection_rate("高志森", {"高志森"}, {"小鬼三个爸"}) == 0.0
+
+
+def test_compute_reward_penalizes_hybrid_injection():
+    out = "Call 刘媛媛以六二一的电话"
+    gt = "call刘圆圆以六二一的电话"
+    hw = ["刘圆圆", "汪媛媛", "张媛媛"]
+    assert compute_reward(out, gt, hw) < compute_reward(out, gt, hw, {"w_mix": 0.0}) - 0.4
 
 
 def test_non_hotword_cer_isolated():

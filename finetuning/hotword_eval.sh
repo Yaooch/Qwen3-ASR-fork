@@ -16,15 +16,16 @@ input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_1/asr_hotword/voyah"
-gpu_ids="0,1,2,3,4,5,6,7"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/asr_hotword/voyah_prompt2"
+gpu_ids="0,1,2,3"
 batch_size=64
 dtype="bf16"
-hotword_topk=10
+hotword_topk=5
 hotword_pinyin_style="normal"
 hotword_retriever="asr_hotword"
 encoder_mode="train_mask"
-lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_1/lora-step700"
+# lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_4/lora-step2500"
+lora=""
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path

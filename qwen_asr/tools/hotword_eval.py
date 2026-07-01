@@ -38,7 +38,8 @@ def parse_args():
     p.add_argument("--target_hotword_file", required=True)
     p.add_argument("--output_path", required=True)
     p.add_argument("--badcase_path", default="")
-    p.add_argument("--topk_badcases", type=int, default=100)
+    p.add_argument("--topk_badcases", type=int, default=0,
+                   help="badcase 输出条数上限，0 或负数=全部输出（默认全部）")
     return p.parse_args()
 
 
@@ -273,7 +274,9 @@ def write_badcases(path: str, rows: List[dict], topk: int):
         return
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     buckets = {key: [] for key, _ in BADCASE_GROUPS}
-    for row in rows[:topk]:
+    if topk > 0:
+        rows = rows[:topk]
+    for row in rows:
         for key, words in badcase_groups(row).items():
             if words:
                 buckets[key].append(row)
