@@ -25,3 +25,8 @@ env/
 finetuning/logs
 .claude
 .opencode
+
+# 训练数据（大文件，不入库）
+*.jsonl
+# 编辑器临时文件
+*.swp
