@@ -19,6 +19,7 @@ language=""
 hotword_file=""
 hotword_topk=5
 hotword_pinyin_style="normal"
+lora=""
 encoder_mode="stream"
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr/joint/defaults.py")"
 pinyin_style="tone3"
@@ -30,6 +31,7 @@ declare -A arg_map=(
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
     [--dtype]=dtype [--language]=language
     [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--lora]=lora
     [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script
     [--pinyin_style]=pinyin_style [--pinyin_topk_badcases]=pinyin_topk_badcases
@@ -61,6 +63,7 @@ usage() {
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
     echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
+    echo "  --lora                RL 训出的 LoRA 目录，可不传；加载后推理用该 LoRA"
     echo "  --encoder_mode        Encoder 路径：offline / stream / train_mask"
     echo "  --stream              等价于 --encoder_mode stream"
     echo "  --no_stream           等价于 --encoder_mode offline"
@@ -202,6 +205,10 @@ if [[ -n "${hotword_file}" ]]; then
     infer_cmd+=(--hotword_file "${hotword_file}")
     infer_cmd+=(--hotword_topk "${hotword_topk}")
     infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
+fi
+
+if [[ -n "${lora}" ]]; then
+    infer_cmd+=(--lora "${lora}")
 fi
 
 collect_result_targets() {

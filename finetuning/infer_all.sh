@@ -4,11 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/train_mode"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50_sft"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_sft/train_mode"
 mode="llm,ctc"
 stage="all" 
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="0,1,2,3"
 batch_size=256
 dtype="bf16"
 skip_done=0
@@ -18,6 +18,8 @@ wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
 text_topk_badcases=300
+# lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_3/lora"
+lora=""
 
 # 字段：name|wav.scp|text|language。language 为空或 None 时跳过 LID 统计。
 DATASETS=(
@@ -39,6 +41,7 @@ declare -A arg_map=(
     [--wer_script]=wer_script [--pinyin_style]=pinyin_style
     [--pinyin_topk_badcases]=pinyin_topk_badcases
     [--text_topk_badcases]=text_topk_badcases
+    [--lora]=lora
 )
 
 usage() {
@@ -232,6 +235,9 @@ for row in "${DATASETS[@]}"; do
     )
     if [[ -n "${wer_script}" ]]; then
         cmd+=(--wer_script "${wer_script}")
+    fi
+    if [[ -n "${lora}" ]]; then
+        cmd+=(--lora "${lora}")
     fi
     "${cmd[@]}"
     maybe_lid "${output_dir}" "${language}"

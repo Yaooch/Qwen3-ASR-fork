@@ -66,7 +66,7 @@ class DataCollatorForJointTraining:
             except Exception as exc:
                 print(f"音频读取失败，跳过：{item['audio']}，{exc}")
                 continue
-            if len(wav) / self.sampling_rate > 30.0:
+            if len(wav) / self.sampling_rate > 1000.0:
                 print(f"音频过长，跳过：{item['audio']}")
                 continue
             rows.append((item, wav))

@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="0,1,2,3"
 if [[ $# -gt 0 ]]; then
     gpu_ids="$1"
 fi
@@ -22,27 +22,27 @@ export OMP_NUM_THREADS=4
 
 model_path="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
 # model_path="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
-train_file="/cfs/data/private/WangYaoChi/train_data/all/train_shuffled.jsonl"
-eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
+train_file="/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2.jsonl"
+eval_file="/cfs/data/private/WangYaoChi/train_data/all/contextasr/eval_contextasr.jsonl"
+output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_sft"
 # output_dir="/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-2"
-logging_dir="./logs/logs_ctc_50"
+logging_dir="./logs/logs_ctc_50_sft"
 
 batch_size=32
 grad_acc=4
 epochs=1
 
 # encoder, proj, llm, ctc, rnnt 可以设置不同的学习率，或者只微调其中部分模块
-train_tasks="encoder,ctc,proj,llm"
+train_tasks="llm"
 
 lr_encoder=4e-5
-lr_llm=4e-5
+lr_llm=1e-5
 lr_proj=4e-5
 lr_ctc=2e-3
 lr_rnnt=2e-3
 
-w_llm=0.9
-w_ctc=0.1
+w_llm=1
+w_ctc=0
 w_rnnt=0
 
 # CTC adapter: auto 继承源 checkpoint；新 MoE 训练可设为 moe
@@ -50,7 +50,7 @@ ctc_adapter="mlp"
 
 stream_train=1
 
-save_steps=1000
+save_steps=200
 num_workers=4
 master_port=$(shuf -n 1 -i 20000-65000)
 
