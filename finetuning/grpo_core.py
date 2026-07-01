@@ -84,13 +84,14 @@ def grpo_loss(
 ) -> torch.Tensor:
     """token-level：logp/old_logp/ref_logp/advantages 同 shape (T,)。
     返回标量 loss = -mean(clip_surrogate) + beta * mean(KL)。
-    KL 用 (logp - ref_logp) 作为惩罚项（简化估计，带梯度）。
+    KL 用 GRPO 的非负采样估计：exp(ref-logp) - (ref-logp) - 1。
     on-policy 单步训练中 old_logp = logp.detach()，ratio≡1、clip 为多 epoch 占位；
     KL 项把 LoRA 拉回基线 talker，护住非热词能力。"""
     ratio = torch.exp(logp - old_logp)
     clipped = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)
     surrogate = torch.min(ratio * advantages, clipped * advantages)
-    kl = logp - ref_logp
+    ref_minus_logp = ref_logp - logp
+    kl = torch.exp(ref_minus_logp) - ref_minus_logp - 1.0
     return -surrogate.mean() + beta * kl.mean()
 
 
@@ -122,7 +123,7 @@ def apply_lora(
     joint,
     r: int = 16,
     alpha: int = 32,
-    dropout: float = 0.05,
+    dropout: float = 0.0,
 ):
     from peft import LoraConfig, get_peft_model
 
@@ -145,9 +146,14 @@ def apply_lora(
 def assert_only_text_decoder_trainable(peft_model) -> None:
     """可训参数必须全在 thinker.model 下（文本解码器），不得误挂 audio_tower / heads。"""
     bad = []
+    trainable = []
     for name, p in peft_model.named_parameters():
-        if p.requires_grad and "thinker.model" not in name:
-            bad.append(name)
+        if p.requires_grad:
+            trainable.append(name)
+            if "thinker.model" not in name:
+                bad.append(name)
+    if not trainable:
+        raise RuntimeError("没有可训练 LoRA 参数。")
     if bad:
         raise RuntimeError(
             f"LoRA 误挂到非文本解码器: {bad[:5]}（共 {len(bad)} 个）"

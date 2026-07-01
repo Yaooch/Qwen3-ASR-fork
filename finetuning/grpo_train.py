@@ -36,7 +36,7 @@ from finetuning.grpo_core import (
 )
 
 CKPT_DEFAULT = "/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
-DATA_DEFAULT = "/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2.jsonl"
+DATA_DEFAULT = "/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2_zeroshot_prompt.jsonl"
 
 
 # --------------------------------------------------------------------------
@@ -254,7 +254,8 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=100, help="每 N 步保存一次 LoRA 到 lora-step{N}；0 表示不周期保存")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--eval_ratio", type=float, default=0.02)
-    p.add_argument("--resume", default=None, help="从 LoRA 目录续训（加载 LoRA 权重 + 优化器状态 + step）；max_steps 为总目标步数")
+    p.add_argument("--resume", type=int, default=0, choices=[0, 1], help="1 表示续训，0 表示重新训练")
+    p.add_argument("--resume_from", default="", help="续训 LoRA 目录；为空时使用 output_dir/lora")
     p.add_argument("--smoke", action="store_true", help="少量样本 1 step 自检")
     return p.parse_args()
 
@@ -297,12 +298,15 @@ def main():
     ).to(device)
     joint.eval()
     asr_wrapper = joint._asr_wrapper
+    resume_from = (args.resume_from or "").strip()
+    if args.resume == 1 and not resume_from:
+        resume_from = os.path.join(args.output_dir, "lora")
 
-    if args.resume:
+    if args.resume == 1:
         from peft import PeftModel
 
         # 续训：各卡从同一目录加载 LoRA 权重，结构/权重天然一致
-        peft = PeftModel.from_pretrained(joint, args.resume)
+        peft = PeftModel.from_pretrained(joint, resume_from, is_trainable=True)
         assert_only_text_decoder_trainable(peft)
     else:
         peft = apply_lora(joint)
@@ -330,17 +334,17 @@ def main():
 
     # 续训：恢复优化器状态与步数；idx = step * accum（每步每卡固定消费 accum 个样本）
     start_step = 0
-    if args.resume:
-        state_path = os.path.join(args.resume, "train_state.pt")
+    if args.resume == 1:
+        state_path = os.path.join(resume_from, "train_state.pt")
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu")
             opt.load_state_dict(state["opt"])
             start_step = int(state["step"])
             if is_main:
-                print(f"resumed from {args.resume}: step={start_step} (with optimizer state)")
+                print(f"resumed from {resume_from}: step={start_step} (with optimizer state)")
         elif is_main:
             print(
-                f"resumed from {args.resume}: 无 train_state.pt，仅加载 LoRA 权重，"
+                f"resumed from {resume_from}: 无 train_state.pt，仅加载 LoRA 权重，"
                 "优化器重置、step 从 0 起（旧版 checkpoint 兜底）"
             )
 
@@ -358,7 +362,8 @@ def main():
     while step < max_steps and idx < len(train_local):
         opt.zero_grad()
         last_loss = 0.0
-        last_rewards = None
+        step_rewards = []
+        did_backward = False
         for _ in range(accum):
             if idx >= len(train_local):
                 break
@@ -394,9 +399,19 @@ def main():
                 continue
             # 累积：按 accum 与 world 同时归一，等价于对所有样本梯度求平均
             (loss_acc / n_valid / accum).backward()
+            did_backward = True
             last_loss = float(loss_acc.detach() / n_valid)
-            last_rewards = rewards
+            step_rewards.append(rewards.detach().float())
             sampler.clear_audio_cache()
+
+        has_update = torch.tensor(1 if did_backward else 0, device=device)
+        if world > 1:
+            dist.all_reduce(has_update, op=dist.ReduceOp.SUM)
+        if int(has_update.item()) == 0:
+            if is_main and (step % 10 == 0 or args.smoke):
+                print(f"step {step} all-skipped (eff_batch={world * accum})")
+            step += 1
+            continue
 
         # 确保各卡 LoRA 都有 grad 张量（某卡若全部 skip 则为 None），再 all-reduce 求平均
         if world > 1:
@@ -410,20 +425,22 @@ def main():
         # clip_grad_norm_ 返回裁剪前的总范数，用来确认梯度在流动（loss 前向值恒≈0，看 grad_norm 才有意义）
         grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, 1.0))
         opt.step()
-        if last_rewards is not None:
-            reward_history.append(float(last_rewards.mean()))
+        reward_stats = torch.cat(step_rewards) if step_rewards else None
+        reward_std = torch.stack([x.std() for x in step_rewards]).mean() if step_rewards else None
+        if reward_stats is not None:
+            reward_history.append(float(reward_stats.mean()))
 
         if is_main and (step % 10 == 0 or args.smoke):
-            if last_rewards is not None:
+            if reward_stats is not None:
                 roll_mean = sum(reward_history) / len(reward_history) if reward_history else 0.0
                 print(
                     f"step {step} loss {last_loss:.4f} grad_norm {grad_norm:.4f} "
-                    f"reward {float(last_rewards.mean()):.3f} std {float(last_rewards.std()):.3f} "
+                    f"reward {float(reward_stats.mean()):.3f} std {float(reward_std):.3f} "
                     f"reward_avg{len(reward_history)} {roll_mean:.3f} "
                     f"(eff_batch={world * accum})"
                 )
             else:
-                print(f"step {step} all-skipped (eff_batch={world * accum})")
+                print(f"step {step} no-rank0-reward grad_norm {grad_norm:.4f} (eff_batch={world * accum})")
 
         # 周期保存：崩溃不丢进度，可从最近 checkpoint 评测/续训（step 0 不保存，无意义）
         if is_main and args.save_steps > 0 and step > 0 and step % args.save_steps == 0:

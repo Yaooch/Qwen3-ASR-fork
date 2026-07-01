@@ -99,6 +99,14 @@ def test_grpo_loss_finite_and_sign():
     loss.backward()
     assert logp.grad is not None
 
+def test_grpo_kl_penalty_is_zero_at_ref_and_positive_when_changed():
+    adv = torch.zeros(2)
+    same = torch.zeros(2, requires_grad=True)
+    moved = torch.tensor([1.0, -1.0], requires_grad=True)
+    ref = torch.zeros(2)
+    assert float(grpo_loss(same, same.detach(), adv, ref, beta=1.0).detach()) == 0.0
+    assert float(grpo_loss(moved, moved.detach(), adv, ref, beta=1.0).detach()) > 0.0
+
 
 # --------------------------------------------------------------------------
 # grpo_lora: apply_lora（集成，需真实 ckpt，默认跳过）
