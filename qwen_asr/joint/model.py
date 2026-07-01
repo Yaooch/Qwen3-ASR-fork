@@ -329,6 +329,19 @@ class Qwen3ASRJointModel(nn.Module):
         tasks = names(tasks or self.train_tasks, {"llm", "ctc", "rnnt"}, "tasks")
         aux_tasks = [x for x in ("ctc", "rnnt") if x in tasks]
         need_llm = "llm" in tasks
+        # 纯文本路径(NLU):无音频输入,跳过 audio_tower,直接 thinker 文本前向。
+        # ASR / ASR+NLU 路径(input_features 非空)不受影响,仍走下方 audio encode。
+        if input_features is None:
+            if aux_tasks:
+                raise ValueError("纯文本样本(input_features 为空)不支持 ctc/rnnt,仅支持 llm 任务。")
+            if not need_llm:
+                raise ValueError("纯文本样本至少需要 llm 任务。")
+            out = self.qwen_model.thinker(
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels,
+            )
+            outputs = {"output_lengths": None, "llm_loss": out.loss}
+            outputs["loss"] = self.loss_weights.get("llm", 1.0) * out.loss
+            return outputs
         # 训练时 CTC/RNNT 和可选 LLM 复用同一次 encoder 输出。
         tower = self.qwen_model.thinker.audio_tower
         feat_lengths = feature_lens(input_features, feature_attention_mask)
