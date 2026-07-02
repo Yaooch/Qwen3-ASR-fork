@@ -19,9 +19,9 @@ export OMP_NUM_THREADS=4
 
 # 基线 joint checkpoint(已有 ASR 能力)
 ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-train_file="/root/asr_project/Qwen3-ASR/all_nlu_task.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_lora"
-logging_dir="./logs/logs_nlu"
+train_file="/cfs/data/private/WangYaoChi/train_data/all/nlu/voyah_nlu_train_2.jsonl"
+output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
+logging_dir="./logs/logs_ctc_50_nlu_2"
 
 batch_size=32
 grad_acc=4

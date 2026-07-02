@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50_sft"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_sft/train_mode"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
+outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_nlu_2/train_mode"
 mode="llm,ctc"
 stage="all" 
 gpu_ids="0,1,2,3"
@@ -19,7 +19,7 @@ pinyin_style="tone3"
 pinyin_topk_badcases=100
 text_topk_badcases=300
 # lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_3/lora"
-lora=""
+lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
 
 # 字段：name|wav.scp|text|language。language 为空或 None 时跳过 LID 统计。
 DATASETS=(

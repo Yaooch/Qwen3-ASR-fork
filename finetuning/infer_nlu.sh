@@ -10,12 +10,14 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-input_file="${1:?用法: infer_nlu.sh <input.jsonl> [GPU_IDS]}"
-gpu_ids="${2:-0}"
+# 用法: infer_nlu.sh [input.jsonl] [GPU_IDS]; 不传 input 用默认测试集
+default_input="/cfs/data/private/WangYaoChi/train_data/all/nlu/voyah_nlu_test_2.jsonl"
+input_file="${1:-$default_input}"
+gpu_ids="${2:-0,1,2,3}"
 
 ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_lora"
-output_dir="./nlu_out"
+lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_nlu_2"
 
 eval_flag=()
 if [[ "${EVAL:-0}" == "1" ]]; then
@@ -28,6 +30,6 @@ python infer_nlu.py \
     --input_file "$input_file" \
     --output_dir "$output_dir" \
     --gpu_ids "$gpu_ids" \
-    --batch_size 16 \
+    --batch_size 32 \
     --max_new_tokens 256 \
     "${eval_flag[@]}"
