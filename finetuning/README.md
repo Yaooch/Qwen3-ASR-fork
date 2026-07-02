@@ -16,6 +16,8 @@ train_nlu.py      NLU(用户意图提取)LoRA SFT 入口
 infer_nlu.py      NLU 文本推理 + 意图评测入口
 train_nlu.sh      NLU 训练启动脚本
 infer_nlu.sh      NLU 推理/评测启动脚本
+train_asr_nlu.py  ASR + ASR+NLU 联合 LoRA SFT 入口
+train_asr_nlu.sh  ASR+NLU 联合训练启动脚本
 ```
 
 ## 训练
@@ -62,3 +64,18 @@ EVAL=1 bash infer_nlu.sh <input_with_ref.jsonl> 0 # 评测（输出 name_acc / a
 ```
 
 输入 jsonl 每行 `{"messages":[{system},{user},{assistant}]}`（`assistant` 可选；`--eval` 时作 ref），也支持 `{"text":"..."}`。默认基线 / LoRA / 数据路径在 `train_nlu.sh`、`infer_nlu.sh` 顶部。意图 prompt 构造与评测指标工具在 `qwen_asr/tools/nlu.py`。本期只验证 NLU，为后期三能力（ASR / NLU / ASR+NLU）统一留接口。
+
+## ASR + ASR+NLU 联合训练
+
+只训 NLU 会让 LoRA 扰动 thinker 导致 ASR 崩，因此用同一批 TTS 两用数据（音频+文本+意图）派生 ASR + ASR+NLU 两种样本联合训练同一个 LoRA：
+
+- ASR     ：system="转写语音"，              target=`language X<asr_text>文本`
+- ASR+NLU ：system="转写语音并提取用户意图"， target=`language X<asr_text>文本\n意图JSON`
+
+数据每行 `{"messages":[{system},{user:audio_path},{assistant}]}`，assistant 格式 `language X<asr_text>文本\n意图JSON`。`expand_two_way` 自动把每条派生成 ASR + ASR+NLU 两个样本（1:1）。
+
+```bash
+bash train_asr_nlu.sh "0,1,2,3"
+```
+
+只算 LLM loss（`joint.train_tasks=("llm",)`），不动 ctc/rnnt；LoRA 同样打在 thinker 文本解码器。推理 ASR+NLU 用 `infer.sh --prompt "转写语音并提取用户意图"`（输出"文本\n意图"）。
