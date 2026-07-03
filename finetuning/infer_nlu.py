@@ -1,14 +1,13 @@
 # finetuning/infer_nlu.py
-"""NLU（用户意图提取）批量推理 + 评测。
+"""NLU / Agent 批量推理 + 评测。
 
-加载基线 joint checkpoint + NLU LoRA，文本输入（user 语句）-> 意图 JSON。
-多卡数据并行（spawn），结构与 infer.py 一致。
+加载基线 joint checkpoint + LoRA，文本输入 -> 生成，按 --task 评测：
+  nlu   : user 语句  -> 意图 JSON,            评测 json_valid / name_acc / args_exact
+  agent : user prompt -> Action&&Action Input,  评测 format_valid / action_acc / params_exact / exact_str
+多卡数据并行(spawn)，结构与 infer.py 一致。
 
-输入 jsonl 每行支持：
-  {"messages": [{system}, {user}, {assistant}]}  # assistant 可选；--eval 时作为 ref
-  {"text": "..."} 或 {"system": "...", "user": "...", "assistant": "..."}
-
-用法：见 infer_nlu.sh。
+输入 jsonl 每行 {"messages":[{system},{user},{assistant}]}（assistant 可选；--eval 时作 ref），
+也支持 {"text":"..."}。用法：见 infer_nlu.sh。
 """
 import argparse
 import json
@@ -23,9 +22,11 @@ from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
 from qwen_asr.tools.nlu import (
     NLU_SYSTEM_PROMPT,
+    agent_metrics,
     build_nlu_prompt,
     intent_metrics,
     nlu_messages,
+    parse_agent,
     parse_intent,
 )
 
@@ -35,9 +36,9 @@ def log(msg: str):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Qwen3-ASR NLU 批量推理 / 评测。")
+    p = argparse.ArgumentParser(description="Qwen3-ASR NLU/Agent 批量推理 / 评测。")
     p.add_argument("--ckpt", required=True, help="基线 joint checkpoint 目录")
-    p.add_argument("--lora", default=None, help="NLU LoRA 目录；不传则只跑基线")
+    p.add_argument("--lora", default=None, help="LoRA 目录；不传则只跑基线")
     p.add_argument("--input_file", required=True, help="输入 jsonl")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--gpu_ids", default="0")
@@ -45,7 +46,9 @@ def parse_args():
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--system", default=None, help="覆盖 system prompt；默认用数据里的或 NLU_SYSTEM_PROMPT")
-    p.add_argument("--eval", action="store_true", help="输入含 assistant ref，输出意图指标")
+    p.add_argument("--task", choices=["nlu", "agent"], default="nlu",
+                   help="nlu=意图JSON, agent=Action&&Action Input")
+    p.add_argument("--eval", action="store_true", help="输入含 assistant ref，输出指标")
     return p.parse_args()
 
 
@@ -126,7 +129,6 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
                     "utt_id": b["utt_id"],
                     "user": b["user"],
                     "pred_text": text,
-                    "intent": parse_intent(text),
                     "ref": b["ref"],
                 })
 
@@ -136,7 +138,7 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
     log(f"进程{rank}完成")
 
 
-def merge(tmp_files, output_dir, do_eval):
+def merge(tmp_files, output_dir, do_eval, task):
     os.makedirs(output_dir, exist_ok=True)
     rows = []
     for path in tmp_files:
@@ -145,19 +147,32 @@ def merge(tmp_files, output_dir, do_eval):
                 rows.extend(json.loads(line) for line in f if line.strip())
     rows.sort(key=lambda x: x["utt_id"])
 
+    parser = parse_agent if task == "agent" else parse_intent
+    for r in rows:
+        r["pred_parsed"] = parser(r.get("pred_text", ""))
+        r["ref_parsed"] = parser(r["ref"]) if r.get("ref") else None
+
     detail_path = os.path.join(output_dir, "results_detail.jsonl")
     with open(detail_path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if do_eval:
-        preds = [r["intent"] for r in rows]
-        refs = [parse_intent(r["ref"]) or {} for r in rows]
-        metrics = intent_metrics(preds, refs)
+        preds = [r["pred_parsed"] for r in rows]
+        refs = [r["ref_parsed"] or {} for r in rows]
+        if task == "agent":
+            metrics = agent_metrics(preds, refs)
+            n = len(rows)
+            metrics["exact_str_rate"] = (
+                sum(1 for r in rows if (r.get("pred_text") or "").strip() == (r.get("ref") or "").strip()) / n
+                if n else 0.0
+            )
+        else:
+            metrics = intent_metrics(preds, refs)
         metrics_path = os.path.join(output_dir, "metrics.json")
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
-        print("NLU 评测指标：")
+        print(f"{task.upper()} 评测指标：")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
     print(f"明细：{detail_path}")
@@ -175,9 +190,10 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
 
-    print("NLU 推理配置")
+    print(f"{args.task.upper()} 推理配置")
     print(f"基线：{args.ckpt}")
     print(f"LoRA：{args.lora or '(无，基线)'}")
+    print(f"任务：{args.task}")
     print(f"输入：{args.input_file}")
     print(f"输出：{args.output_dir}")
     print(f"GPU：{ids}")
@@ -199,7 +215,7 @@ def main():
             if proc.exitcode != 0:
                 raise RuntimeError(f"子进程失败，exitcode={proc.exitcode}")
 
-    merge(tmp_files, args.output_dir, args.eval)
+    merge(tmp_files, args.output_dir, args.eval, args.task)
     for path in tmp_files:
         if os.path.exists(path):
             os.remove(path)

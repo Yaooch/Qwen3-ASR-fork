@@ -99,6 +99,55 @@ def intent_metrics(preds: List[Optional[Dict]], refs: List[Dict]) -> Dict[str, f
     }
 
 
+# --------------------------------------------------------------------------
+# Agent (工具调用) 解析与指标
+# --------------------------------------------------------------------------
+# assistant 格式: "Action&&param1=&v1@param2=&v2"  (ReAct 风格 Action && Action Input)
+# 例如: "schedule_operation&&operation_type=&add@time=&国庆22点@event=&去开会"
+
+
+def parse_agent(text: str) -> Optional[Dict]:
+    """解析 'Action&&param=&v@param=&v' 为 {"action":..., "params":{...}}。失败返回 None。"""
+    if not text or "&&" not in text:
+        return None
+    action, _, action_input = text.partition("&&")
+    action = action.strip()
+    if not action:
+        return None
+    params: Dict[str, str] = {}
+    for kv in action_input.split("@"):
+        if "=&" in kv:
+            k, _, v = kv.partition("=&")
+            k = k.strip()
+            if k:
+                params[k] = v.strip()
+    return {"action": action, "params": params}
+
+
+def agent_metrics(preds: List[Optional[Dict]], refs: List[Dict]) -> Dict[str, float]:
+    """返回 format_valid_rate / action_acc / params_exact_rate。
+
+    - format_valid_rate: 输出能解析为合法 Action&&Action Input 的比例
+    - action_acc:        Action(工具)名命中率
+    - params_exact_rate: action + params 全等的精确匹配率
+    """
+    n = len(refs)
+    if n == 0:
+        return {"format_valid_rate": 0.0, "action_acc": 0.0, "params_exact_rate": 0.0}
+    valid = sum(1 for p in preds if p is not None)
+    action_ok = sum(1 for p, r in zip(preds, refs) if p and r and p.get("action") == r.get("action"))
+    params_ok = sum(
+        1
+        for p, r in zip(preds, refs)
+        if p and r and p.get("action") == r.get("action") and p.get("params") == r.get("params")
+    )
+    return {
+        "format_valid_rate": valid / n,
+        "action_acc": action_ok / n,
+        "params_exact_rate": params_ok / n,
+    }
+
+
 __all__ = [
     "NLU_SYSTEM_PROMPT",
     "NLU_CHAT_TEMPLATE",
@@ -106,4 +155,6 @@ __all__ = [
     "build_nlu_prompt",
     "parse_intent",
     "intent_metrics",
+    "parse_agent",
+    "agent_metrics",
 ]
