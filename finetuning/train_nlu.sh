@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-gpu_ids="0,1,2,3"
+gpu_ids="0,1,2,3,4,5,6,7"
 if [[ $# -gt 0 ]]; then
     gpu_ids="$1"
 fi
@@ -19,19 +19,28 @@ export OMP_NUM_THREADS=4
 
 # 基线 joint checkpoint(已有 ASR 能力)
 ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-train_file="/cfs/data/private/WangYaoChi/train_data/all/nlu/voyah_nlu_train_2.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
-logging_dir="./logs/logs_ctc_50_nlu_2"
+# ckpt="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
+train_file="/root/asr_project/Qwen3-ASR/voyah_agent_train_split.jsonl"
+# train_file="/root/asr_project/Qwen3-ASR/all_full_nlu_train.jsonl"
+output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_5"
+logging_dir="./logs/logs_ctc_50_nlu_5"
 
 batch_size=32
 grad_acc=4
-epochs=2
+epochs=1
 lr=1e-4
 lora_r=32
 lora_alpha=64
 save_steps=500
 num_workers=4
 master_port=$(shuf -n 1 -i 20000-65000)
+
+# 全参微调: FULL_FT=1 bash train_nlu.sh (lr 建议降到 1e-5, batch 视显存调小)
+full_ft="${FULL_FT:-0}"
+full_ft_flag=()
+if [[ "$full_ft" == "1" ]]; then
+    full_ft_flag=(--full_ft)
+fi
 
 echo "==========================================================="
 echo "  启动 Qwen3-ASR NLU LoRA SFT"
@@ -53,4 +62,5 @@ torchrun --nproc_per_node="$num_gpus" --master_port "$master_port" \
     --lora_alpha "$lora_alpha" \
     --save_steps "$save_steps" \
     --logging_dir "$logging_dir" \
-    --num_workers "$num_workers"
+    --num_workers "$num_workers" \
+    "${full_ft_flag[@]}"

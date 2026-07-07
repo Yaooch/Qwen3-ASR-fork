@@ -91,6 +91,7 @@ def parse_args():
     p.add_argument("--logging_dir", type=str, default="./logs_nlu")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--resume_from", type=str, default="")
+    p.add_argument("--full_ft", action="store_true", help="全参微调(不挂 LoRA, 解冻 thinker 文本解码器)")
     return p.parse_args()
 
 
@@ -117,19 +118,25 @@ def main():
                 print("当前 transformers 不支持非重入 checkpoint。")
 
     resume_from = (args.resume_from or "").strip()
-    if resume_from:
+    if args.full_ft:
+        # 全参微调:不挂 LoRA, 解冻 thinker 文本解码器, 复用 train.py 的 set_trainable
+        from finetuning.train import set_trainable
+        set_trainable(joint, ("llm",))
+        model = joint
+    elif resume_from:
         from peft import PeftModel
-        peft = PeftModel.from_pretrained(joint, resume_from, is_trainable=True)
+        model = PeftModel.from_pretrained(joint, resume_from, is_trainable=True)
+        assert_only_text_decoder_trainable(model)
     else:
-        peft = apply_lora(joint, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
-    assert_only_text_decoder_trainable(peft)
-    if hasattr(peft, "enable_input_require_grads"):
-        peft.enable_input_require_grads()
+        model = apply_lora(joint, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
+        assert_only_text_decoder_trainable(model)
+    if not args.full_ft and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     if is_main:
-        trainable = sum(p.numel() for p in peft.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in peft.parameters())
-        print(f"NLU LoRA 可训练参数：{trainable:,} / {total:,}")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"{'全参' if args.full_ft else 'NLU LoRA'} 可训练参数：{trainable:,} / {total:,}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     lock_path = os.path.join(args.output_dir, ".dataset_cache.lock")
@@ -165,14 +172,28 @@ def main():
         report_to="tensorboard",
         logging_dir=args.logging_dir,
     )
-    trainer = Trainer(
-        model=peft,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=collator,
-        tokenizer=processor.tokenizer,
-    )
+    if args.full_ft:
+        from finetuning.train import JointTrainer
+        trainer = JointTrainer(
+            lr_by_group={"llm": args.lr, "proj": args.lr, "encoder": args.lr, "ctc": args.lr, "rnnt": args.lr},
+            save_heads=(),
+            head_source=args.ckpt,
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            data_collator=collator,
+            tokenizer=processor.tokenizer,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            data_collator=collator,
+            tokenizer=processor.tokenizer,
+        )
     trainer.train(resume_from_checkpoint=resume_from or None)
     trainer.save_model(args.output_dir)
     if is_main:
