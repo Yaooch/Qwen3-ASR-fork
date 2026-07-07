@@ -13,6 +13,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+from collections import Counter
 from datetime import datetime
 from typing import Dict, List
 
@@ -138,6 +139,68 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
     log(f"进程{rank}完成")
 
 
+def write_badcase(rows, path: str, task: str) -> int:
+    """把错的样本逐条 diff 写到 badcase.txt, 直观展示怎么错。返回 badcase 条数。"""
+    if task == "agent":
+        main_key, param_key = "action", "params"
+    else:
+        main_key, param_key = "name", "arguments"
+    n = len(rows)
+    bad = []
+    reasons = Counter()
+    for r in rows:
+        pp, rp = r.get("pred_parsed"), r.get("ref_parsed")
+        pred_str = (r.get("pred_text") or "").strip()
+        ref_str = (r.get("ref") or "").strip()
+        if pp == rp and pred_str == ref_str:
+            continue
+        bad.append(r)
+        if pp is None:
+            reasons["格式无效"] += 1
+        if rp and pp and pp.get(main_key) != rp.get(main_key):
+            reasons[f"{main_key}错"] += 1
+        if rp and pp and pp.get(main_key) == rp.get(main_key):
+            rpk = set((rp.get(param_key) or {}).keys())
+            ppk = set((pp.get(param_key) or {}).keys())
+            if rpk - ppk:
+                reasons["缺参数"] += 1
+            if ppk - rpk:
+                reasons["字段名错/多参数"] += 1
+            common = rpk & ppk
+            if any((rp.get(param_key) or {})[k] != (pp.get(param_key) or {})[k] for k in common):
+                reasons["值错"] += 1
+
+    lines = [f"===== BADCASE 报告 (task={task}, {len(bad)}/{n} 条错) =====\n"]
+    lines.append("错因汇总(同条可多类):")
+    for k, v in reasons.most_common():
+        lines.append(f"  {k}: {v}")
+    lines.append("\n===== 逐条 =====\n")
+    for i, r in enumerate(bad, 1):
+        pp, rp = r.get("pred_parsed"), r.get("ref_parsed")
+        lines.append(f"[{i:04d}] user: {(r.get('user') or '')[:80]}")
+        lines.append(f"  REF : {(r.get('ref') or '')[:200]}")
+        lines.append(f"  PRED: {(r.get('pred_text') or '')[:200]}")
+        if rp is None:
+            lines.append("  解析: REF 格式无效, 无法 diff")
+        elif pp is None:
+            lines.append(f"  解析: PRED 格式无效; REF {main_key}={rp.get(main_key)}")
+        else:
+            rv, pv = rp.get(main_key), pp.get(main_key)
+            lines.append(f"  [{'OK' if rv == pv else 'XX'}] {main_key}: ref={rv} | pred={pv}")
+            rpk = rp.get(param_key) or {}
+            ppk = pp.get(param_key) or {}
+            all_keys = list(rpk.keys()) + [k for k in ppk if k not in rpk]
+            for k in all_keys:
+                rv2 = rpk.get(k, "〈缺〉")
+                pv2 = ppk.get(k, "〈缺〉")
+                tag = " (多余)" if rv2 == "〈缺〉" else (" (缺)" if pv2 == "〈缺〉" else "")
+                lines.append(f"       [{'OK' if rv2 == pv2 else 'XX'}] {k}: ref={rv2} | pred={pv2}{tag}")
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return len(bad)
+
+
 def merge(tmp_files, output_dir, do_eval, task):
     os.makedirs(output_dir, exist_ok=True)
     rows = []
@@ -175,6 +238,8 @@ def merge(tmp_files, output_dir, do_eval, task):
         print(f"{task.upper()} 评测指标：")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
+    n_bad = write_badcase(rows, os.path.join(output_dir, "badcase.txt"), task)
+    print(f"badcase：{os.path.join(output_dir, 'badcase.txt')} ({n_bad}/{len(rows)} 条错)")
     print(f"明细：{detail_path}")
 
 
