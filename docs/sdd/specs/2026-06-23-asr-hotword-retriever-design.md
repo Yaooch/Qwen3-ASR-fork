@@ -1,5 +1,7 @@
 # 复现 asr-hotword 检索并接入现有热词流程
 
+> 历史设计：2026-07-24 已删除旧 pinyin retriever，FastRAG + 边界约束 DP 成为唯一 `HotwordRetriever` 实现。
+
 - 分支：`new-rag`
 - 日期：2026-06-23
 - 状态：已批准

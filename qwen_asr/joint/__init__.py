@@ -2,7 +2,6 @@
 
 from .ctc import CTC, CTCAdapter, CTCMoEAdapter
 from .hotword import HotwordRetriever
-from .asr_hotword import AsrHotwordRetriever
 from .model import Qwen3ASRJointModel
 from .defaults import DEFAULT_PROMPT, JOINT_CONFIG, hotword_prompt
 from .rnnt import RNNT
@@ -12,7 +11,6 @@ __all__ = [
     "CTCAdapter",
     "CTCMoEAdapter",
     "HotwordRetriever",
-    "AsrHotwordRetriever",
     "Qwen3ASRJointModel",
     "DEFAULT_PROMPT",
     "JOINT_CONFIG",

@@ -1,5 +1,7 @@
 # asr-hotword 检索复现接入 Implementation Plan
 
+> 历史计划：2026-07-24 已删除旧 pinyin retriever，FastRAG + 边界约束 DP 成为唯一 `HotwordRetriever` 实现。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sdd:subagent-driven-development (recommended) or sdd:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 `new-rag` 分支复现 asr-hotword 的两层检索（粗筛 FastRAG + 精筛边界约束 DP），以 adapter 接入现有「召回→注入 LLM prompt」流程，评测记录每条音频检索耗时与召回，两套 retriever 经开关切换对比。

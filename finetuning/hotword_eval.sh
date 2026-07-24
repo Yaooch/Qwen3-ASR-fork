@@ -16,13 +16,11 @@ input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/asr_hotword/voyah_prompt2"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/hotword/voyah_prompt2"
 gpu_ids="0,1,2,3"
 batch_size=64
 dtype="bf16"
 hotword_topk=5
-hotword_pinyin_style="normal"
-hotword_retriever="asr_hotword"
 encoder_mode="train_mask"
 # lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_4/lora-step2500"
 lora=""
@@ -33,8 +31,7 @@ declare -A arg_map=(
     [--target_hotword_file]=target_hotword_file
     [--output_dir]=output_dir
     [--gpu_ids]=gpu_ids [--batch_size]=batch_size [--dtype]=dtype
-    [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
-    [--hotword_retriever]=hotword_retriever
+    [--hotword_topk]=hotword_topk
     [--encoder_mode]=encoder_mode
     [--lora]=lora
 )
@@ -42,7 +39,7 @@ declare -A arg_map=(
 usage() {
     echo "用法：bash $0 --ckpt CKPT --input_scp wav.scp --ref_path text --hotword_file hotwords.txt --target_hotword_file utt_hotword.txt --output_dir out"
     echo "可选：--stage all|infer|eval"
-    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --hotword_pinyin_style normal|tone3 --encoder_mode offline|stream|train_mask"
+    echo "      --gpu_ids 0,1 --batch_size 8 --hotword_topk 5 --encoder_mode offline|stream|train_mask"
 }
 
 set_arg() {
@@ -111,8 +108,6 @@ if [[ "${stage}" == "all" || "${stage}" == "infer" ]]; then
         --encoder_mode "${encoder_mode}"
         --hotword_file "${hotword_file}"
         --hotword_topk "${hotword_topk}"
-        --hotword_pinyin_style "${hotword_pinyin_style}"
-        --hotword_retriever "${hotword_retriever}"
     )
     if [[ -n "${lora}" ]]; then
         infer_cmd+=(--lora "${lora}")

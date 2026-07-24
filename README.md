@@ -15,7 +15,7 @@
 - `qwen_asr/joint/ctc.py`：CTC 辅助头。
 - `qwen_asr/joint/rnnt.py`：RNNT 辅助头。
 - `qwen_asr/joint/model.py`：联合模型，支持 `llm/ctc/rnnt` 逗号组合。
-- `qwen_asr/joint/hotword.py`：基于粗识别文本的热词召回。
+- `qwen_asr/joint/hotword/`：FastRAG 粗筛 + 边界约束 DP 热词召回。
 - `qwen_asr/tools/pinyin_eval.py`：拼音级 PER/SAR 评估。
 - `finetuning/train.py`：联合训练入口。
 - `finetuning/infer.py`：批量推理入口。
@@ -36,7 +36,7 @@ qwen_asr/
     encoder.py    # Encoder、长度换算和流式 KV cache
     ctc.py        # CTC 辅助头
     rnnt.py       # RNNT 辅助头
-    hotword.py    # 热词召回
+    hotword/      # FastRAG + 边界约束 DP 热词召回
   tools/
     hotword_eval.py
     hotword_reward.py

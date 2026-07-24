@@ -18,7 +18,6 @@ dtype="bf16"
 language=""
 hotword_file=""
 hotword_topk=5
-hotword_pinyin_style="normal"
 lora=""
 lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_asr_nlu_1"
 encoder_mode="stream"
@@ -31,7 +30,7 @@ declare -A arg_map=(
     [--ckpt]=ckpt [--stage]=stage [--mode]=mode [--input_scp]=input_scp
     [--ref_dir]=ref_dir [--output_dir]=output_dir [--gpu_ids]=gpu_ids [--batch_size]=batch_size
     [--dtype]=dtype [--language]=language
-    [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk [--hotword_pinyin_style]=hotword_pinyin_style
+    [--hotword_file]=hotword_file [--hotword_topk]=hotword_topk
     [--lora]=lora
     [--encoder_mode]=encoder_mode
     [--wer_script]=wer_script
@@ -63,7 +62,6 @@ usage() {
     echo "  --language            默认语种，可不传"
     echo "  --hotword_file        热词文件，可不传"
     echo "  --hotword_topk        热词召回数量"
-    echo "  --hotword_pinyin_style 热词拼音召回风格：normal / tone3，默认 normal"
     echo "  --lora                RL 训出的 LoRA 目录，可不传；加载后推理用该 LoRA"
     echo "  --encoder_mode        Encoder 路径：offline / stream / train_mask"
     echo "  --stream              等价于 --encoder_mode stream"
@@ -205,7 +203,6 @@ fi
 if [[ -n "${hotword_file}" ]]; then
     infer_cmd+=(--hotword_file "${hotword_file}")
     infer_cmd+=(--hotword_topk "${hotword_topk}")
-    infer_cmd+=(--hotword_pinyin_style "${hotword_pinyin_style}")
 fi
 
 if [[ -n "${lora}" ]]; then

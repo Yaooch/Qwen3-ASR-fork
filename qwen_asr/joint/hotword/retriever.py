@@ -1,5 +1,5 @@
 # coding: utf-8
-"""asr-hotword 检索 adapter：复现对方两层检索，仅产出召回词列表。"""
+"""热词检索入口：FastRAG 粗筛 + 边界约束 DP 精筛。"""
 from typing import Dict, List
 
 from .phoneme import Phoneme, get_phoneme_info
@@ -7,8 +7,8 @@ from .calc import fuzzy_substring_search_constrained
 from .fast_rag import FastRAG
 
 
-class AsrHotwordRetriever:
-    """音素级两层检索（粗筛 FastRAG + 精筛边界约束 DP），接口对齐 HotwordRetriever。"""
+class HotwordRetriever:
+    """音素级两层热词检索。"""
 
     def __init__(
         self,
@@ -28,7 +28,7 @@ class AsrHotwordRetriever:
         self._rag.add_hotwords(self._phonemes)
 
     @classmethod
-    def from_file(cls, path: str, **kwargs) -> "AsrHotwordRetriever":
+    def from_file(cls, path: str, **kwargs) -> "HotwordRetriever":
         with open(path, "r", encoding="utf-8") as f:
             hotwords = [line.strip() for line in f if line.strip()]
         return cls(hotwords, **kwargs)

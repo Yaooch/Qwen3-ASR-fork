@@ -5,8 +5,8 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 ## 目录边界
 
 - 官方能力放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
-- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe` 主推理入口，`encoder.py` 负责 Encoder、长度换算和流式 KV cache，`ctc.py/rnnt.py/hotword.py/defaults.py` 分别放对应核心逻辑。
-- `qwen_asr/joint/asr_hotword/` 子包复现自 asr-hotword 的音素级两层检索（粗筛 `FastRAG` + 精筛边界约束 DP），经 `AsrHotwordRetriever` adapter 对齐 `HotwordRetriever` 接口，仅在 `--hotword_retriever asr_hotword` 时启用。
+- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe` 主推理入口，`encoder.py` 负责 Encoder、长度换算和流式 KV cache，`ctc.py/rnnt.py/defaults.py` 分别放对应核心逻辑。
+- 热词检索只保留 `qwen_asr/joint/hotword/` 的音素级两层实现：`FastRAG` 粗筛 + 边界约束 DP 精筛，统一由 `HotwordRetriever` 对外提供接口。
 - `finetuning/` 只放长期使用的训练、推理、评估入口；`qwen_asr/tools/` 只保留主链路依赖或会重复使用的评估/诊断工具，一次性数据加工脚本不要提交到仓库。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr/joint/defaults.py`。
 
@@ -46,7 +46,7 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 
 ## 热词和评估约定
 
-- 热词召回默认使用 pinyin retriever（`HotwordRetriever`），缺少 `pypinyin` 直接报错；`infer.py` 经 `--hotword_retriever {pinyin,asr_hotword}` 可切换到复现的音素级 `AsrHotwordRetriever`（默认 pinyin）。
+- 热词召回固定使用 `HotwordRetriever` 的音素级两层检索，不再提供算法选择或拼音风格参数；缺少 `pypinyin/rapidfuzz` 时直接报错。
 - 热词推理可用 `--keep_origin_llm 0/1` 控制是否保留默认 LLM 输出，默认保留；热词库和评估目标热词分开，评估目标格式为 `utt_id<TAB>热词1,热词2`。
 - 热词测试集按语言拆分输出到测试集目录下的 `Mandarin/` 和 `English/`，`hotword.txt` 从拆分后的目标热词重新生成。
 - 拼音评估兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本`；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。
