@@ -4,9 +4,8 @@
 不在模块顶部 import 重模型，便于单测快速加载。apply_lora 内部惰性 import peft。
 """
 import json
-import random
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -47,20 +46,6 @@ def load_samples(jsonl_path: str, limit: Optional[int] = None) -> List[GrpoSampl
     return samples
 
 
-def split_eval(
-    samples: List[GrpoSample], eval_ratio: float = 0.02, seed: int = 42
-) -> Tuple[List[GrpoSample], List[GrpoSample]]:
-    """随机留 eval_ratio 比例作 eval，其余作 train。"""
-    rng = random.Random(seed)
-    idx = list(range(len(samples)))
-    rng.shuffle(idx)
-    n_eval = int(len(idx) * eval_ratio)
-    eval_idx = set(idx[:n_eval])
-    train = [samples[i] for i in range(len(samples)) if i not in eval_idx]
-    eval_ = [samples[i] for i in idx[:n_eval]]
-    return train, eval_
-
-
 # --------------------------------------------------------------------------
 # GRPO 数学
 # --------------------------------------------------------------------------
@@ -99,17 +84,6 @@ def grpo_loss(
 # LoRA 装配
 # --------------------------------------------------------------------------
 
-# thinker 文本解码器的注意力与 MLP 投影。audio_tower 的注意力层同名(q_proj 等)，
-# 故用正则限定到 thinker.model.layers 下，避免误挂音频侧。
-TEXT_DECODER_TARGETS = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
 # peft 用 re.fullmatch 匹配整条模块路径。前缀可选：训练时包 joint（有 base_model.model.qwen_model. 前缀），
 # 评测时包 qwen_model（无前缀，键为 thinker.model...），两种都需命中；audio_tower 同名层靠 `.model.layers` 排除。
 TEXT_DECODER_TARGET_REGEX = (

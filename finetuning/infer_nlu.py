@@ -1,14 +1,5 @@
 # finetuning/infer_nlu.py
-"""NLU / Agent 批量推理 + 评测。
-
-加载基线 joint checkpoint + LoRA，文本输入 -> 生成，按 --task 评测：
-  nlu   : user 语句  -> 意图 JSON,            评测 json_valid / name_acc / args_exact
-  agent : user prompt -> Action&&Action Input,  评测 format_valid / action_acc / params_exact / exact_str
-多卡数据并行(spawn)，结构与 infer.py 一致。
-
-输入 jsonl 每行 {"messages":[{system},{user},{assistant}]}（assistant 可选；--eval 时作 ref），
-也支持 {"text":"..."}。用法：见 infer_nlu.sh。
-"""
+"""纯文本 NLU / Agent 批量推理与评测，支持 joint checkpoint 和纯 Qwen3 LLM。"""
 import argparse
 import json
 import multiprocessing as mp
@@ -18,6 +9,8 @@ from datetime import datetime
 from typing import Dict, List
 
 import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
@@ -37,19 +30,19 @@ def log(msg: str):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Qwen3-ASR NLU/Agent 批量推理 / 评测。")
-    p.add_argument("--ckpt", required=True, help="基线 joint checkpoint 目录")
-    p.add_argument("--lora", default=None, help="LoRA 目录；不传则只跑基线")
-    p.add_argument("--input_file", required=True, help="输入 jsonl")
+    p = argparse.ArgumentParser(description="NLU / Agent 批量推理与评测")
+    p.add_argument("--backend", choices=["joint", "llm"], default="joint")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--lora", default=None)
+    p.add_argument("--input_file", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--gpu_ids", default="0")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--max_new_tokens", type=int, default=256)
-    p.add_argument("--system", default=None, help="覆盖 system prompt；默认用数据里的或 NLU_SYSTEM_PROMPT")
-    p.add_argument("--task", choices=["nlu", "agent"], default="nlu",
-                   help="nlu=意图JSON, agent=Action&&Action Input")
-    p.add_argument("--eval", action="store_true", help="输入含 assistant ref，输出指标")
+    p.add_argument("--system", default=None)
+    p.add_argument("--task", choices=["nlu", "agent"], default=None)
+    p.add_argument("--eval", action="store_true")
     return p.parse_args()
 
 
@@ -60,16 +53,16 @@ def load_items(path: str, default_system: str) -> List[Dict]:
             line = line.strip()
             if not line:
                 continue
-            r = json.loads(line)
-            if "messages" in r:
-                msgs = r["messages"]
+            row = json.loads(line)
+            if "messages" in row:
+                msgs = row["messages"]
                 system = next((m["content"] for m in msgs if m["role"] == "system"), default_system)
                 user = next((m["content"] for m in msgs if m["role"] == "user"), "")
                 assistant = next((m["content"] for m in msgs if m["role"] == "assistant"), None)
             else:
-                system = r.get("system") or default_system
-                user = r.get("text") or r.get("user") or ""
-                assistant = r.get("assistant")
+                system = row.get("system") or default_system
+                user = row.get("text") or row.get("user") or ""
+                assistant = row.get("assistant")
             items.append({"utt_id": str(line_no), "system": system, "user": user, "ref": assistant})
     return items
 
@@ -88,49 +81,87 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
-    model = Qwen3ASRJointModel.from_pretrained(
-        args.ckpt, dtype=dtype, device_map=None, load_heads=False,
-        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
-    ).to(device)
-    if args.lora:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, args.lora)
+    if args.backend == "joint":
+        model = Qwen3ASRJointModel.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            load_heads=False,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+        ).to(device)
+        if args.lora:
+            model = PeftModel.from_pretrained(model, args.lora)
+        processor = model.processor
+        tokenizer = processor.tokenizer
+        suppress_tokens = None
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            trust_remote_code=True,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+        ).to(device)
+        if args.lora:
+            model = PeftModel.from_pretrained(model, args.lora)
+        processor = None
+        tokenizer.padding_side = "left"
+        suppress_tokens = [151667] if 151667 in tokenizer.get_added_vocab().values() else None
     model.eval()
-    processor = model.processor
-    default_system = args.system or NLU_SYSTEM_PROMPT
 
     rows = []
+    default_system = args.system or NLU_SYSTEM_PROMPT
     with torch.no_grad():
         for idx, batch in enumerate(batches(shard, args.batch_size), 1):
             if idx == 1 or idx % 20 == 0:
                 log(f"进程{rank}推理 batch {idx}")
-            prompts = [
-                build_nlu_prompt(
-                    processor,
-                    nlu_messages(b["system"] or default_system, b["user"]),
-                    add_generation_prompt=True,
+            messages = [nlu_messages(b["system"] or default_system, b["user"]) for b in batch]
+            if args.backend == "joint":
+                prompts = [
+                    build_nlu_prompt(processor, value, add_generation_prompt=True)
+                    for value in messages
+                ]
+                inputs = processor(text=prompts, audio=None, return_tensors="pt", padding=True)
+                inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
+                generated = model.qwen_model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=args.max_new_tokens,
                 )
-                for b in batch
-            ]
-            inputs = processor(text=prompts, audio=None, return_tensors="pt", padding=True)
-            inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
-            gen = model.qwen_model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=args.max_new_tokens,
-            )
-            seq = gen.sequences if hasattr(gen, "sequences") else gen
-            decoded = processor.batch_decode(
-                seq[:, inputs["input_ids"].shape[1]:],
+                sequences = generated.sequences if hasattr(generated, "sequences") else generated
+                decoder = processor
+            else:
+                prompts = [
+                    tokenizer.apply_chat_template(
+                        value,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                        tokenize=False,
+                    )
+                    for value in messages
+                ]
+                inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+                inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
+                sequences = model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=args.max_new_tokens,
+                    suppress_tokens=suppress_tokens,
+                    do_sample=False,
+                )
+                decoder = tokenizer
+            decoded = decoder.batch_decode(
+                sequences[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-            for b, text in zip(batch, decoded):
+            for item, text in zip(batch, decoded):
                 rows.append({
-                    "utt_id": b["utt_id"],
-                    "user": b["user"],
+                    "utt_id": item["utt_id"],
+                    "user": item["user"],
                     "pred_text": text,
-                    "ref": b["ref"],
+                    "ref": item["ref"],
                 })
 
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -140,65 +171,69 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
 
 
 def write_badcase(rows, path: str, task: str) -> int:
-    """把错的样本逐条 diff 写到 badcase.txt, 直观展示怎么错。返回 badcase 条数。"""
     if task == "agent":
         main_key, param_key = "action", "params"
     else:
         main_key, param_key = "name", "arguments"
-    n = len(rows)
     bad = []
     reasons = Counter()
     invalid_ref = 0
-    for r in rows:
-        pp, rp = r.get("pred_parsed"), r.get("ref_parsed")
-        if rp is None:
+    for row in rows:
+        pred, ref = row.get("pred_parsed"), row.get("ref_parsed")
+        if ref is None:
             invalid_ref += 1
             continue
-        if pp == rp:
+        if pred == ref:
             continue
-        bad.append(r)
-        if pp is None:
+        bad.append(row)
+        if pred is None:
             reasons["格式无效"] += 1
-        if rp and pp and pp.get(main_key) != rp.get(main_key):
+        if pred and pred.get(main_key) != ref.get(main_key):
             reasons[f"{main_key}错"] += 1
-        if rp and pp and pp.get(main_key) == rp.get(main_key):
-            rpk = set((rp.get(param_key) or {}).keys())
-            ppk = set((pp.get(param_key) or {}).keys())
-            if rpk - ppk:
+        if pred and pred.get(main_key) == ref.get(main_key):
+            ref_keys = set((ref.get(param_key) or {}).keys())
+            pred_keys = set((pred.get(param_key) or {}).keys())
+            if ref_keys - pred_keys:
                 reasons["缺参数"] += 1
-            if ppk - rpk:
+            if pred_keys - ref_keys:
                 reasons["字段名错/多参数"] += 1
-            common = rpk & ppk
-            if any((rp.get(param_key) or {})[k] != (pp.get(param_key) or {})[k] for k in common):
+            if any(
+                (ref.get(param_key) or {})[key] != (pred.get(param_key) or {})[key]
+                for key in ref_keys & pred_keys
+            ):
                 reasons["值错"] += 1
 
-    lines = [f"===== BADCASE 报告 (task={task}, {len(bad)}/{n} 条错) =====\n"]
+    lines = [f"===== BADCASE 报告 (task={task}, {len(bad)}/{len(rows)} 条错) =====\n"]
     if invalid_ref:
         lines.append(f"无效参考标注（未计入模型 badcase）: {invalid_ref} 条")
     lines.append("错因汇总(同条可多类):")
-    for k, v in reasons.most_common():
-        lines.append(f"  {k}: {v}")
+    for name, count in reasons.most_common():
+        lines.append(f"  {name}: {count}")
     lines.append("\n===== 逐条 =====\n")
-    for i, r in enumerate(bad, 1):
-        pp, rp = r.get("pred_parsed"), r.get("ref_parsed")
-        lines.append(f"[{i:04d}] user: {(r.get('user') or '')[-200:]}")
-        lines.append(f"  REF : {(r.get('ref') or '')[:200]}")
-        lines.append(f"  PRED: {(r.get('pred_text') or '')[:200]}")
-        if rp is None:
-            lines.append("  解析: REF 格式无效, 无法 diff")
-        elif pp is None:
-            lines.append(f"  解析: PRED 格式无效; REF {main_key}={rp.get(main_key)}")
+    for idx, row in enumerate(bad, 1):
+        pred, ref = row.get("pred_parsed"), row.get("ref_parsed")
+        lines.append(f"[{idx:04d}] user: {(row.get('user') or '')[-200:]}")
+        lines.append(f"  REF : {(row.get('ref') or '')[:200]}")
+        lines.append(f"  PRED: {(row.get('pred_text') or '')[:200]}")
+        if pred is None:
+            lines.append(f"  解析: PRED 格式无效; REF {main_key}={ref.get(main_key)}")
         else:
-            rv, pv = rp.get(main_key), pp.get(main_key)
-            lines.append(f"  [{'OK' if rv == pv else 'XX'}] {main_key}: ref={rv} | pred={pv}")
-            rpk = rp.get(param_key) or {}
-            ppk = pp.get(param_key) or {}
-            all_keys = list(rpk.keys()) + [k for k in ppk if k not in rpk]
-            for k in all_keys:
-                rv2 = rpk.get(k, "〈缺〉")
-                pv2 = ppk.get(k, "〈缺〉")
-                tag = " (多余)" if rv2 == "〈缺〉" else (" (缺)" if pv2 == "〈缺〉" else "")
-                lines.append(f"       [{'OK' if rv2 == pv2 else 'XX'}] {k}: ref={rv2} | pred={pv2}{tag}")
+            ref_value, pred_value = ref.get(main_key), pred.get(main_key)
+            lines.append(
+                f"  [{'OK' if ref_value == pred_value else 'XX'}] "
+                f"{main_key}: ref={ref_value} | pred={pred_value}"
+            )
+            ref_params = ref.get(param_key) or {}
+            pred_params = pred.get(param_key) or {}
+            keys = list(ref_params) + [key for key in pred_params if key not in ref_params]
+            for key in keys:
+                ref_value = ref_params.get(key, "〈缺〉")
+                pred_value = pred_params.get(key, "〈缺〉")
+                tag = " (多余)" if ref_value == "〈缺〉" else (" (缺)" if pred_value == "〈缺〉" else "")
+                lines.append(
+                    f"       [{'OK' if ref_value == pred_value else 'XX'}] "
+                    f"{key}: ref={ref_value} | pred={pred_value}{tag}"
+                )
         lines.append("")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -212,12 +247,12 @@ def merge(tmp_files, output_dir, do_eval, task):
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 rows.extend(json.loads(line) for line in f if line.strip())
-    rows.sort(key=lambda x: x["utt_id"])
+    rows.sort(key=lambda row: int(row["utt_id"]))
 
     parser = parse_agent if task == "agent" else parse_intent
-    for r in rows:
-        r["pred_parsed"] = parser(r.get("pred_text", ""))
-        r["ref_parsed"] = parser(r["ref"]) if r.get("ref") else None
+    for row in rows:
+        row["pred_parsed"] = parser(row.get("pred_text", ""))
+        row["ref_parsed"] = parser(row["ref"]) if row.get("ref") else None
 
     detail_path = os.path.join(output_dir, "results_detail.jsonl")
     with open(detail_path, "w", encoding="utf-8") as f:
@@ -225,64 +260,75 @@ def merge(tmp_files, output_dir, do_eval, task):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if do_eval:
-        preds = [r["pred_parsed"] for r in rows]
-        refs = [r["ref_parsed"] or {} for r in rows]
+        preds = [row["pred_parsed"] for row in rows]
+        refs = [row["ref_parsed"] or {} for row in rows]
+        metrics = agent_metrics(preds, refs) if task == "agent" else intent_metrics(preds, refs)
         if task == "agent":
-            metrics = agent_metrics(preds, refs)
-            n = len(rows)
             metrics["exact_str_rate"] = (
-                sum(1 for r in rows if (r.get("pred_text") or "").strip() == (r.get("ref") or "").strip()) / n
-                if n else 0.0
+                sum(
+                    1
+                    for row in rows
+                    if (row.get("pred_text") or "").strip() == (row.get("ref") or "").strip()
+                )
+                / len(rows)
+                if rows
+                else 0.0
             )
-        else:
-            metrics = intent_metrics(preds, refs)
-        metrics_path = os.path.join(output_dir, "metrics.json")
-        with open(metrics_path, "w", encoding="utf-8") as f:
+        with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
         print(f"{task.upper()} 评测指标：")
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
-    n_bad = write_badcase(rows, os.path.join(output_dir, "badcase.txt"), task)
-    print(f"badcase：{os.path.join(output_dir, 'badcase.txt')} ({n_bad}/{len(rows)} 条错)")
+        for name, value in metrics.items():
+            print(f"  {name}: {value:.4f}")
+
+    badcase_path = os.path.join(output_dir, "badcase.txt")
+    count = write_badcase(rows, badcase_path, task)
+    print(f"badcase：{badcase_path} ({count}/{len(rows)} 条错)")
     print(f"明细：{detail_path}")
 
 
 def main():
     args = parse_args()
-    default_system = args.system or NLU_SYSTEM_PROMPT
-    items = load_items(args.input_file, default_system)
+    if args.task is None:
+        args.task = "nlu" if args.backend == "joint" else "agent"
+    items = load_items(args.input_file, args.system or NLU_SYSTEM_PROMPT)
     if not items:
         raise ValueError(f"输入文件无可用样本：{args.input_file}")
-    ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip()]
-    if not ids:
+    gpu_ids = [int(value.strip()) for value in args.gpu_ids.split(",") if value.strip()]
+    if not gpu_ids:
         raise ValueError("gpu_ids 不能为空")
-    os.makedirs(args.output_dir, exist_ok=True)
-    tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    tmp_files = [
+        os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl")
+        for rank in range(len(gpu_ids))
+    ]
     print(f"{args.task.upper()} 推理配置")
+    print(f"后端：{args.backend}")
     print(f"基线：{args.ckpt}")
     print(f"LoRA：{args.lora or '(无，基线)'}")
-    print(f"任务：{args.task}")
     print(f"输入：{args.input_file}")
     print(f"输出：{args.output_dir}")
-    print(f"GPU：{ids}")
+    print(f"GPU：{gpu_ids}")
     print(f"样本数：{len(items)}")
     print(f"评测：{'是' if args.eval else '否'}")
 
-    if len(ids) == 1:
-        worker(0, ids[0], 1, args, items, tmp_files[0])
+    if len(gpu_ids) == 1:
+        worker(0, gpu_ids[0], 1, args, items, tmp_files[0])
     else:
         ctx = mp.get_context("spawn")
-        procs = [
-            ctx.Process(target=worker, args=(rank, gpu, len(ids), args, items, tmp_files[rank]))
-            for rank, gpu in enumerate(ids)
+        processes = [
+            ctx.Process(
+                target=worker,
+                args=(rank, gpu_id, len(gpu_ids), args, items, tmp_files[rank]),
+            )
+            for rank, gpu_id in enumerate(gpu_ids)
         ]
-        for proc in procs:
-            proc.start()
-        for proc in procs:
-            proc.join()
-            if proc.exitcode != 0:
-                raise RuntimeError(f"子进程失败，exitcode={proc.exitcode}")
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join()
+            if process.exitcode != 0:
+                raise RuntimeError(f"子进程失败，exitcode={process.exitcode}")
 
     merge(tmp_files, args.output_dir, args.eval, args.task)
     for path in tmp_files:

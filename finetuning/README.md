@@ -1,38 +1,35 @@
 # Finetuning 入口
 
-这个目录只保留训练、推理和评估脚本。核心模型代码在 `qwen_asr/joint/`。
+`finetuning/` 只保留长期使用的训练、推理和评估入口；模型核心在 `qwen_asr/joint/`。
 
 ## 文件
 
 ```text
-train.py          联合训练入口
-infer.py          批量推理入口
-train.sh          训练启动脚本
-infer.sh          推理 + WER + 拼音评估脚本
-infer_all.sh      多数据集批量推理和汇总脚本
-hotword_eval.sh   热词专项评估脚本
-qwen3_asr_sft.py  原始 SFT baseline
-train_nlu.py      NLU(用户意图提取)LoRA SFT 入口
-infer_nlu.py      NLU 文本推理 + 意图评测入口
-train_nlu.sh      NLU 训练启动脚本
-infer_nlu.sh      NLU 推理/评测启动脚本
-train_asr_nlu.py  ASR + ASR+NLU 联合 LoRA SFT 入口
-train_asr_nlu.sh  ASR+NLU 联合训练启动脚本
+train.py             联合 ASR/CTC/RNNT 训练
+infer.py             ASR 批量推理
+train.sh             联合训练配置
+infer.sh             推理 + WER + 拼音评估
+infer_all.sh         多数据集批量推理
+hotword_eval.sh      热词专项评估
+grpo_train.py        热词 GRPO 训练
+grpo_core.py         GRPO 数据、数学和文本 LoRA
+grpo_train.sh        GRPO 启动配置
+train_nlu.py         joint / 纯 Qwen3 文本 NLU SFT
+infer_nlu.py         joint / 纯 Qwen3 文本 NLU 推理评测
+train_nlu.sh         文本 NLU 启动配置
+infer_nlu.sh         文本 NLU 推理配置
+train_asr_nlu.py     ASR + ASR+NLU 联合 LoRA SFT
+infer_asr_nlu.py     ASR+NLU 推理和 CER/意图评测
+train_asr_nlu.sh     ASR+NLU 训练配置
+infer_asr_nlu.sh     ASR+NLU 推理配置
 ```
 
-## 训练
+## 联合 ASR 训练与推理
 
 ```bash
-bash train.sh "0,1,2,3"
-```
+bash finetuning/train.sh "0,1,2,3"
 
-常用配置直接改 `train.sh` 顶部变量。`--train` 只控制训练和 loss，不训练的已有 CTC/RNNT 头不加载，保存时原样复制。Audio window 使用模型配置默认值。
-默认词表路径、SentencePiece 路径和 WER 脚本路径在 `qwen_asr/joint/defaults.py` 中维护。
-
-## 推理
-
-```bash
-bash infer.sh \
+bash finetuning/infer.sh \
   --ckpt /path/to/checkpoint \
   --mode llm,ctc \
   --input_scp /path/to/wav.scp \
@@ -41,41 +38,50 @@ bash infer.sh \
   --gpu_ids 0,1
 ```
 
-`--mode` 只支持 `llm/ctc/rnnt` 的逗号组合，不再支持 `joint`。`--encoder_mode` 支持 `offline/stream/train_mask`：`offline` 使用整条音频离线前向，`stream` 使用真实 chunk-wise 流式路径，`train_mask` 使用与流式训练一致的整条 Mel + chunk mask Encoder 路径评测理论上限。`--stream/--no_stream` 分别兼容映射到 `stream/offline`。具体窗口参数在 `qwen_asr/joint/defaults.py` 中修改。
+`--mode` 支持 `llm/ctc/rnnt` 的逗号组合。`--encoder_mode` 支持
+`offline/stream/train_mask`；`train_mask` 只是训练侧 chunk mask 理论上限，
+线上真实流式评测使用 `stream`。
 
-热词评估会同时输出默认 LLM 和热词 prompt LLM，并比较两者的热词识别变化。
+## 文本 NLU / Agent
 
-## 批量推理
+文本任务统一使用 `train_nlu.py` 和 `infer_nlu.py`：
 
-```bash
-bash infer_all.sh --ckpt /path/to/checkpoint --datasets_file datasets.txt --outdir /path/to/out --encoder_mode train_mask
-```
-
-默认使用脚本内置数据集列表；传 `--datasets_file` 可覆盖。`datasets.txt` 每行格式：`name|wav.scp|text|language`。`infer_all.sh` 默认使用 `train_mask`，用于先观察与流式训练严格对齐时的评测结果；线上真实流式评测显式传 `--encoder_mode stream`。
-
-## NLU（用户意图提取）
-
-NLU 是纯文本任务（user 语句 → 意图 JSON），与 ASR 共存于同一 LLM：基线 joint checkpoint 冻结，LoRA 打在 thinker 文本解码器（复用 `grpo_core.apply_lora`），NLU 用独立的标准 Qwen chat format prompt（不走 ASR 的 audio chat_template），system prompt（"提取用户意图"）做任务路由。`joint.forward` 检测到 `input_features` 为空时走纯文本 thinker 前向分支，ASR 路径不受影响。
+- `--backend joint`：加载 `Qwen3ASRJointModel`，无音频时直接走 thinker 文本 forward。
+- `--backend llm`：加载纯 `AutoModelForCausalLM`。
+- 两种 backend 共用数据、label mask、评测指标、badcase 和多 GPU 分片逻辑。
 
 ```bash
-bash train_nlu.sh "0,1,2,3"                       # 训练
-bash infer_nlu.sh <input.jsonl> 0                 # 推理
-EVAL=1 bash infer_nlu.sh <input_with_ref.jsonl> 0 # 评测（输出 name_acc / args_exact / json_valid）
+BACKEND=joint FULL_FT=0 bash finetuning/train_nlu.sh "0,1,2,3"
+BACKEND=llm   FULL_FT=1 bash finetuning/train_nlu.sh "6,7"
+
+BACKEND=joint TASK=agent EVAL=1 bash finetuning/infer_nlu.sh
+BACKEND=llm   TASK=agent EVAL=1 bash finetuning/infer_nlu.sh
 ```
 
-输入 jsonl 每行 `{"messages":[{system},{user},{assistant}]}`（`assistant` 可选；`--eval` 时作 ref），也支持 `{"text":"..."}`。默认基线 / LoRA / 数据路径在 `train_nlu.sh`、`infer_nlu.sh` 顶部。意图 prompt 构造与评测指标工具在 `qwen_asr/tools/nlu.py`。本期只验证 NLU，为后期三能力（ASR / NLU / ASR+NLU）统一留接口。
+输入 JSONL 每行使用 `{"messages":[{system},{user},{assistant}]}`；推理也兼容
+`{"text":"..."}`。大数据文件统一放在
+`/cfs/data/private/WangYaoChi/train_data/all/nlu/`，不放仓库根目录。
 
-## ASR + ASR+NLU 联合训练
+## ASR + ASR+NLU
 
-只训 NLU 会让 LoRA 扰动 thinker 导致 ASR 崩，因此用同一批 TTS 两用数据（音频+文本+意图）派生 ASR + ASR+NLU 两种样本联合训练同一个 LoRA：
+ASR+NLU 保留独立入口，因为它使用音频输入并把一条标注派生为两条训练样本：
 
-- ASR     ：system="转写语音"，              target=`language X<asr_text>文本`
-- ASR+NLU ：system="转写语音并提取用户意图"， target=`language X<asr_text>文本\n意图JSON`
-
-数据每行 `{"messages":[{system},{user:audio_path},{assistant}]}`，assistant 格式 `language X<asr_text>文本\n意图JSON`。`expand_two_way` 自动把每条派生成 ASR + ASR+NLU 两个样本（1:1）。
+- ASR：prompt=`转写语音`，target=`language X<asr_text>文本`
+- ASR+NLU：prompt=`转写语音并提取用户意图`，target=`language X<asr_text>文本\n意图JSON`
 
 ```bash
-bash train_asr_nlu.sh "0,1,2,3"
+bash finetuning/train_asr_nlu.sh "0,1,2,3"
+bash finetuning/infer_asr_nlu.sh
 ```
 
-只算 LLM loss（`joint.train_tasks=("llm",)`），不动 ctc/rnnt；LoRA 同样打在 thinker 文本解码器。推理 ASR+NLU 用 `infer.sh --prompt "转写语音并提取用户意图"`（输出"文本\n意图"）。
+训练只更新 thinker 文本 LoRA；推理输出文本 CER 和意图指标。
+
+## 热词 GRPO
+
+```bash
+bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]
+bash finetuning/hotword_eval.sh
+```
+
+GRPO 的 checkpoint、数据和输出路径只在 shell/CLI 中配置。`grpo_train.py`
+不再保存另一套机器相关默认路径，并直接使用全部输入训练样本。

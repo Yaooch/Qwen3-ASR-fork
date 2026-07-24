@@ -205,7 +205,12 @@ def main():
         data_collator=collator,
         tokenizer=processor.tokenizer,
     )
-    trainer.train(resume_from_checkpoint=resume_from or None)
+    trainer_resume = (
+        resume_from
+        if resume_from and os.path.exists(os.path.join(resume_from, "trainer_state.json"))
+        else None
+    )
+    trainer.train(resume_from_checkpoint=trainer_resume)
     trainer.save_model(args.output_dir)
     if is_main:
         print(f"ASR+NLU LoRA 已保存到：{args.output_dir}")

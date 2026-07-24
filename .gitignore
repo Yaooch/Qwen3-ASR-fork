@@ -26,6 +26,7 @@ finetuning/logs
 .claude
 .opencode
 slu_data_process/
+reports/
 
 # 训练数据（大文件，不入库）
 *.jsonl

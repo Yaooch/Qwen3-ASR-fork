@@ -107,7 +107,7 @@ def intent_metrics(preds: List[Optional[Dict]], refs: List[Dict]) -> Dict[str, f
 
 
 def parse_agent(text: str) -> Optional[Dict]:
-    """解析 'Action解析 'Action&&param=&v@param=&v' 为解析 'Action&&param=&v@param=&v' 为param=解析 'Action&&param=&v@param=&v' 为v@param=解析 'Action&&param=&v@param=&v' 为v' 或无参数裸 Action 为 {"action":..., "params":{...}}。失败返回 None。"""
+    """解析 Action&&param=&value 或无参数裸 Action，失败返回 None。"""
     if not text:
         return None
     text = text.strip()

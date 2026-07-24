@@ -11,14 +11,13 @@ from finetuning.grpo_core import (
     group_advantages,
     grpo_loss,
     load_samples,
-    split_eval,
 )
 
 CKPT = "/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
 
 
 # --------------------------------------------------------------------------
-# grpo_data: load_samples / split_eval
+# grpo_data: load_samples
 # --------------------------------------------------------------------------
 
 
@@ -51,28 +50,6 @@ def test_load_samples_parses_fields():
     assert s.gt_text == "洪金宝演的"
     assert s.hotwords == ["洪金宝", "伊佐美纪"]
     assert "专属名词" in s.prompt
-
-
-def test_split_eval_disjoint_and_ratio():
-    rows = [
-        {
-            "audio": f"/{i}.wav",
-            "text": f"language Chinese<asr_text>x{i}",
-            "prompt": "专属名词：[a，b]",
-        }
-        for i in range(200)
-    ]
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".jsonl", delete=False, encoding="utf-8"
-    ) as f:
-        _write(f.name, rows)
-        path = f.name
-    samples = load_samples(path)
-    os.unlink(path)
-    tr, ev = split_eval(samples, eval_ratio=0.1, seed=42)
-    assert len(ev) == 20
-    assert len(tr) == 180
-    assert set(id(x) for x in tr).isdisjoint(set(id(x) for x in ev))
 
 
 # --------------------------------------------------------------------------

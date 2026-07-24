@@ -32,11 +32,7 @@ from finetuning.grpo_core import (
     group_advantages,
     grpo_loss,
     load_samples,
-    split_eval,
 )
-
-CKPT_DEFAULT = "/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
-DATA_DEFAULT = "/cfs/data/private/WangYaoChi/train_data/all/contextasr/train_contextasr2_zeroshot_prompt.jsonl"
 
 
 # --------------------------------------------------------------------------
@@ -242,9 +238,9 @@ class RolloutSampler:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", default=CKPT_DEFAULT)
-    p.add_argument("--data", default=DATA_DEFAULT)
-    p.add_argument("--output_dir", default="/cfs/data/private/WangYaoChi/model/grpo_lora_out")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--data", required=True)
+    p.add_argument("--output_dir", required=True)
     p.add_argument("--group_size", type=int, default=8, help="每条样本采样的 rollout 数 G")
     p.add_argument("--batch_size_per_rank", type=int, default=1, help="每卡每步累积样本数；effective batch = world_size × 此值")
     p.add_argument("--temperature", type=float, default=0.8)
@@ -253,7 +249,6 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--save_steps", type=int, default=100, help="每 N 步保存一次 LoRA 到 lora-step{N}；0 表示不周期保存")
     p.add_argument("--max_new_tokens", type=int, default=512)
-    p.add_argument("--eval_ratio", type=float, default=0.02)
     p.add_argument("--resume", type=int, default=0, choices=[0, 1], help="1 表示续训，0 表示重新训练")
     p.add_argument("--resume_from", default="", help="续训 LoRA 目录；为空时使用 output_dir/lora")
     p.add_argument("--smoke", action="store_true", help="少量样本 1 step 自检")
@@ -350,7 +345,7 @@ def main():
 
     limit = 8 if args.smoke else None
     samples = load_samples(args.data, limit=limit)
-    train, _eval = split_eval(samples, eval_ratio=args.eval_ratio)
+    train = samples
     # 多卡按 rank stride 切分，各卡样本数一致以保持步数对齐
     train_local = train[rank::world] if world > 1 else train
     max_steps = 1 if args.smoke else args.max_steps

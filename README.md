@@ -22,6 +22,9 @@
 - `finetuning/train.sh`：训练启动脚本。
 - `finetuning/infer.sh`：推理 + WER + 拼音评估脚本。
 - `finetuning/hotword_eval.sh`：热词 prompt 评估脚本。
+- `finetuning/grpo_train.py`：热词 GRPO 训练入口。
+- `finetuning/train_nlu.py`、`infer_nlu.py`：joint / 纯 Qwen3 文本 NLU 统一入口。
+- `finetuning/train_asr_nlu.py`、`infer_asr_nlu.py`：ASR+NLU 训练和评测入口。
 
 ## 目录结构
 
@@ -30,23 +33,29 @@ qwen_asr/
   joint/
     model.py      # 联合模型
     defaults.py   # 默认提示词和内部推理常量
-    stream.py     # 流式窗口和 chunk 特征
-    decode.py     # CTC/RNNT/LLM 推理
+    encoder.py    # Encoder、长度换算和流式 KV cache
     ctc.py        # CTC 辅助头
     rnnt.py       # RNNT 辅助头
     hotword.py    # 热词召回
   tools/
     hotword_eval.py
+    hotword_reward.py
+    nlu.py
     pinyin_eval.py
+    text_badcase.py
 
 finetuning/
   train.py        # 训练入口
   infer.py        # 推理入口
   train.sh        # 训练脚本
   infer.sh        # 推理 + WER + 拼音
-  infer_all.sh    # 多数据集推理
-  hotword_eval.sh # 热词评估
-  qwen3_asr_sft.py
+  infer_all.sh       # 多数据集推理
+  hotword_eval.sh    # 热词评估
+  grpo_train.py      # 热词 GRPO
+  train_nlu.py       # 文本 NLU（joint/llm）
+  infer_nlu.py       # 文本 NLU 推理评测
+  train_asr_nlu.py   # ASR+NLU
+  infer_asr_nlu.py   # ASR+NLU 推理评测
 ```
 
 ## 辅助头接入位置

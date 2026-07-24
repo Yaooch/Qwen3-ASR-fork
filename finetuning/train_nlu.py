@@ -1,14 +1,5 @@
 # finetuning/train_nlu.py
-"""NLU（用户意图提取）LoRA SFT 训练。
-
-基线 joint checkpoint 冻结，LoRA 打在 thinker 文本解码器（复用 grpo_core.apply_lora），
-纯文本 SFT：user 语句 -> assistant 意图 JSON。不走 audio_tower / ctc / rnnt；
-joint.forward 检测到 input_features 为空时走纯文本 thinker 前向分支。
-
-数据：jsonl 每行 {"messages": [{system}, {user}, {assistant}]}，按 eval_ratio 随机切 train/eval。
-
-用法：见 train_nlu.sh。
-"""
+"""纯文本 NLU / Agent SFT，支持 joint checkpoint 和纯 Qwen3 LLM。"""
 import argparse
 import os
 from dataclasses import dataclass
@@ -17,24 +8,34 @@ from typing import Any, Dict, List
 import torch
 from datasets import load_dataset
 from filelock import FileLock
-from transformers import Trainer, TrainingArguments
+from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
+from finetuning.grpo_core import apply_lora, assert_only_text_decoder_trainable
 from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
 from qwen_asr.tools.nlu import NLU_SYSTEM_PROMPT, build_nlu_prompt, nlu_messages
-from finetuning.grpo_core import apply_lora, assert_only_text_decoder_trainable
 
 
 @dataclass
 class NluCollator:
-    """纯文本 NLU collator：messages -> input_ids + labels（mask prompt，只对 assistant+eos 算 loss）。"""
-
-    processor: Any
+    tokenizer: Any
+    backend: str
+    processor: Any = None
     max_len: int = 512
 
     def __post_init__(self):
-        self.tokenizer = self.processor.tokenizer
         self.eos = self.tokenizer.eos_token or ""
+
+    def render(self, messages: List[Dict[str, str]]) -> str:
+        if self.backend == "joint":
+            return build_nlu_prompt(self.processor, messages, add_generation_prompt=True)
+        return self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            tokenize=False,
+        )
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         prefix_texts, full_texts = [], []
@@ -43,37 +44,39 @@ class NluCollator:
             system = next((m["content"] for m in msgs if m["role"] == "system"), NLU_SYSTEM_PROMPT)
             user = next((m["content"] for m in msgs if m["role"] == "user"), "")
             assistant = next((m["content"] for m in msgs if m["role"] == "assistant"), "")
-            prefix = build_nlu_prompt(self.processor, nlu_messages(system, user), add_generation_prompt=True)
+            prefix = self.render(nlu_messages(system, user))
             prefix_texts.append(prefix)
             full_texts.append(prefix + assistant + self.eos)
 
         old_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "right"
+        kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": True,
+            "max_length": self.max_len,
+        }
         try:
-            full_tok = self.tokenizer(
-                full_texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_len,
-            )
-            prefix_tok = self.tokenizer(
-                prefix_texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_len,
-            )
+            full_tok = self.tokenizer(full_texts, **kwargs)
+            prefix_tok = self.tokenizer(prefix_texts, **kwargs)
         finally:
             self.tokenizer.padding_side = old_side
 
         labels = full_tok["input_ids"].clone()
         for idx, length in enumerate(prefix_tok["attention_mask"].sum(dim=1).tolist()):
             labels[idx, :length] = -100
-        pad_id = self.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
+        if self.tokenizer.pad_token_id is not None:
+            labels[labels == self.tokenizer.pad_token_id] = -100
         full_tok["labels"] = labels
         return full_tok
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR NLU LoRA SFT")
-    p.add_argument("--ckpt", type=str, required=True, help="基线 joint checkpoint 目录（含 joint_config.json）")
-    p.add_argument("--train_file", type=str, required=True, help="NLU jsonl，每行 {messages:[system,user,assistant]}")
-    p.add_argument("--output_dir", type=str, required=True)
+    p = argparse.ArgumentParser("NLU / Agent 纯文本 SFT")
+    p.add_argument("--backend", choices=["joint", "llm"], default="joint")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--train_file", required=True)
+    p.add_argument("--output_dir", required=True)
     p.add_argument("--eval_ratio", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_len", type=int, default=512)
@@ -88,66 +91,102 @@ def parse_args():
     p.add_argument("--log_steps", type=int, default=20)
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--save_total_limit", type=int, default=3)
-    p.add_argument("--logging_dir", type=str, default="./logs_nlu")
+    p.add_argument("--logging_dir", default="./logs_nlu")
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--resume_from", type=str, default="")
-    p.add_argument("--full_ft", action="store_true", help="全参微调(不挂 LoRA, 解冻 thinker 文本解码器)")
+    p.add_argument("--resume_from", default="")
+    p.add_argument("--full_ft", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    is_main = local_rank == 0
-
+    is_main = int(os.environ.get("LOCAL_RANK", "0")) == 0
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-    joint = Qwen3ASRJointModel.from_pretrained(
-        args.ckpt,
-        dtype=torch.bfloat16 if use_bf16 else torch.float16,
-        device_map=None,
-        load_heads=False,
-        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
-    )
-    processor = joint.processor
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
 
-    if hasattr(joint.qwen_model, "gradient_checkpointing_enable"):
+    if args.backend == "joint":
+        base = Qwen3ASRJointModel.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            load_heads=False,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+        )
+        processor = base.processor
+        tokenizer = processor.tokenizer
+        checkpoint_model = base.qwen_model
+    else:
+        processor = None
+        tokenizer = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
+        base = AutoModelForCausalLM.from_pretrained(
+            args.ckpt,
+            dtype=dtype,
+            device_map=None,
+            trust_remote_code=True,
+            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+        )
+        checkpoint_model = base
+
+    if hasattr(checkpoint_model, "gradient_checkpointing_enable"):
         try:
-            joint.qwen_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            checkpoint_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         except TypeError:
             if is_main:
                 print("当前 transformers 不支持非重入 checkpoint。")
 
-    resume_from = (args.resume_from or "").strip()
+    resume_from = args.resume_from.strip()
+    trainer_resume = resume_from or None
     if args.full_ft:
-        # 全参微调:不挂 LoRA, 解冻 thinker 文本解码器, 复用 train.py 的 set_trainable
-        from finetuning.train import set_trainable
-        set_trainable(joint, ("llm",))
-        model = joint
+        if args.backend == "joint":
+            from finetuning.train import set_trainable
+
+            set_trainable(base, ("llm",))
+        else:
+            for param in base.parameters():
+                param.requires_grad_(True)
+        model = base
     elif resume_from:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(joint, resume_from, is_trainable=True)
-        assert_only_text_decoder_trainable(model)
+        model = PeftModel.from_pretrained(base, resume_from, is_trainable=True)
+        if args.backend == "joint":
+            assert_only_text_decoder_trainable(model)
+        if not os.path.exists(os.path.join(resume_from, "trainer_state.json")):
+            trainer_resume = None
+    elif args.backend == "joint":
+        model = apply_lora(base, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
     else:
-        model = apply_lora(joint, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
-        assert_only_text_decoder_trainable(model)
+        model = get_peft_model(
+            base,
+            LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ],
+                task_type="CAUSAL_LM",
+            ),
+        )
+
     if not args.full_ft and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
     if is_main:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        print(f"{'全参' if args.full_ft else 'NLU LoRA'} 可训练参数：{trainable:,} / {total:,}")
+        mode = "全参" if args.full_ft else "LoRA"
+        print(f"{args.backend} {mode} 可训练参数：{trainable:,} / {total:,}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    lock_path = os.path.join(args.output_dir, ".dataset_cache.lock")
-    with FileLock(lock_path):
+    with FileLock(os.path.join(args.output_dir, ".dataset_cache.lock")):
         ds = load_dataset("json", data_files={"train": args.train_file})["train"]
         split = ds.train_test_split(test_size=args.eval_ratio, seed=args.seed)
     train_ds, eval_ds = split["train"], split["test"]
     if is_main:
         print(f"训练样本：{len(train_ds)}，验证样本：{len(eval_ds)}")
 
-    collator = NluCollator(processor, max_len=args.max_len)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -172,32 +211,33 @@ def main():
         report_to="tensorboard",
         logging_dir=args.logging_dir,
     )
-    if args.full_ft:
+    collator = NluCollator(tokenizer, args.backend, processor, args.max_len)
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "data_collator": collator,
+        "tokenizer": tokenizer,
+    }
+    if args.backend == "joint" and args.full_ft:
         from finetuning.train import JointTrainer
+
         trainer = JointTrainer(
-            lr_by_group={"llm": args.lr, "proj": args.lr, "encoder": args.lr, "ctc": args.lr, "rnnt": args.lr},
+            lr_by_group={name: args.lr for name in ("llm", "proj", "encoder", "ctc", "rnnt")},
             save_heads=(),
             head_source=args.ckpt,
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=eval_ds,
-            data_collator=collator,
-            tokenizer=processor.tokenizer,
+            **trainer_kwargs,
         )
     else:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=eval_ds,
-            data_collator=collator,
-            tokenizer=processor.tokenizer,
-        )
-    trainer.train(resume_from_checkpoint=resume_from or None)
+        trainer = Trainer(**trainer_kwargs)
+
+    trainer.train(resume_from_checkpoint=trainer_resume)
     trainer.save_model(args.output_dir)
     if is_main:
-        print(f"NLU LoRA 已保存到：{args.output_dir}")
+        if args.backend == "llm":
+            tokenizer.save_pretrained(args.output_dir)
+        print(f"NLU 模型已保存到：{args.output_dir}")
 
 
 if __name__ == "__main__":
