@@ -4,22 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-outdir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_nlu_2/train_mode"
-mode="llm,ctc"
+# ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
+ckpt="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
+outdir="/cfs/data/private/WangYaoChi/test_out/qwen3_asr/offline"
+mode="llm"
 stage="all" 
-gpu_ids="0,1,2,3"
+gpu_ids="6,7"
 batch_size=256
 dtype="bf16"
 skip_done=0
 datasets_file=""
-encoder_mode="train_mask"  # 可选：offline|stream|train_mask
+encoder_mode="offline"  # 可选：offline|stream|train_mask
 wer_script="/root/scripts/compute_asr_wer_with_slu.py"
 pinyin_style="tone3"
 pinyin_topk_badcases=100
 text_topk_badcases=300
 # lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_3/lora"
-lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
+# lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_2"
+lora=""
 
 # 字段：name|wav.scp|text|language。language 为空或 None 时跳过 LID 统计。
 DATASETS=(

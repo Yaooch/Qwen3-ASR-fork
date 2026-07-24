@@ -1,9 +1,7 @@
 #!/bin/bash
-# finetuning/train_asr_nlu.sh — ASR + ASR+NLU 联合 LoRA SFT wrapper
-# 用法: bash finetuning/train_asr_nlu.sh [GPU_IDS]
-#
-# 用同一批 TTS 两用数据派生 ASR + ASR+NLU 两种样本联合训练，防止只训 NLU 导致 ASR 崩。
-# 数据每行 {"messages":[{system},{user:audio_path},{assistant="language X<asr_text>文本\n意图JSON"}]}
+# finetuning/train_nlu_pure.sh — 纯 Qwen3 LLM NLU SFT wrapper
+# 用原始 Qwen3-1.7B（未经 ASR 训练）做 NLU 微调
+# 用法: bash finetuning/train_nlu_pure.sh [GPU_IDS]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +9,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 cd "${SCRIPT_DIR}"
 
-gpu_ids="0,1,2,3,4,5,6,7"
+gpu_ids="6,7"
 if [[ $# -gt 0 ]]; then
     gpu_ids="$1"
 fi
@@ -19,32 +17,42 @@ num_gpus=$(echo "$gpu_ids" | awk -F',' '{print NF}')
 
 export CUDA_VISIBLE_DEVICES=$gpu_ids
 export OMP_NUM_THREADS=4
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-train_file="/cfs/data/private/WangYaoChi/train_data/all/nlu/voyah_asr_nlu_train_2.jsonl"
-output_dir="/cfs/data/private/WangYaoChi/model/joint_ctc_50_asr_nlu_1"
-logging_dir="./logs/logs_ctc_50_asr_nlu_1"
+# 原始 Qwen3-1.7B（未经 ASR 训练的纯 LLM）
+ckpt="/cfs/data/private/WangYaoChi/model/Qwen3-1.7B"
+train_file="/cfs/data/share/NLU/llm_training_data/LLM/20260716/generate/voyah_agent_train.jsonl"
+output_dir="/cfs/data/private/WangYaoChi/model/qwen3_1_7b_nlu_6"
+logging_dir="./logs/logs_qwen3_nlu_6"
 
-batch_size=32
+batch_size=4
 grad_acc=4
-epochs=10
+epochs=2
 lr=2e-5
 lora_r=32
 lora_alpha=64
-save_steps=500
+save_steps=1000
 num_workers=4
 master_port=$(shuf -n 1 -i 20000-65000)
 
+# 全参微调: FULL_FT=1 bash train_nlu_pure.sh
+# LoRA 微调: FULL_FT=0 bash train_nlu_pure.sh
+full_ft="${FULL_FT:-1}"
+full_ft_flag=()
+if [[ "$full_ft" == "1" ]]; then
+    full_ft_flag=(--full_ft)
+fi
+
 echo "==========================================================="
-echo "  启动 Qwen3-ASR ASR+NLU 联合 LoRA SFT"
+echo "  纯 Qwen3-1.7B NLU SFT"
 echo "  GPU: $gpu_ids  数量: $num_gpus"
 echo "  基线: $ckpt"
-echo "  数据: $train_file (每条派生 ASR + ASR+NLU)"
+echo "  模式: $([[ "$full_ft" == "1" ]] && echo '全参微调' || echo 'LoRA')"
 echo "  输出: $output_dir"
 echo "==========================================================="
 
 torchrun --nproc_per_node="$num_gpus" --master_port "$master_port" \
-    train_asr_nlu.py \
+    train_nlu_pure.py \
     --ckpt "$ckpt" \
     --train_file "$train_file" \
     --output_dir "$output_dir" \
@@ -56,4 +64,5 @@ torchrun --nproc_per_node="$num_gpus" --master_port "$master_port" \
     --lora_alpha "$lora_alpha" \
     --save_steps "$save_steps" \
     --logging_dir "$logging_dir" \
-    --num_workers "$num_workers"
+    --num_workers "$num_workers" \
+    "${full_ft_flag[@]}"

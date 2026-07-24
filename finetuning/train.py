@@ -255,6 +255,8 @@ class JointTrainer(Trainer):
             with torch.no_grad():
                 for batch in dataloader:
                     inputs = self._prepare_inputs(batch)
+                    if "input_features" not in inputs:
+                        return metrics
                     ref_param = next(base.qwen_model.parameters())
                     feats = inputs["input_features"].to(device=ref_param.device, dtype=ref_param.dtype)
                     mask = inputs.get("feature_attention_mask")

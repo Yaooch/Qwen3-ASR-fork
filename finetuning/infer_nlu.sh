@@ -12,14 +12,15 @@ cd "${SCRIPT_DIR}"
 
 # 用法: infer_nlu.sh [input.jsonl] [GPU_IDS]; 不传 input 用默认测试集
 # default_input="/cfs/data/private/WangYaoChi/train_data/all/nlu/voyah_nlu_test_2.jsonl"
-default_input="/root/asr_project/Qwen3-ASR/voyah_agent_test.jsonl"
+default_input="/root/asr_project/Qwen3-ASR/voyah_agent_train_split_3k.jsonl"
 input_file="${1:-$default_input}"
 gpu_ids="${2:-0,1,2,3}"
 task="${TASK:-agent}"  # nlu=意图JSON, agent=Action&&Action Input
 
-ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50"
-lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_3"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_nlu_3"
+ckpt="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_9"
+# lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_nlu_3"
+lora=""
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_nlu_9_train"
 
 # 默认评测模式; EVAL=0 关闭评测只跑推理
 eval_flag=(--eval)

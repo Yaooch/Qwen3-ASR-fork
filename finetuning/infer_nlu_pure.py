@@ -1,30 +1,23 @@
-# finetuning/infer_nlu.py
-"""NLU / Agent 批量推理 + 评测。
+# finetuning/infer_nlu_pure.py
+"""纯 Qwen3 LLM NLU/Agent 批量推理 + 评测（不经 Qwen3ASRJointModel）。
 
-加载基线 joint checkpoint + LoRA，文本输入 -> 生成，按 --task 评测：
-  nlu   : user 语句  -> 意图 JSON,            评测 json_valid / name_acc / args_exact
-  agent : user prompt -> Action&&Action Input,  评测 format_valid / action_acc / params_exact / exact_str
-多卡数据并行(spawn)，结构与 infer.py 一致。
-
-输入 jsonl 每行 {"messages":[{system},{user},{assistant}]}（assistant 可选；--eval 时作 ref），
-也支持 {"text":"..."}。用法：见 infer_nlu.sh。
+直接用 AutoModelForCausalLM 加载原始 Qwen3 checkpoint + LoRA。
+数据格式与 infer_nlu.py 一致。
 """
 import argparse
 import json
 import multiprocessing as mp
 import os
-from collections import Counter
 from datetime import datetime
 from typing import Dict, List
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
-from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
 from qwen_asr.tools.nlu import (
     NLU_SYSTEM_PROMPT,
     agent_metrics,
-    build_nlu_prompt,
     intent_metrics,
     nlu_messages,
     parse_agent,
@@ -37,19 +30,18 @@ def log(msg: str):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Qwen3-ASR NLU/Agent 批量推理 / 评测。")
-    p.add_argument("--ckpt", required=True, help="基线 joint checkpoint 目录")
-    p.add_argument("--lora", default=None, help="LoRA 目录；不传则只跑基线")
+    p = argparse.ArgumentParser(description="纯 Qwen3 NLU/Agent 批量推理 / 评测。")
+    p.add_argument("--ckpt", required=True, help="Qwen3 模型目录")
+    p.add_argument("--lora", default=None, help="LoRA 目录")
     p.add_argument("--input_file", required=True, help="输入 jsonl")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--gpu_ids", default="0")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--max_new_tokens", type=int, default=256)
-    p.add_argument("--system", default=None, help="覆盖 system prompt；默认用数据里的或 NLU_SYSTEM_PROMPT")
-    p.add_argument("--task", choices=["nlu", "agent"], default="nlu",
-                   help="nlu=意图JSON, agent=Action&&Action Input")
-    p.add_argument("--eval", action="store_true", help="输入含 assistant ref，输出指标")
+    p.add_argument("--system", default=None)
+    p.add_argument("--task", choices=["nlu", "agent"], default="agent")
+    p.add_argument("--eval", action="store_true")
     return p.parse_args()
 
 
@@ -81,23 +73,26 @@ def batches(items, size):
 
 def worker(rank, gpu_id, world_size, args, items, tmp_path):
     shard = items[rank::world_size]
-    if not torch.cuda.is_available():
-        raise RuntimeError("当前环境不可用 CUDA。")
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
-    model = Qwen3ASRJointModel.from_pretrained(
-        args.ckpt, dtype=dtype, device_map=None, load_heads=False,
-        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+    tokenizer = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.ckpt, dtype=dtype, device_map=None, trust_remote_code=True,
+        attn_implementation="flash_attention_2",
     ).to(device)
     if args.lora:
-        from peft import PeftModel
         model = PeftModel.from_pretrained(model, args.lora)
     model.eval()
-    processor = model.processor
     default_system = args.system or NLU_SYSTEM_PROMPT
+    tokenizer.padding_side = "left"
+
+    # 查  thinking token id，推理时 suppress 阻止模型进入 thinking
+    _added = tokenizer.get_added_vocab()
+    _think_id = next((v for v in _added.values() if v == 151667), None)
+    _suppress = [_think_id] if _think_id is not None else None
 
     rows = []
     with torch.no_grad():
@@ -105,23 +100,25 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
             if idx == 1 or idx % 20 == 0:
                 log(f"进程{rank}推理 batch {idx}")
             prompts = [
-                build_nlu_prompt(
-                    processor,
+                tokenizer.apply_chat_template(
                     nlu_messages(b["system"] or default_system, b["user"]),
                     add_generation_prompt=True,
+                    enable_thinking=False,
+                    tokenize=False,
                 )
                 for b in batch
             ]
-            inputs = processor(text=prompts, audio=None, return_tensors="pt", padding=True)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
             inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
-            gen = model.qwen_model.generate(
+            gen = model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 max_new_tokens=args.max_new_tokens,
+                suppress_tokens=_suppress,
+                do_sample=False,
             )
-            seq = gen.sequences if hasattr(gen, "sequences") else gen
-            decoded = processor.batch_decode(
-                seq[:, inputs["input_ids"].shape[1]:],
+            decoded = tokenizer.batch_decode(
+                gen[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
@@ -140,11 +137,11 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
 
 
 def write_badcase(rows, path: str, task: str) -> int:
-    """把错的样本逐条 diff 写到 badcase.txt, 直观展示怎么错。返回 badcase 条数。"""
     if task == "agent":
         main_key, param_key = "action", "params"
     else:
         main_key, param_key = "name", "arguments"
+    from collections import Counter
     n = len(rows)
     bad = []
     reasons = Counter()
@@ -242,52 +239,40 @@ def merge(tmp_files, output_dir, do_eval, task):
         print(f"{task.upper()} 评测指标：")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
-    n_bad = write_badcase(rows, os.path.join(output_dir, "badcase.txt"), task)
-    print(f"badcase：{os.path.join(output_dir, 'badcase.txt')} ({n_bad}/{len(rows)} 条错)")
-    print(f"明细：{detail_path}")
+
+    badcase_path = os.path.join(output_dir, "badcase.txt")
+    n_bad = write_badcase(rows, badcase_path, task)
+    print(f"badcase：{badcase_path} ({n_bad}/{len(rows)} 条错)")
+    print(f"明细：{os.path.join(output_dir, 'results_detail.jsonl')}")
 
 
 def main():
     args = parse_args()
-    default_system = args.system or NLU_SYSTEM_PROMPT
-    items = load_items(args.input_file, default_system)
-    if not items:
-        raise ValueError(f"输入文件无可用样本：{args.input_file}")
-    ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip()]
-    if not ids:
-        raise ValueError("gpu_ids 不能为空")
-    os.makedirs(args.output_dir, exist_ok=True)
-    tmp_files = [os.path.join(args.output_dir, f"tmp_rank{rank}.jsonl") for rank in range(len(ids))]
-
-    print(f"{args.task.upper()} 推理配置")
-    print(f"基线：{args.ckpt}")
-    print(f"LoRA：{args.lora or '(无，基线)'}")
+    gpu_ids = [int(x) for x in args.gpu_ids.split(",")]
+    items = load_items(args.input_file, args.system or NLU_SYSTEM_PROMPT)
     print(f"任务：{args.task}")
     print(f"输入：{args.input_file}")
     print(f"输出：{args.output_dir}")
-    print(f"GPU：{ids}")
+    print(f"GPU：{gpu_ids}")
     print(f"样本数：{len(items)}")
     print(f"评测：{'是' if args.eval else '否'}")
 
-    if len(ids) == 1:
-        worker(0, ids[0], 1, args, items, tmp_files[0])
-    else:
-        ctx = mp.get_context("spawn")
-        procs = [
-            ctx.Process(target=worker, args=(rank, gpu, len(ids), args, items, tmp_files[rank]))
-            for rank, gpu in enumerate(ids)
-        ]
-        for proc in procs:
-            proc.start()
-        for proc in procs:
-            proc.join()
-            if proc.exitcode != 0:
-                raise RuntimeError(f"子进程失败，exitcode={proc.exitcode}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    tmp_files = [os.path.join(args.output_dir, f"_tmp_rank{r}.jsonl") for r in gpu_ids]
+
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank, gpu_id in enumerate(gpu_ids):
+        p = ctx.Process(target=worker, args=(rank, gpu_id, len(gpu_ids), args, items, tmp_files[rank]))
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
 
     merge(tmp_files, args.output_dir, args.eval, args.task)
-    for path in tmp_files:
-        if os.path.exists(path):
-            os.remove(path)
+    for f in tmp_files:
+        if os.path.exists(f):
+            os.remove(f)
 
 
 if __name__ == "__main__":
