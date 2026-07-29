@@ -7,7 +7,9 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 # baseurl="/cfs/data/private/WangYaoChi/open_datasets/aishell_hotword_test"
 # baseurl="/cfs/data/private/WangYaoChi/open_datasets/ContextASR/hotword_test"
-baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
+# baseurl="/cfs/data/private/WangYaoChi/open_datasets/GLCLAP-stop1-stop2-dataset/ready/stop1"
+baseurl="/cfs/data/private/WangYaoChi/open_datasets/GLCLAP-stop1-stop2-dataset/ready/stop2"
+# baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET"
 # baseurl="/cfs/data/private/hubk/asr_test_set/VOYAH_CONTACT_TEST_SET_perturb"
 
 stage="all"
@@ -16,14 +18,14 @@ input_scp="${baseurl}/wav.scp"
 ref_path="${baseurl}/text"
 hotword_file="${baseurl}/hotword.txt"
 target_hotword_file="${baseurl}/utt_hotword.txt"
-output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50/hotword/voyah_prompt2"
-gpu_ids="0,1,2,3"
+output_dir="/cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_2/hotword/stop2"
+gpu_ids="6,7"
 batch_size=64
 dtype="bf16"
-hotword_topk=5
+hotword_topk=3
 encoder_mode="train_mask"
-# lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_4/lora-step2500"
-lora=""
+lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_grpo_2/lora"
+# lora=""
 
 declare -A arg_map=(
     [--stage]=stage [--ckpt]=ckpt [--input_scp]=input_scp [--ref_path]=ref_path

@@ -1,5 +1,5 @@
 DEFAULT_PROMPT = ""
-HOTWORD_PROMPT = "转写语音。专属名词列表仅作为候选参考：如果语音中出现某个专属名词，按列表中的完整原文输出；不要拆分、改写或组合不同候选词中的字；不要输出列表中未出现的混合专属名词；未听到的候选词不要写入结果。"
+HOTWORD_PROMPT = "转写语音，专属名词优先按列表原文输出。"
 JOINT_CONFIG = "joint_config.json"
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
 
