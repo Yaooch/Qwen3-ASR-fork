@@ -19,3 +19,15 @@ def test_from_file(tmp_path):
     path.write_text("撒贝宁\n\nGolden Valley\n", encoding="utf-8")
 
     assert HotwordRetriever.from_file(path).hotwords == ["撒贝宁", "Golden Valley"]
+
+
+def test_retrieve_english_by_pronunciation():
+    retriever = HotwordRetriever(["ED SHEERAN", "GLAY", "CHER"])
+
+    assert "ED SHEERAN" in retriever.retrieve("play edd sherron s last album", topk=3)
+
+
+def test_english_phone_candidate_requires_confidence():
+    retriever = HotwordRetriever(["ED SHEERAN"])
+
+    assert retriever.retrieve("play some music", topk=3) == []

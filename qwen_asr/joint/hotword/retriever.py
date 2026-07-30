@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from .phoneme import Phoneme, get_phoneme_info
 from .calc import fuzzy_substring_search_constrained
+from .english import EnglishPhoneMatcher
 from .fast_rag import FastRAG
 
 
@@ -26,6 +27,7 @@ class HotwordRetriever:
             if phons:
                 self._phonemes[word] = [phons]
         self._rag.add_hotwords(self._phonemes)
+        self._english = EnglishPhoneMatcher(self.hotwords)
 
     @classmethod
     def from_file(cls, path: str, **kwargs) -> "HotwordRetriever":
@@ -66,4 +68,9 @@ class HotwordRetriever:
 
         ranked = [(w, s) for w, s in best.items() if s >= self.recall_threshold]
         ranked.sort(key=lambda x: x[1], reverse=True)
-        return [w for w, _ in ranked[:topk]]
+        words = [w for w, _ in ranked[:topk]]
+        if len(words) < topk:
+            phone_word = self._english.retrieve(query)
+            if phone_word and phone_word not in words:
+                words.append(phone_word)
+        return words

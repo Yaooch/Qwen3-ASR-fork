@@ -28,6 +28,7 @@ dependencies = [
   "librosa",
   "soundfile",
   "sox",
+  "gruut==2.4.0",
   "gradio",
   "flask",
   "pytz",
