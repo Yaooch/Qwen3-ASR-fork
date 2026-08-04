@@ -3,6 +3,7 @@ import random
 
 import torch
 
+from finetuning.eval_glclap import normalize_text, read_candidates, read_key_value
 from finetuning.train_glclap import iter_jsonl_shard, parse_text, sample_subtext
 from qwen_asr.joint.glclap import feature_mask, glclap_loss
 
@@ -86,3 +87,17 @@ def test_glclap_local_loss_ignores_padding_frames():
     mask = torch.tensor([[True, False], [True, False]])
     out = glclap_loss(text, text, audio_global, audio_local, mask, torch.tensor(0.0))
     assert out["local_logits"].argmax(dim=1).tolist() == [0, 1]
+
+
+def test_stop_files_are_normalized_and_deduplicated(tmp_path):
+    mapping = tmp_path / "utt_hotword.txt"
+    mapping.write_text("utt1  New   York State\nutt2\tAustin\n", encoding="utf-8")
+    candidates = tmp_path / "hotword.txt"
+    candidates.write_text(" new york state \nAUSTIN\nAustin\n", encoding="utf-8")
+
+    assert read_key_value(str(mapping)) == {
+        "utt1": "New   York State",
+        "utt2": "Austin",
+    }
+    assert read_candidates(str(candidates)) == ["NEW YORK STATE", "AUSTIN"]
+    assert normalize_text("  New   York State ") == "NEW YORK STATE"
