@@ -1,5 +1,6 @@
 import json
 import random
+from collections import Counter
 
 import torch
 
@@ -20,6 +21,23 @@ def test_sample_subtext_is_contiguous_original_slice():
     subtext = sample_subtext(text, max_units=5, rng=random.Random(3))
     assert subtext in text
     assert subtext != text
+
+
+def test_sample_subtext_uses_language_specific_lengths():
+    rng = random.Random(7)
+    english = Counter(
+        len(sample_subtext("one two three four five six", "English", rng=rng).split())
+        for _ in range(1000)
+    )
+    chinese = Counter(
+        len(sample_subtext("一二三四五六七八九十", "Chinese", rng=rng))
+        for _ in range(1000)
+    )
+
+    assert set(english) == {1, 2, 3, 4}
+    assert english[2] > english[4] and english[3] > english[4]
+    assert set(chinese) == set(range(2, 9))
+    assert chinese[2] > chinese[4] and chinese[3] > chinese[8]
 
 
 def test_iter_jsonl_shard_reads_each_row_once(tmp_path):

@@ -27,6 +27,7 @@ AUDIO_MODEL = "/cfs/data/private/WangYaoChi/model/glclap/data2vec-audio-large"
 TEXT_MODEL = "/cfs/data/private/WangYaoChi/model/glclap/bert-base-multilingual-uncased"
 OUTPUT_DIR = "/cfs/data/private/WangYaoChi/model/glclap/retrieval"
 ASR_TAG = "<asr_text>"
+HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 UNIT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
 
 
@@ -42,12 +43,20 @@ def parse_text(raw: str):
     return language, text.strip()
 
 
-def sample_subtext(text: str, max_units: int = 8, rng=random) -> str:
+def sample_subtext(text: str, language: str = "", max_units: int = 8, rng=random) -> str:
     """从中英文混合文本中抽取连续 span，并保留原始字符间隔。"""
     matches = list(UNIT_RE.finditer(text))
-    if len(matches) < 2:
+    chinese = language.lower().startswith("chinese") if language else bool(HAN_RE.search(text))
+    min_length, max_length = (2, 8) if chinese else (1, 4)
+    max_length = min(max_length, max_units, len(matches))
+    if max_length < min_length:
         return text.strip()
-    length = rng.randint(2, min(max_units, len(matches)))
+    lengths = list(range(min_length, max_length + 1))
+    if chinese:
+        weights = [3 if length in (2, 3) else 1 for length in lengths]
+    else:
+        weights = [{1: 2, 2: 3, 3: 3, 4: 1}[length] for length in lengths]
+    length = rng.choices(lengths, weights=weights, k=1)[0]
     start = rng.randint(0, len(matches) - length)
     return text[matches[start].start():matches[start + length - 1].end()].strip()
 
@@ -151,7 +160,10 @@ class GLCLAPCollator:
             return_tensors="pt",
         )
         texts = [x["text"] for x in rows]
-        subtexts = [sample_subtext(x, self.max_subtext_units) for x in texts]
+        subtexts = [
+            sample_subtext(x["text"], x["language"], self.max_subtext_units)
+            for x in rows
+        ]
         text = self.tokenizer(
             texts,
             padding=True,
