@@ -4,7 +4,7 @@ from collections import Counter
 
 import torch
 
-from finetuning.retrieval_eval import normalize_text, read_candidates, read_key_value
+from finetuning.retrieval_eval import load_stop_data, normalize_text, read_candidates, read_key_value
 from finetuning.train_glclap import (
     iter_jsonl_shard,
     load_word_df,
@@ -166,3 +166,20 @@ def test_stop_files_are_normalized_and_deduplicated(tmp_path):
     }
     assert read_candidates(str(candidates)) == ["NEW YORK STATE", "AUSTIN"]
     assert normalize_text("  New   York State ") == "NEW YORK STATE"
+
+
+def test_load_stop_data_builds_sorted_records(tmp_path):
+    (tmp_path / "text").write_text("u2 query two\nu1 query one\n", encoding="utf-8")
+    (tmp_path / "utt_hotword.txt").write_text("u1 Alpha\nu2 Beta\n", encoding="utf-8")
+    (tmp_path / "hotword.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    candidates, transcripts, records = load_stop_data(
+        str(tmp_path), "text", sort_records=True
+    )
+
+    assert candidates == ["ALPHA", "BETA"]
+    assert transcripts == {"u2": "query two", "u1": "query one"}
+    assert records == [
+        ("u1", "query one", "ALPHA"),
+        ("u2", "query two", "BETA"),
+    ]
