@@ -17,6 +17,7 @@
 | 音频 | 16 kHz mono，保留 0.2～30 秒 |
 | 精度 | bf16 |
 | Optimizer | AdamW，weight decay 0.01，grad clip 1.0 |
+| Scheduler | cosine |
 | 其他 | gradient checkpointing 开启，max text length 128，seed 42 |
 
 全量微调模型共有 480,959,745 个可训练参数。V1 只训练两个投影层和 logit_scale；V2、V3 放开 Data2Vec、mBERT、投影层和 logit_scale。
@@ -63,10 +64,11 @@ GLCLAP 评测：
 - 固定返回 Top-3，不设置阈值，因此候选数大于等于 3 时每条一定返回 3 个。
 - 在线延迟不包含 librosa 磁盘解码；包含 feature extraction、音频 Encoder 和候选相似度计算。
 
-CTC 拼音/音素检索评测：
+CTC 粗识别 + 拼音/两层模糊检索评测：
 
 - 输入是 joint_ctc_50_grpo_2 产生的 ctc_text。
-- 检索器为 HotwordRetriever：FastRAG 粗筛 + 边界约束 DP 精筛。
+- 四份结果生成于 2026-07-24：中文使用声母、韵母和声调；STOP 英文在当时版本的主路径使用字母表示。
+- 当时的检索器使用 FastRAG 粗筛 + 边界约束 DP 精筛。
 - 推理参数的 topk 上限为 3，但带分数阈值，因此每条实际返回 0～3 个候选，不会补满。
 - 所以现有 hotword_eval.txt 中 R@5、R@10 与 R@3 相同。
 - 这里的检索延迟只统计拿到 ctc_text 之后的 HotwordRetriever，不包含 CTC Encoder 和 CTC 解码时间；与 GLCLAP 在线延迟不是严格端到端同口径。
@@ -75,7 +77,7 @@ CTC 拼音/音素检索评测：
 
 | 方法 | STOP1 | STOP2 | AISHELL hotword | Voyah 联系人 |
 |---|---:|---:|---:|---:|
-| CTC 粗识别 + 拼音/音素检索 | 60.42% / 75.51% | 83.41% / 86.14% | 75.80% / 94.66% | 98.08% / 98.94% |
+| CTC 粗识别 + 7/24 两层检索 | 60.42% / 75.51% | 83.41% / 86.14% | 75.80% / 94.66% | 98.08% / 98.94% |
 | GLCLAP V2 | 49.63% / 63.40% | 29.16% / 37.09% | 71.89% / 92.53% | 85.80% / 95.48% |
 | GLCLAP V3 checkpoint-160000 | 69.32% / 85.38% | 66.84% / 84.25% | 79.00% / 96.80% | 96.07% / 99.42% |
 
@@ -94,7 +96,7 @@ STOP 按目标长度拆分：
 
 | 方法 | STOP1 mean | STOP2 mean | AISHELL mean | Voyah mean |
 |---|---:|---:|---:|---:|
-| CTC 拼音/音素检索，不含 CTC 推理 | 3.784 ms | 6.959 ms | 2.620 ms | 14.069 ms |
+| CTC 7/24 两层检索，不含 CTC 推理 | 3.784 ms | 6.959 ms | 2.620 ms | 14.069 ms |
 | GLCLAP V2 | 20.03 ms | 19.43 ms | 26.88 ms | 19.81 ms |
 | GLCLAP V3 checkpoint-160000 | 18.32 ms | 18.27 ms | 27.51 ms | 19.43 ms |
 
@@ -102,15 +104,15 @@ STOP 按目标长度拆分：
 
 - V3 在四个测试集上都明显优于 V2，说明增加短文本训练有效。
 - 提升主要来自单 unit：STOP1 Top-1 从 5.26% 提升到 45.31%，STOP2 从 5.26% 提升到 60.60%。
-- V3 在 STOP1 和 AISHELL 的 Top-1/Top-3 高于 CTC 拼音/音素检索。
-- STOP2 上 CTC 检索仍明显更强；Voyah 上 CTC Top-1 更高，V3 Top-3 略高。
+- V3 在 STOP1 和 AISHELL 的 Top-1/Top-3 高于 CTC 7/24 两层检索。
+- STOP2 上 CTC 两层检索仍明显更强；Voyah 上 CTC Top-1 更高，V3 Top-3 略高。
 - 当前 CTC 延迟不含 CTC 模型推理，只能说明检索器本身较快，不能直接得出端到端比 GLCLAP 快。
 
 ## 7. 结果位置
 
 | 方法 | 结果根目录 |
 |---|---|
-| CTC 拼音/音素检索 | /cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_2/asr_hotword |
+| CTC 7/24 两层检索 | /cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_2/asr_hotword |
 | GLCLAP V2 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune |
 | GLCLAP V3 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune_subtext_v2 |
 
