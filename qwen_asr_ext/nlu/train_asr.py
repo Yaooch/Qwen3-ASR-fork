@@ -1,16 +1,15 @@
-# finetuning/train_asr_nlu.py
 """ASR + ASR+NLU 联合 LoRA SFT 训练。
 
 只训 NLU 会让 LoRA 扰动 thinker 导致 ASR 崩；用同一批 TTS 两用数据(音频+文本+意图)
 派生两种样本联合训练同一个 LoRA, 让它同时服务 ASR 和 ASR+NLU：
   ASR     : system="转写语音",             target="language X<asr_text>文本"
   ASR+NLU : system="转写语音并提取用户意图", target="language X<asr_text>文本\n意图JSON"
-LoRA 打在 thinker 文本解码器(复用 grpo_core.apply_lora), 只算 LLM loss, 不动 ctc/rnnt。
+LoRA 打在 thinker 文本解码器(复用 joint.lora.apply_lora), 只算 LLM loss, 不动 ctc/rnnt。
 
 数据 jsonl 每行 {"messages":[{system},{user:audio_path},{assistant}]}，
 assistant 格式 "language X<asr_text>文本\n意图JSON"。每条派生 ASR + ASR+NLU 两个样本。
 
-用法：见 train_asr_nlu.sh。
+用法：见 scripts/train_asr.sh。
 """
 import argparse
 import os

@@ -1,4 +1,3 @@
-# finetuning/infer_nlu.py
 """纯文本 NLU / Agent 批量推理与评测，支持 joint checkpoint 和纯 Qwen3 LLM。"""
 import argparse
 import json

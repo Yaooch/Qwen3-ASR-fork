@@ -3,9 +3,9 @@ import os
 from typing import List
 
 if __package__:
-    from .edit_eval import EditStat, edit, norm, percent, read_texts
+    from .edit import EditStat, edit, norm, percent, read_texts
 else:
-    from edit_eval import EditStat, edit, norm, percent, read_texts
+    from edit import EditStat, edit, norm, percent, read_texts
 
 def parse_args():
     p = argparse.ArgumentParser("拼音相似度评估")

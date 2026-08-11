@@ -4,9 +4,9 @@ import os
 from typing import List
 
 if __package__:
-    from .edit_eval import edit, norm, percent, read_texts
+    from .edit import edit, norm, percent, read_texts
 else:
-    from edit_eval import edit, norm, percent, read_texts
+    from edit import edit, norm, percent, read_texts
 
 def parse_args():
     p = argparse.ArgumentParser("文本 badcase 生成")

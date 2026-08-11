@@ -1,4 +1,3 @@
-# finetuning/train_nlu.py
 """纯文本 NLU / Agent SFT，支持 joint checkpoint 和纯 Qwen3 LLM。"""
 import argparse
 import os

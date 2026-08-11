@@ -1,11 +1,10 @@
-# finetuning/infer_asr_nlu.py
 """ASR+NLU 批量推理 + 评测。
 
 加载基线 joint + ASR+NLU LoRA，音频 -> "文本\n意图"，评测文本 CER + 意图指标
 (name_acc / args_exact / json_valid)。
 
 输入 jsonl 每行 {"messages":[{system},{user:audio_path},{assistant="language X<asr_text>文本\n意图JSON"}]}。
-用法：见 infer_asr_nlu.sh。
+用法：见 scripts/infer_asr.sh。
 """
 import argparse
 import json

@@ -1,4 +1,3 @@
-# finetuning/grpo_train.py
 """GRPO 训练主循环（支持多卡数据并行）+ rollout 采样器。
 
 每条样本采样 G 个 rollout → 可验证奖励 → 组内归一化优势 →
