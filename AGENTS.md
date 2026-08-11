@@ -5,7 +5,7 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 ## 目录边界
 
 - 官方能力放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
-- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe` 主推理入口，`encoder.py` 负责 Encoder、长度换算和流式 KV cache，`ctc.py/rnnt.py/defaults.py` 分别放对应核心逻辑。
+- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe`，`encoder.py` 负责 Encoder、长度和流式 KV cache，`llm.py` 统一 prompt/tokenize/音频注入，`ctc.py/rnnt.py/defaults.py` 放其余核心逻辑。
 - 热词检索只保留 `qwen_asr/joint/hotword/` 的音素级两层实现：`FastRAG` 粗筛 + 边界约束 DP 精筛，统一由 `HotwordRetriever` 对外提供接口。
 - `finetuning/` 只放长期使用的训练、推理、评估入口；`qwen_asr/tools/` 只保留主链路依赖或会重复使用的评估/诊断工具，一次性数据加工脚本不要提交到仓库。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr/joint/defaults.py`。
@@ -58,9 +58,9 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 - 目标：让 talker 在注入「真热词 + 干扰词」混合列表时选对并原样输出真热词、不误注入干扰词、非热词部分不退化。
 - 训练数据用 ContextASR（`train_contextasr2.jsonl`，每条 `text` 为 ground-truth、`prompt` 已含混合热词列表）；候选列表直接用数据预给列表，不与 retriever 耦合。
 - 奖励纯函数在 `qwen_asr/tools/hotword_reward.py`：`parse_text_field` 剥 `language X<asr_text>` 前缀并去标点，`split_truth` 按子串划真热词/干扰词，`compute_reward = w_r·recall − w_f·fp − w_mix·hybrid_injection − w_c·non_hotword_cer − w_fmt·(1−fmt)`；`hybrid_injection_rate` 惩罚真热词与干扰词片段拼出的中文混合词。
-- 训练组件在 `finetuning/grpo_core.py`（数据读写/组内优势+clip+KL 数学/LoRA 装配，轻量、可单测）与 `finetuning/grpo_train.py`（`RolloutSampler` 音频 embedding + G 路采样 + ref/train logprob + 训练主循环）；评测统一走 `finetuning/hotword_eval.sh` + `qwen_asr/tools/hotword_eval.py`。
+- 训练组件在 `finetuning/grpo_core.py`（数据读写/组内优势+clip+KL 数学/LoRA 装配）与 `finetuning/grpo_train.py`（音频 embedding、G 路采样、固定 old/ref logprob 和多轮 PPO 更新）；评测统一走 `finetuning/hotword_eval.sh` + `qwen_asr/tools/hotword_eval.py`。
 - 模型加载统一 `from_pretrained(..., load_heads=False, attn_implementation=...).to("cuda")`（GRPO 只用 LLM + audio_tower，不加载 CTC/RNNT 头）；LoRA 评测经 `PeftModel.from_pretrained(joint, lora)` 包整个 joint，与训练的 adapter key 对齐。
-- 训练 `bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]`（默认 4 卡，经 `torchrun` 数据并行：各卡取 rank-strided 样本做 G 路 rollout 与 backward，LoRA 梯度 all-reduce 求平均后同步步进；`apply_lora` 后由 rank 0 广播 LoRA 初始参数，保证各卡一致），单卡跑传 `NPROC=1`；`--batch_size_per_rank` 控制每卡每步累积样本数，effective batch = NPROC × batch_size_per_rank；`RESUME=1` 从 `OUTPUT_DIR/lora` 续训（恢复 LoRA 权重 + 优化器状态 + step）。评测 `bash finetuning/hotword_eval.sh`（设 `lora` 变量挂载 RL LoRA，留空评基线）。成功标准：热词召回升、误注入降、非热词 CER 不劣化（≤基线 +0.5% 绝对），三者同时达成。
+- 训练 `bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]`（默认 4 卡，经 `torchrun` 数据并行）；rollout 时固定 behavior `old_logp`，同一批 rollout 默认做 4 轮 PPO 更新，`PPO_EPOCHS` 可调整，采样分布与 old/current logprob 使用同一 temperature 且不做 top-p/top-k 截断。各卡 LoRA 梯度 all-reduce 后同步步进；`--batch_size_per_rank` 控制每卡每批样本数，effective batch = NPROC × batch_size_per_rank；`RESUME=1` 从 `OUTPUT_DIR/lora` 恢复 LoRA、优化器和 rollout step。
 - 纯函数与数学单测在 `tests/tools/test_hotword_reward.py`、`tests/finetuning/test_grpo_core.py`；不保留依赖个人 checkpoint 的集成测试。
 
 ## 脚本和验证

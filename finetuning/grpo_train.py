@@ -2,11 +2,11 @@
 """GRPO 训练主循环（支持多卡数据并行）+ rollout 采样器。
 
 每条样本采样 G 个 rollout → 可验证奖励 → 组内归一化优势 →
-clip surrogate + KL(π_θ ‖ π_ref) 更新 LoRA。π_ref = 关 LoRA 的基线 talker。
+固定 behavior policy 的多轮 clip surrogate + KL(π_θ ‖ π_ref) 更新 LoRA。π_ref = 关 LoRA 的基线 talker。
 
 多卡（torchrun 启动）：每卡取 rank-strided 样本，各自做 G 路 rollout 与 backward，
 LoRA 梯度跨卡 all-reduce 求平均后同步步进；apply_lora 前固定种子使各卡 LoRA 初始化一致，
-保证参数始终同步。effective batch = world_size × batch_size_per_rank。
+保证参数始终同步。effective batch = world_size × batch_size_per_rank；每批 rollout 更新 ppo_epochs 轮。
 """
 import argparse
 import os
@@ -25,6 +25,7 @@ from qwen_asr.inference.utils import parse_asr_output
 from qwen_asr.joint import Qwen3ASRJointModel
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
 from qwen_asr.joint.encoder import encode_offline, feature_lens
+from qwen_asr.joint.llm import audio_prompts, inject_audio, left_tokenize
 from qwen_asr.tools.hotword_reward import compute_reward
 from finetuning.grpo_core import (
     apply_lora,
@@ -47,6 +48,7 @@ from finetuning.grpo_core import (
 class RolloutResult:
     ids: torch.LongTensor   # (T_gen,) 生成 token
     text: str
+    logp_old: torch.Tensor  # (T_gen,) behavior policy logprob，固定跨 PPO epoch
     logp_ref: torch.Tensor  # (T_gen,) base(LoRA-off) logprob，detach
 
 
@@ -100,25 +102,27 @@ class RolloutSampler:
     def build_batch(self, sample):
         """构造 G 份相同 prompt 的 batch（同音频同 prompt，仅 rollout 生成不同）。
         返回 input_ids (G,T)、attn (G,T)、audio_embeds (G, n_audio, hidden)。"""
-        thinker = self.joint.qwen_model.thinker
         processor = self.processor
-        token = processor.audio_token
-        context = sample.prompt or ""
-        text = self.asr_wrapper._build_text_prompt(context=context, force_language=None)
         audio_embeds_1d = self.audio_embedding(sample.audio)  # (n_audio, hidden)
-        text = text.replace(token, token * int(audio_embeds_1d.shape[0]), 1)
-        old = processor.tokenizer.padding_side
-        processor.tokenizer.padding_side = "left"
-        try:
-            tok = processor.tokenizer(text, return_tensors="pt", add_special_tokens=False)
-        finally:
-            processor.tokenizer.padding_side = old
+        text, = audio_prompts(
+            self.asr_wrapper,
+            processor.audio_token,
+            [audio_embeds_1d.shape[0]],
+            [sample.prompt],
+            [None],
+        )
+        tok = left_tokenize(
+            processor.tokenizer,
+            text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
         input_ids_1d = tok["input_ids"][0]   # (T,)
         attn_1d = tok["attention_mask"][0]   # (T,)
         G = self.G
         input_ids = input_ids_1d.unsqueeze(0).expand(G, -1).contiguous()
         attn = attn_1d.unsqueeze(0).expand(G, -1).contiguous()
-        audio_embeds = audio_embeds_1d.unsqueeze(0).expand(G, -1, -1).contiguous()
+        audio_embeds = audio_embeds_1d.unsqueeze(0).expand(G, -1, -1)
         return input_ids.to(self.device), attn.to(self.device), audio_embeds
 
     def _strip_gen(self, gen_full_1d) -> torch.Tensor:
@@ -135,9 +139,7 @@ class RolloutSampler:
     def _generate_batch(self, input_ids, attn, audio_embeds):
         """一次 batch=G 的采样生成，返回 list[(gen_ids, text)]。"""
         thinker = self.joint.qwen_model.thinker
-        embeds = thinker.get_input_embeddings()(input_ids)  # (G, T, hidden)
-        audio_mask = thinker.get_placeholder_mask(input_ids, inputs_embeds=embeds)
-        inputs_embeds = embeds.masked_scatter(audio_mask, audio_embeds.to(dtype=embeds.dtype))
+        inputs_embeds = inject_audio(thinker, input_ids, audio_embeds)
         gen = self.joint.qwen_model.generate(
             input_ids=input_ids,
             attention_mask=attn,
@@ -145,7 +147,8 @@ class RolloutSampler:
             max_new_tokens=self.max_new_tokens,
             do_sample=True,
             temperature=self.temperature,
-            top_p=0.95,
+            top_p=1.0,
+            top_k=0,
             pad_token_id=self.pad_token_id,
         )
         seqs = gen.sequences  # (G, T + max_gen)
@@ -176,9 +179,7 @@ class RolloutSampler:
             li = g.numel()
             full[i, prompt_len:prompt_len + li] = g
             attn[i, prompt_len:prompt_len + li] = 1
-        embeds = thinker.get_input_embeddings()(full)  # (G, T+max, hidden)
-        audio_mask = thinker.get_placeholder_mask(full, inputs_embeds=embeds)
-        inputs_embeds = embeds.masked_scatter(audio_mask, audio_embeds.to(dtype=embeds.dtype))
+        inputs_embeds = inject_audio(thinker, full, audio_embeds)
         ctx = (
             self.joint.disable_adapter()
             if (not use_lora and hasattr(self.joint, "disable_adapter"))
@@ -198,21 +199,30 @@ class RolloutSampler:
                 continue
             # 位置 prompt_len-1+k 的 logits 预测 gen token k
             row_logits = logits[i, prompt_len - 1:prompt_len - 1 + li, :]
-            logp = F.log_softmax(row_logits, dim=-1).gather(-1, g.to(logits.device).unsqueeze(-1)).squeeze(-1)
+            logp = (
+                F.log_softmax(row_logits / self.temperature, dim=-1)
+                .gather(-1, g.to(logits.device).unsqueeze(-1))
+                .squeeze(-1)
+            )
             logp_list.append(logp)
         return logp_list
 
     @torch.no_grad()
     def sample(self, sample):
-        """batched rollout：1 次 generate + 1 次 ref logp。
-        返回 (inputs, list[RolloutResult])，inputs 供 token_logp_batch 复用避免重 tokenize。"""
+        """采样 rollout，并冻结 behavior/ref 两套 token logprob 供多轮 PPO 复用。"""
         input_ids, attn, audio_embeds = self.build_batch(sample)
         gen_results = self._generate_batch(input_ids, attn, audio_embeds)
-        gen_ids_list = [g for g, _ in gen_results]
+        gen_ids_list = [ids for ids, _ in gen_results]
+        old_logps = self._logp_batch(input_ids, audio_embeds, gen_ids_list, use_lora=True)
         ref_logps = self._logp_batch(input_ids, audio_embeds, gen_ids_list, use_lora=False)
         results = [
-            RolloutResult(ids=g.detach(), text=t, logp_ref=ref.detach())
-            for (g, t), ref in zip(gen_results, ref_logps)
+            RolloutResult(
+                ids=ids.detach(),
+                text=text,
+                logp_old=old.detach(),
+                logp_ref=ref.detach(),
+            )
+            for (ids, text), old, ref in zip(gen_results, old_logps, ref_logps)
         ]
         return (input_ids, audio_embeds), results
 
@@ -220,6 +230,23 @@ class RolloutSampler:
         """训练时 LoRA-on 带梯度重算各 rollout logp（1 次 batch 前向）。"""
         input_ids, audio_embeds = inputs
         return self._logp_batch(input_ids, audio_embeds, gen_ids_list, use_lora=True)
+
+
+def ppo_group_loss(sampler, inputs, rollouts, advantages, beta):
+    """用固定 behavior/ref logp 计算一个 rollout group 的 PPO loss。"""
+    logps = sampler.token_logp_batch(inputs, [result.ids for result in rollouts])
+    losses = [
+        grpo_loss(
+            logp,
+            result.logp_old.to(logp.dtype),
+            advantage.expand_as(logp),
+            result.logp_ref.to(logp.dtype),
+            beta=beta,
+        )
+        for result, advantage, logp in zip(rollouts, advantages, logps)
+        if logp.numel()
+    ]
+    return sum(losses) / len(losses)
 
 
 # --------------------------------------------------------------------------
@@ -237,12 +264,18 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.04)
+    p.add_argument("--ppo_epochs", type=int, default=4, help="每批 rollout 的 PPO 更新轮数")
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--save_steps", type=int, default=100, help="每 N 步保存一次 LoRA 到 lora-step{N}；0 表示不周期保存")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--resume", type=int, default=0, choices=[0, 1], help="1 表示续训，0 表示重新训练")
     p.add_argument("--resume_from", default="", help="续训 LoRA 目录；为空时使用 output_dir/lora")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.temperature <= 0:
+        raise ValueError("temperature 必须大于 0。")
+    if args.ppo_epochs < 2:
+        raise ValueError("ppo_epochs 至少为 2，否则 PPO clip 不会实际生效。")
+    return args
 
 
 def init_distributed():
@@ -341,10 +374,8 @@ def main():
     idx = start_step * accum
     reward_history = deque(maxlen=50)  # 滚动 reward 均值，平滑样本难度噪声看真趋势
     while step < args.max_steps and idx < len(train_local):
-        opt.zero_grad()
-        last_loss = 0.0
+        groups = []
         step_rewards = []
-        did_backward = False
         for _ in range(accum):
             if idx >= len(train_local):
                 break
@@ -358,31 +389,15 @@ def main():
                 dtype=torch.float32,
             )
             if float(rewards.std().item()) < 1e-6:
-                # 组内无区分，无学习信号：跳过 backward（仍消耗该样本，保持各卡步数对齐）
+                # 组内无区分，无学习信号；仍消耗该样本以保持多卡步数对齐。
                 continue
-            adv = group_advantages(rewards.unsqueeze(0)).squeeze(0)  # (G,)
-            # 1 次 batch 带梯度前向算所有 rollout 的 logp（复用 inputs，避免重 tokenize）
-            logps = sampler.token_logp_batch(inputs, [r.ids for r in rollouts])
-            loss_acc = 0.0
-            n_valid = 0
-            for r, a, logp in zip(rollouts, adv, logps):
-                if logp.numel() == 0:
-                    continue  # 退化空输出，无梯度可算
-                # on-policy 单步：old_logp 取当前策略 logp 的 detach，ratio≡1、clip 为多 epoch 占位
-                old_logp = logp.detach()
-                loss_acc = loss_acc + grpo_loss(
-                    logp, old_logp, a.expand_as(logp), r.logp_ref.to(logp.dtype), beta=args.beta
-                )
-                n_valid += 1
-            if n_valid == 0:
+            if not any(r.ids.numel() for r in rollouts):
                 continue
-            # 累积：按 accum 与 world 同时归一，等价于对所有样本梯度求平均
-            (loss_acc / n_valid / accum).backward()
-            did_backward = True
-            last_loss = float(loss_acc.detach() / n_valid)
+            advantages = group_advantages(rewards.unsqueeze(0)).squeeze(0)
+            groups.append((inputs, rollouts, advantages))
             step_rewards.append(rewards.detach().float())
 
-        has_update = torch.tensor(1 if did_backward else 0, device=device)
+        has_update = torch.tensor(1 if groups else 0, device=device)
         if world > 1:
             dist.all_reduce(has_update, op=dist.ReduceOp.SUM)
         if int(has_update.item()) == 0:
@@ -391,18 +406,29 @@ def main():
             step += 1
             continue
 
-        # 确保各卡 LoRA 都有 grad 张量（某卡若全部 skip 则为 None），再 all-reduce 求平均
-        if world > 1:
-            for p in trainable:
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p)
-            for p in trainable:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                p.grad.mul_(1.0 / world)
+        loss_values = []
+        grad_norms = []
+        for _ in range(args.ppo_epochs):
+            opt.zero_grad()
+            for inputs, rollouts, advantages in groups:
+                loss = ppo_group_loss(sampler, inputs, rollouts, advantages, args.beta)
+                (loss / accum).backward()
+                loss_values.append(float(loss.detach()))
 
-        # clip_grad_norm_ 返回裁剪前的总范数，用来确认梯度在流动（loss 前向值恒≈0，看 grad_norm 才有意义）
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, 1.0))
-        opt.step()
+            # 某些 rank 可能全部 skip；补零梯度后仍参与每轮同步更新。
+            if world > 1:
+                for param in trainable:
+                    if param.grad is None:
+                        param.grad = torch.zeros_like(param)
+                for param in trainable:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    param.grad.mul_(1.0 / world)
+
+            grad_norms.append(float(torch.nn.utils.clip_grad_norm_(trainable, 1.0)))
+            opt.step()
+
+        last_loss = sum(loss_values) / len(loss_values) if loss_values else 0.0
+        grad_norm = sum(grad_norms) / len(grad_norms)
         reward_stats = torch.cat(step_rewards) if step_rewards else None
         reward_std = torch.stack([x.std() for x in step_rewards]).mean() if step_rewards else None
         if reward_stats is not None:

@@ -11,33 +11,8 @@ import torch
 from safetensors.torch import load_file
 from transformers import AutoFeatureExtractor, BertTokenizer
 
+from finetuning.retrieval_eval import RetrievalMetrics, latency_stats, load_stop_data
 from qwen_asr.joint.glclap import GLCLAPModel
-
-
-def normalize_text(text: str) -> str:
-    return " ".join(text.strip().upper().split())
-
-
-def read_key_value(path: str) -> Dict[str, str]:
-    rows = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            fields = line.strip().split(maxsplit=1)
-            if len(fields) == 2:
-                rows[fields[0]] = fields[1].strip()
-    return rows
-
-
-def read_candidates(path: str) -> List[str]:
-    candidates = []
-    seen = set()
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            text = normalize_text(line)
-            if text and text not in seen:
-                candidates.append(text)
-                seen.add(text)
-    return candidates
 
 
 def load_model(checkpoint: str, device: torch.device) -> Tuple[GLCLAPModel, Dict]:
@@ -102,19 +77,6 @@ def retrieve_batch(
         return similarity.topk(top_k, dim=-1)
 
 
-def latency_stats(values: List[float]) -> Dict[str, float]:
-    ordered = sorted(values)
-
-    def percentile(q: float) -> float:
-        return ordered[round((len(ordered) - 1) * q)]
-
-    return {
-        "mean": sum(ordered) / len(ordered),
-        "p50": percentile(0.50),
-        "p95": percentile(0.95),
-        "max": ordered[-1],
-    }
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="在 STOP1/STOP2 上评测 GLCLAP 热词检索")
@@ -134,20 +96,9 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    wavs = read_key_value(os.path.join(args.data_dir, "wav.scp"))
-    targets = {
-        key: normalize_text(value)
-        for key, value in read_key_value(os.path.join(args.data_dir, "utt_hotword.txt")).items()
-    }
-    transcripts = read_key_value(os.path.join(args.data_dir, "text"))
-    candidates = read_candidates(os.path.join(args.data_dir, "hotword.txt"))
-    candidate_to_index = {text: index for index, text in enumerate(candidates)}
-    records = [(key, path, targets[key]) for key, path in wavs.items() if key in targets]
-    if args.max_utts > 0:
-        records = records[:args.max_utts]
-    missing = sorted({target for _, _, target in records} - candidate_to_index.keys())
-    if missing:
-        raise ValueError(f"目标热词不在候选词库中：{missing[:10]}")
+    candidates, transcripts, records = load_stop_data(
+        args.data_dir, "wav.scp", args.max_utts
+    )
 
     model, config = load_model(args.checkpoint, device)
     feature_extractor = AutoFeatureExtractor.from_pretrained(
@@ -183,10 +134,7 @@ def main():
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    top1_hits = 0
-    topk_hits = 0
-    latencies = []
-    details = []
+    metrics = RetrievalMetrics(top_k, len(records), progress_every=100)
     for start in range(0, len(records), args.batch_size):
         batch = records[start:start + args.batch_size]
         waveforms = [librosa.load(path, sr=16000, mono=True)[0] for _, path, _ in batch]
@@ -206,44 +154,21 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         item_ms = (time.perf_counter() - retrieve_start) * 1000 / len(batch)
-        latencies.extend([item_ms] * len(batch))
 
         scores = scores.float().cpu().tolist()
         indices = indices.cpu().tolist()
         for (utt_id, _, target), row_scores, row_indices in zip(batch, scores, indices):
-            retrieved = [candidates[index] for index in row_indices]
-            hit_top1 = retrieved[0] == target
-            hit_topk = target in retrieved
-            top1_hits += hit_top1
-            topk_hits += hit_topk
-            details.append({
-                "utt_id": utt_id,
-                "target": target,
-                "text": transcripts.get(utt_id, ""),
-                "hit_top1": hit_top1,
-                f"hit_top{top_k}": hit_topk,
-                "retrieve_ms": round(item_ms, 3),
-                "returned_count": len(retrieved),
-                "retrieved": [
-                    {"text": text, "score": round(score, 6)}
-                    for text, score in zip(retrieved, row_scores)
-                ],
-            })
-        done = min(start + args.batch_size, len(records))
-        if done % 100 == 0 or done == len(records):
-            print(
-                f"进度 {done}/{len(records)} top1_recall={top1_hits / done:.4f} "
-                f"top{top_k}_recall={topk_hits / done:.4f}",
-                flush=True,
+            metrics.add(
+                utt_id,
+                target,
+                transcripts.get(utt_id, ""),
+                [candidates[index] for index in row_indices],
+                item_ms,
+                scores=row_scores,
             )
 
-    stats = latency_stats(latencies)
-    if args.output:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
-            for row in details:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"明细：{args.output}")
+    stats = latency_stats(metrics.latencies)
+    metrics.write(args.output)
     print(f"候选编码：{candidate_encode_ms:.2f} ms（离线一次）")
     print(
         f"在线延迟 batch={args.batch_size} mean={stats['mean']:.2f} ms "
@@ -251,8 +176,8 @@ def main():
     )
     print(
         f"结果 checkpoint={args.checkpoint} utterances={len(records)} "
-        f"candidates={len(candidates)} top1_recall={top1_hits / len(records):.4f} "
-        f"top{top_k}_recall={topk_hits / len(records):.4f}"
+        f"candidates={len(candidates)} top1_recall={metrics.top1_recall:.4f} "
+        f"top{top_k}_recall={metrics.topk_recall:.4f}"
     )
 
 

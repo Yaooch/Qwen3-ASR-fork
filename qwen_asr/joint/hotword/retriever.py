@@ -50,18 +50,16 @@ class HotwordRetriever:
             if not any(abs(approx_end - p) < 5 for p in positions):
                 positions.append(approx_end)
 
-        input_info = [p.info for p in input_phonemes]
         best: Dict[str, float] = {}
         for hw, positions in seen.items():
             for approx_end in positions:
                 for hw_phonemes in self._phonemes.get(hw, []):
-                    hw_compare = [p.info[:5] for p in hw_phonemes]
-                    window_size = len(hw_compare) + 10
+                    window_size = len(hw_phonemes) + 10
                     win_start = max(0, approx_end - window_size)
-                    win_end = min(len(input_info), approx_end + 5)
-                    local_input = input_info[win_start:win_end]
+                    win_end = min(len(input_phonemes), approx_end + 5)
+                    local_input = input_phonemes[win_start:win_end]
                     for score, _s, _e in fuzzy_substring_search_constrained(
-                        hw_compare, local_input, threshold=self.fast_threshold
+                        hw_phonemes, local_input, threshold=self.fast_threshold
                     ):
                         if score > best.get(hw, 0.0):
                             best[hw] = score

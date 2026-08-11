@@ -2,8 +2,7 @@
 """精筛：边界约束的模糊编辑距离 DP。移植自 asr-hotword。"""
 from typing import List, Tuple
 
-from .phoneme import Phoneme  # noqa: F401  （保留类型导出，调用方按 info 元组传入）
-
+from .phoneme import Phoneme
 
 SIMILAR_PHONEMES = [
     {'an', 'ang'},
@@ -49,22 +48,22 @@ def lcs_length(s1: str, s2: str) -> int:
     return prev[n]
 
 
-def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tuple],
+def fuzzy_substring_search_constrained(hw_phonemes: List[Tuple], input_phonemes: List[Tuple],
                                         threshold: float = 0.6) -> List[Tuple[float, int, int]]:
-    n = len(hw_info)
-    m = len(input_info)
+    n = len(hw_phonemes)
+    m = len(input_phonemes)
     if n == 0 or m == 0:
         return []
 
     dp = [[float('inf')] * (m + 1) for _ in range(n + 1)]
     path = [[(0, 0)] * (m + 1) for _ in range(n + 1)]
 
-    input_vals = [t[0] for t in input_info]
-    input_langs = [t[1] for t in input_info]
-    input_starts = [t[2] for t in input_info]
-    hw_vals = [t[0] for t in hw_info]
-    hw_langs = [t[1] for t in hw_info]
-    hw_phones = [t[4] for t in hw_info]
+    input_vals = [p.value for p in input_phonemes]
+    input_langs = [p.lang for p in input_phonemes]
+    input_starts = [p.is_word_start for p in input_phonemes]
+    hw_vals = [p.value for p in hw_phonemes]
+    hw_langs = [p.lang for p in hw_phonemes]
+    hw_phones = [p.is_tone for p in hw_phonemes]
 
     for j in range(m + 1):
         if j == 0 or (j < m and input_starts[j]):
@@ -117,7 +116,7 @@ def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tu
 
     results = []
     for j in range(1, m + 1):
-        if not input_info[j - 1][3]:
+        if not input_phonemes[j - 1].is_word_end:
             continue
         dist = dp[n][j]
         if dist >= n * 0.8:

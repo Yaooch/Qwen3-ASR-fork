@@ -72,3 +72,28 @@ def test_grpo_kl_penalty_is_zero_at_ref_and_positive_when_changed():
     ref = torch.zeros(2)
     assert float(grpo_loss(same, same.detach(), adv, ref, beta=1.0).detach()) == 0.0
     assert float(grpo_loss(moved, moved.detach(), adv, ref, beta=1.0).detach()) > 0.0
+
+
+def test_grpo_clip_stops_positive_advantage_above_upper_bound():
+    logp = torch.tensor([0.3], requires_grad=True)
+    loss = grpo_loss(logp, torch.zeros(1), torch.ones(1), logp.detach(), beta=0.0)
+    loss.backward()
+    assert float(logp.grad) == 0.0
+
+
+def test_grpo_clip_stops_negative_advantage_below_lower_bound():
+    logp = torch.tensor([-0.3], requires_grad=True)
+    loss = grpo_loss(logp, torch.zeros(1), -torch.ones(1), logp.detach(), beta=0.0)
+    loss.backward()
+    assert float(logp.grad) == 0.0
+
+
+def test_grpo_ratio_uses_fixed_old_logp_across_updates():
+    old_logp = torch.zeros(1)
+    first = torch.zeros(1, requires_grad=True)
+    grpo_loss(first, old_logp, torch.ones(1), first.detach(), beta=0.0).backward()
+    assert float(first.grad) < 0.0
+
+    moved = torch.tensor([0.3], requires_grad=True)
+    grpo_loss(moved, old_logp, torch.ones(1), moved.detach(), beta=0.0).backward()
+    assert float(moved.grad) == 0.0

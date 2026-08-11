@@ -4,7 +4,7 @@ from collections import Counter
 
 import torch
 
-from finetuning.eval_glclap import normalize_text, read_candidates, read_key_value
+from finetuning.retrieval_eval import normalize_text, read_candidates, read_key_value
 from finetuning.train_glclap import (
     iter_jsonl_shard,
     load_word_df,

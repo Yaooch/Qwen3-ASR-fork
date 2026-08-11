@@ -68,7 +68,7 @@ def grpo_loss(
     """token-level：logp/old_logp/ref_logp/advantages 同 shape (T,)。
     返回标量 loss = -mean(clip_surrogate) + beta * mean(KL)。
     KL 用 GRPO 的非负采样估计：exp(ref-logp) - (ref-logp) - 1。
-    on-policy 单步训练中 old_logp = logp.detach()，ratio≡1、clip 为多 epoch 占位；
+    old_logp 固定为 rollout behavior policy；多轮更新后 ratio 变化，clip 才实际生效；
     KL 项把 LoRA 拉回基线 talker，护住非热词能力。"""
     ratio = torch.exp(logp - old_logp)
     clipped = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)

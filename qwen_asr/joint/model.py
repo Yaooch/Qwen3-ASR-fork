@@ -19,6 +19,7 @@ from .defaults import (
     hotword_prompt,
 )
 from .encoder import encode_offline, encode_stream, encode_train_mask, feature_lens
+from .llm import audio_prompts, inject_audio, left_tokenize
 from .rnnt import RNNT
 
 ENCODER_MODES = {"offline", "stream", "train_mask"}
@@ -169,28 +170,28 @@ class Qwen3ASRJointModel(nn.Module):
         if self._asr_wrapper is None:
             raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
         thinker, processor = self.qwen_model.thinker, self.processor
-        device, dtype = next(self.qwen_model.parameters()).device, next(self.qwen_model.thinker.parameters()).dtype
-        token = processor.audio_token
-        prompts = []
-        for feats, context, language in zip(feats_list, contexts, languages):
-            text = self._asr_wrapper._build_text_prompt(context=context or "", force_language=language)
-            prompts.append(text.replace(token, token * int(feats.shape[0]), 1))
-        old_side = processor.tokenizer.padding_side
-        processor.tokenizer.padding_side = "left"
-        try:
-            tok = processor.tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False)
-        finally:
-            processor.tokenizer.padding_side = old_side
+        device = next(self.qwen_model.parameters()).device
+        prompts = audio_prompts(
+            self._asr_wrapper,
+            processor.audio_token,
+            [feats.shape[0] for feats in feats_list],
+            contexts,
+            languages,
+        )
+        tok = left_tokenize(
+            processor.tokenizer,
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
         input_ids, attn = tok["input_ids"].to(device), tok["attention_mask"].to(device)
-        embeds = thinker.get_input_embeddings()(input_ids)
-        audio_mask = thinker.get_placeholder_mask(input_ids, inputs_embeds=embeds)
-        audio_feats = torch.cat([x.to(device=device, dtype=dtype) for x in feats_list], dim=0)
-        if int(audio_mask[..., 0].sum().item()) != int(audio_feats.shape[0]):
-            raise RuntimeError(f"audio placeholder mismatch: prompt={int(audio_mask[..., 0].sum().item())}, features={audio_feats.shape[0]}")
+        audio_feats = torch.cat(feats_list, dim=0)
+        inputs_embeds = inject_audio(thinker, input_ids, audio_feats)
         gen = self.qwen_model.generate(
             input_ids=input_ids,
             attention_mask=attn,
-            inputs_embeds=embeds.masked_scatter(audio_mask, audio_feats),
+            inputs_embeds=inputs_embeds,
             max_new_tokens=max_new_tokens or getattr(self._asr_wrapper, "max_new_tokens", 512),
         )
         seq = gen.sequences if hasattr(gen, "sequences") else gen
@@ -363,9 +364,8 @@ class Qwen3ASRJointModel(nn.Module):
                 outputs["log_probs"] = self.ctc.log_softmax(head_hs, lens)
 
         if need_llm:
-            embeds = self.qwen_model.thinker.get_input_embeddings()(input_ids)
-            mask = self.qwen_model.thinker.get_placeholder_mask(input_ids, embeds)
-            out = self.qwen_model.thinker(inputs_embeds=embeds.masked_scatter(mask, llm.to(embeds.dtype)), attention_mask=attention_mask, labels=labels)
+            inputs_embeds = inject_audio(self.qwen_model.thinker, input_ids, llm)
+            out = self.qwen_model.thinker(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
             outputs["llm_loss"] = out.loss
             losses.append(self.loss_weights.get("llm", 1.0) * out.loss)
         if not losses:
