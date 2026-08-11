@@ -1,87 +1,155 @@
-# Finetuning 入口
+## Fine-tuning Qwen3-ASR
 
-`finetuning/` 只保留长期使用的训练、推理和评估入口；模型核心在 `qwen_asr/joint/`。
+This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports multi-GPU training via `torchrun`.
 
-## 文件
+### 1) Setup
 
-```text
-train.py             联合 ASR/CTC/RNNT 训练
-infer.py             ASR 批量推理
-train.sh             联合训练配置
-infer.sh             推理 + WER + 拼音评估
-infer_all.sh         多数据集批量推理
-hotword_eval.sh      热词专项评估
-grpo_train.py        热词 GRPO 训练
-grpo_core.py         GRPO 数据、数学和文本 LoRA
-grpo_train.sh        GRPO 启动配置
-train_nlu.py         joint / 纯 Qwen3 文本 NLU SFT
-infer_nlu.py         joint / 纯 Qwen3 文本 NLU 推理评测
-train_nlu.sh         文本 NLU 启动配置
-infer_nlu.sh         文本 NLU 推理配置
-train_asr_nlu.py     ASR + ASR+NLU 联合 LoRA SFT
-infer_asr_nlu.py     ASR+NLU 推理和 CER/意图评测
-train_asr_nlu.sh     ASR+NLU 训练配置
-infer_asr_nlu.sh     ASR+NLU 推理配置
-```
-
-## 联合 ASR 训练与推理
+First, please install the two Python packages `qwen-asr` and `datasets` using the command below.
 
 ```bash
-bash finetuning/train.sh "0,1,2,3"
-
-bash finetuning/infer.sh \
-  --ckpt /path/to/checkpoint \
-  --mode llm,ctc \
-  --input_scp /path/to/wav.scp \
-  --ref_dir /path/to/text \
-  --output_dir /path/to/out \
-  --gpu_ids 0,1
+pip install -U qwen-asr datasets
 ```
 
-`--mode` 支持 `llm/ctc/rnnt` 的逗号组合。`--encoder_mode` 支持
-`offline/stream/train_mask`；`train_mask` 只是训练侧 chunk mask 理论上限，
-线上真实流式评测使用 `stream`。
-
-## 文本 NLU / Agent
-
-文本任务统一使用 `train_nlu.py` 和 `infer_nlu.py`：
-
-- `--backend joint`：加载 `Qwen3ASRJointModel`，无音频时直接走 thinker 文本 forward。
-- `--backend llm`：加载纯 `AutoModelForCausalLM`。
-- 两种 backend 共用数据、label mask、评测指标、badcase 和多 GPU 分片逻辑。
+Then, to reduce GPU memory usage and speed up training, it is recommended to install FlashAttention 2.
 
 ```bash
-BACKEND=joint FULL_FT=0 bash finetuning/train_nlu.sh "0,1,2,3"
-BACKEND=llm   FULL_FT=1 bash finetuning/train_nlu.sh "6,7"
-
-BACKEND=joint TASK=agent EVAL=1 bash finetuning/infer_nlu.sh
-BACKEND=llm   TASK=agent EVAL=1 bash finetuning/infer_nlu.sh
+pip install -U flash-attn --no-build-isolation
 ```
 
-输入 JSONL 每行使用 `{"messages":[{system},{user},{assistant}]}`；推理也兼容
-`{"text":"..."}`。大数据文件统一放在
-`/cfs/data/private/WangYaoChi/train_data/all/nlu/`，不放仓库根目录。
-
-## ASR + ASR+NLU
-
-ASR+NLU 保留独立入口，因为它使用音频输入并把一条标注派生为两条训练样本：
-
-- ASR：prompt=`转写语音`，target=`language X<asr_text>文本`
-- ASR+NLU：prompt=`转写语音并提取用户意图`，target=`language X<asr_text>文本\n意图JSON`
+If your machine has less than 96GB of RAM and lots of CPU cores, run:
 
 ```bash
-bash finetuning/train_asr_nlu.sh "0,1,2,3"
-bash finetuning/infer_asr_nlu.sh
+MAX_JOBS=4 pip install -U flash-attn --no-build-isolation
 ```
 
-训练只更新 thinker 文本 LoRA；推理输出文本 CER 和意图指标。
+Also, you should have hardware that is compatible with FlashAttention 2. Read more about it in the official documentation of the [FlashAttention repository](https://github.com/Dao-AILab/flash-attention). FlashAttention 2 can only be used when a model is loaded in `torch.float16` or `torch.bfloat16`.
 
-## 热词 GRPO
+### 2) Input JSONL format
+
+Prepare your training file as JSONL (one JSON per line). Each line must contain:
+
+- `audio`: path to a WAV file
+- `text`: transcript text (you can include a language prefix)
+
+Example:
+```jsonl
+{"audio":"/data/wavs/utt0001.wav","text":"language English<asr_text>This is a test sentence."}
+{"audio":"/data/wavs/utt0002.wav","text":"language English<asr_text>Another example."}
+{"audio":"/data/wavs/utt0003.wav","text":"language English<asr_text>Fine-tuning data line."}
+```
+
+Language prefix recommendation:
+
+- If you **have** language info, use:
+  - `language English<asr_text>...`
+  - `language Chinese<asr_text>...`
+- If you **do not have** language info, use:
+  - `language None<asr_text>...`
+
+Note:
+- If you set `language None`, the model will not learn language detection from that prefix.
+
+### 3) Fine-tune (single GPU)
 
 ```bash
-bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]
-bash finetuning/hotword_eval.sh
+python qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --batch_size 32 \
+  --grad_acc 4 \
+  --lr 2e-5 \
+  --epochs 1 \
+  --save_steps 200 \
+  --save_total_limit 5
 ```
 
-GRPO 的 checkpoint、数据和输出路径只在 shell/CLI 中配置。`grpo_train.py`
-不再保存另一套机器相关默认路径，并直接使用全部输入训练样本。
+Checkpoints will be written to:
+- `./qwen3-asr-finetuning-out/checkpoint-<global_step>`
+
+### 4) Fine-tune (multi GPU with torchrun)
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+torchrun --nproc_per_node=2 qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --batch_size 32 \
+  --grad_acc 4 \
+  --lr 2e-5 \
+  --epochs 1 \
+  --save_steps 200
+```
+
+### 5) Resume training
+
+Option A: explicitly set a checkpoint path:
+
+```bash
+python qwen3_asr_sft.py \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --resume_from ./qwen3-asr-finetuning-out/checkpoint-200
+```
+
+Option B: automatically resume from the latest checkpoint under `output_dir`:
+
+```bash
+python qwen3_asr_sft.py \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --resume 1
+```
+
+### 6) Quick inference test
+
+```python
+import torch
+from qwen_asr import Qwen3ASRModel
+
+model = Qwen3ASRModel.from_pretrained(
+    "qwen3-asr-finetuning-out/checkpoint-200",
+    dtype=torch.bfloat16,
+    device_map="cuda:0",
+)
+
+results = model.transcribe(
+    audio="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav",
+)
+
+print(results[0].language)
+print(results[0].text)
+```
+
+### One-click shell script example
+
+```bash
+#!/usr/bin/env bash
+set -e
+
+export CUDA_VISIBLE_DEVICES=0,1
+
+MODEL_PATH="Qwen/Qwen3-ASR-1.7B"
+TRAIN_FILE="./train.jsonl"
+EVAL_FILE="./eval.jsonl"
+OUTPUT_DIR="./qwen3-asr-finetuning-out"
+
+torchrun --nproc_per_node=2 qwen3_asr_sft.py \
+  --model_path ${MODEL_PATH} \
+  --train_file ${TRAIN_FILE} \
+  --eval_file ${EVAL_FILE} \
+  --output_dir ${OUTPUT_DIR} \
+  --batch_size 32 \
+  --grad_acc 4 \
+  --lr 2e-5 \
+  --epochs 1 \
+  --log_steps 10 \
+  --save_strategy steps \
+  --save_steps 200 \
+  --save_total_limit 5 \
+  --num_workers 2 \
+  --pin_memory 1 \
+  --persistent_workers 1 \
+  --prefetch_factor 2
+```

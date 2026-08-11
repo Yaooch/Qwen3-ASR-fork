@@ -4,11 +4,11 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 
 ## 目录边界
 
-- 官方能力放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
-- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward、`transcribe` 和共用的 LLM 输入构造，`encoder.py` 负责 Encoder、长度和流式 KV cache，`ctc.py/rnnt.py/defaults.py` 放其余核心逻辑。
-- 热词检索只保留 `qwen_asr/joint/hotword/` 的音素级两层实现：`FastRAG` 粗筛 + 边界约束 DP 精筛，统一由 `HotwordRetriever` 对外提供接口。
-- `finetuning/` 只放长期使用的训练、推理、评估入口；`qwen_asr/tools/` 只保留主链路依赖或会重复使用的评估/诊断工具，一次性数据加工脚本不要提交到仓库。
-- 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr/joint/defaults.py`。
+- `qwen_asr/` 保持官方包结构；除 joint encoder 所需的最小接口外，不把自研逻辑放进官方包。
+- 所有自研能力集中在 `qwen_asr_ext/`，总说明见 `qwen_asr_ext/README.md`。
+- `qwen_asr_ext/joint/` 放联合 CTC/RNNT 模型与主训练推理；`hotword/`、`grpo/`、`glclap/`、`nlu/`、`evaluation/` 分别保持单向、清晰的职责边界。
+- `finetuning/` 恢复为上游官方微调示例，不放项目自研入口；一次性数据加工脚本不要提交到仓库。
+- 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr_ext/joint/defaults.py`。
 
 ## 代码原则
 
@@ -25,14 +25,14 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 - CTC head 固定叫 `ctc`，RNNT 固定 cached greedy 解码；两者新训练固定接在 `ln_post` 后、`proj1/proj2` 前。
 - CTC adapter 支持 `mlp/moe`，`joint_config.json` 记录 `ctc_adapter`，旧 checkpoint 默认 `mlp`。
 - CTC-only 训练不构造 LLM `input_ids/labels`；训练 batch 不携带未使用的 raw waveform；checkpoint 保存统一走 `JointTrainer.save_model`，输出根目录和 `checkpoint-*` 都应可直接推理。
-- 训练验证指标记录 `eval_ctc_cer/eval_rnnt_cer`，TensorBoard 日志路径由 `finetuning/train.py --logging_dir` 控制。
+- 训练验证指标记录 `eval_ctc_cer/eval_rnnt_cer`，TensorBoard 日志路径由 `qwen_asr_ext/joint/train.py --logging_dir` 控制。
 
 ## NLU / Agent 训练约定
 
-- 纯文本 NLU/Agent 统一使用 `finetuning/train_nlu.py` 和 `finetuning/infer_nlu.py`，通过 `--backend joint/llm` 显式区分 joint checkpoint 与纯 Qwen3 LLM；不再新增 `*_nlu_pure.py/sh` 平行入口。
+- 纯文本 NLU/Agent 统一使用 `qwen_asr_ext/nlu/train.py` 和 `qwen_asr_ext/nlu/infer.py`，通过 `--backend joint/llm` 显式区分 joint checkpoint 与纯 Qwen3 LLM；不再新增 `*_nlu_pure.py/sh` 平行入口。
 - 两种文本 backend 共用 JSONL 读取、label mask、结果合并、指标和 badcase；仅模型/Tokenizer 加载、prompt 渲染和 LoRA target 保留必要分支。
 - `joint` 无音频训练走 `Qwen3ASRJointModel.forward(input_features=None)` 的 thinker 文本路径；`llm` 直接走 `AutoModelForCausalLM`。
-- ASR+NLU 因为包含音频 collator、ASR/ASR+NLU 双样本派生与 CER 评测，继续保留 `train_asr_nlu.py/infer_asr_nlu.py` 独立入口，不并入文本 NLU。
+- ASR+NLU 因为包含音频 collator、ASR/ASR+NLU 双样本派生与 CER 评测，继续保留 `qwen_asr_ext/nlu/train_asr.py` / `infer_asr.py` 独立入口，不并入文本 NLU。
 - `--resume_from` 先加载 LoRA；只有目录含 `trainer_state.json` 时才同时恢复 Trainer optimizer/step。
 
 ## 流式和推理约定
@@ -51,22 +51,22 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 - 热词测试集按语言拆分输出到测试集目录下的 `Mandarin/` 和 `English/`，`hotword.txt` 从拆分后的目标热词重新生成。
 - 拼音评估兼容 `utt_id<TAB>文本` 和 `utt_id 空格 文本`；中英混合文本保留 ASCII token，汉字转拼音后一起计算 PER/SAR。
 - WER 阶段同时生成文本 badcase，输出 `utt_id/WER/ref/hyp`；badcase 保留问题分组标题，单条只输出 `utt_id/target/retrieved/ref/llm/final`。
-- 启用热词检索时，`Qwen3ASRJointModel.transcribe` 每条记录 `hotword_retrieve_ms`（毫秒）写入 detail jsonl，`qwen_asr/tools/hotword_eval.py` 汇总 mean/p50/p95/max。
+- 启用热词检索时，`Qwen3ASRJointModel.transcribe` 每条记录 `hotword_retrieve_ms`（毫秒）写入 detail jsonl，`qwen_asr_ext/hotword/evaluate.py` 汇总 mean/p50/p95/max。
 
 ## 热词 GRPO 强化学习
 
 - 目标：让 talker 在注入「真热词 + 干扰词」混合列表时选对并原样输出真热词、不误注入干扰词、非热词部分不退化。
 - 训练数据用 ContextASR（`train_contextasr2.jsonl`，每条 `text` 为 ground-truth、`prompt` 已含混合热词列表）；候选列表直接用数据预给列表，不与 retriever 耦合。
-- 奖励纯函数在 `qwen_asr/tools/hotword_reward.py`：`parse_text_field` 剥 `language X<asr_text>` 前缀并去标点，`split_truth` 按子串划真热词/干扰词，`compute_reward = w_r·recall − w_f·fp − w_mix·hybrid_injection − w_c·non_hotword_cer − w_fmt·(1−fmt)`；`hybrid_injection_rate` 惩罚真热词与干扰词片段拼出的中文混合词。
-- 训练组件在 `finetuning/grpo_core.py`（数据读写/组内优势+clip+KL 数学/LoRA 装配）与 `finetuning/grpo_train.py`（音频 embedding、G 路采样、固定 old/ref logprob 和多轮 PPO 更新）；评测统一走 `finetuning/hotword_eval.sh` + `qwen_asr/tools/hotword_eval.py`。
+- 奖励纯函数在 `qwen_asr_ext/grpo/grpo.py`：`parse_text_field` 剥 `language X<asr_text>` 前缀并去标点，`split_truth` 按子串划真热词/干扰词，`compute_reward = w_r·recall − w_f·fp − w_mix·hybrid_injection − w_c·non_hotword_cer − w_fmt·(1−fmt)`；`hybrid_injection_rate` 惩罚真热词与干扰词片段拼出的中文混合词。
+- GRPO 样本、奖励、组内优势、PPO clip 和 KL 数学统一在 `qwen_asr_ext/grpo/grpo.py`；rollout 与训练主循环在 `qwen_asr_ext/grpo/train.py`；共用 LoRA 装配在 `qwen_asr_ext/joint/lora.py`。
 - 模型加载统一 `from_pretrained(..., load_heads=False, attn_implementation=...).to("cuda")`（GRPO 只用 LLM + audio_tower，不加载 CTC/RNNT 头）；LoRA 评测经 `PeftModel.from_pretrained(joint, lora)` 包整个 joint，与训练的 adapter key 对齐。
-- 训练 `bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]`（默认 4 卡，经 `torchrun` 数据并行）；rollout 时固定 behavior `old_logp`，同一批 rollout 默认做 4 轮 PPO 更新，`PPO_EPOCHS` 可调整，采样分布与 old/current logprob 使用同一 temperature 且不做 top-p/top-k 截断。各卡 LoRA 梯度 all-reduce 后同步步进；`--batch_size_per_rank` 控制每卡每批样本数，effective batch = NPROC × batch_size_per_rank；`RESUME=1` 从 `OUTPUT_DIR/lora` 恢复 LoRA、优化器和 rollout step。
-- 纯函数与数学单测在 `tests/tools/test_hotword_reward.py`、`tests/finetuning/test_grpo_core.py`；不保留依赖个人 checkpoint 的集成测试。
+- 训练 `bash qwen_asr_ext/grpo/train.sh [OUTPUT_DIR] [NPROC] [RESUME]`（默认 4 卡，经 `torchrun` 数据并行）；rollout 时固定 behavior `old_logp`，同一批 rollout 默认做 4 轮 PPO 更新，`PPO_EPOCHS` 可调整，采样分布与 old/current logprob 使用同一 temperature 且不做 top-p/top-k 截断。各卡 LoRA 梯度 all-reduce 后同步步进；`--batch_size_per_rank` 控制每卡每批样本数，effective batch = NPROC × batch_size_per_rank；`RESUME=1` 从 `OUTPUT_DIR/lora` 恢复 LoRA、优化器和 rollout step。
+- 纯函数与数学单测在 `tests/test_hotword_reward.py`、`tests/test_grpo.py`；不保留依赖个人 checkpoint 的集成测试。
 
 ## 脚本和验证
 
 - Shell 参数解析避免为每个 `--arg` 手写重复 `case` 分支，优先使用通用赋值 helper，只保留布尔开关和特殊副作用分支。
-- 一次性数据切分、扰动和统计脚本放在 CFS 或临时目录，不放入 `qwen_asr/tools/`；大数据统计优先随机 seek 抽样，避免全量扫描。
+- 一次性数据切分、扰动和统计脚本放在 CFS 或临时目录，不放入 `qwen_asr_ext/`；大数据统计优先随机 seek 抽样，避免全量扫描。
 - 修改 Python 文件后，至少运行 `python3 -m py_compile <file...>`。
 - 修改 shell 脚本后，至少运行 `bash -n <file...>`。
 - 如果改动影响共享接口、训练/推理主链路或跨模块行为，再按实际影响范围扩大验证。
