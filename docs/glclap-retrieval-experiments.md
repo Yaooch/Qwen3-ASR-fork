@@ -28,9 +28,10 @@
 
 | 版本 | 模型目录 / checkpoint | 训练权重 | GPU | per-GPU / global batch | 实际 step / 计划 step |
 |---|---|---|---:|---:|---:|
-| V1 | /cfs/data/private/WangYaoChi/model/glclap/retrieval/checkpoint-47000 | 仅投影层和 logit_scale | 2 | 32 / 64 | 47k / 100k |
-| V2 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune/final | 全量微调 | 2 | 32 / 64 | 100k / 100k |
-| V3 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune_subtext_v2/checkpoint-160000 | 全量微调 | 8 | 8 / 64 | 160k / 200k |
+| V1 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v1/checkpoint-47000 | 仅投影层和 logit_scale | 2 | 32 / 64 | 47k / 100k |
+| V2 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v2/final | 全量微调 | 2 | 32 / 64 | 100k / 100k |
+| V3 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v3/checkpoint-160000 | 全量微调 | 8 | 8 / 64 | 160k / 200k |
+| V4 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v4 | 全量微调 | 7 | 9 / 63 | 待训练 / 200k |
 
 ### 2.2 优化参数与 subtext 构造
 
@@ -38,7 +39,8 @@
 |---|---:|---:|---:|---:|---|
 | V1 | 5e-4 | Encoder 冻结 | 1k | 1k / 1k | 中英文统一随机连续 2～8 units |
 | V2 | 1e-3 | 1e-5 | 1k | 1k / 5k | 中英文统一随机连续 2～8 units |
-| V3 | 1e-3 | 1e-5 | 10k | 10k / 10k | 中文 2～8；英文 1～4，权重 2:3:3:1 |
+| V3 | 1e-3 | 1e-5 | 10k | 10k / 10k | Chinese 2～8；其他语言标签 1～4，权重 2:3:3:1 |
+| V4 | 1e-3 | 1e-5 | 10k | 10k / 10k | 含汉字文本 2～8；英文 1～4=40%/30%/20%/10% |
 
 补充说明：
 
@@ -46,6 +48,10 @@
 - V2 共处理约 6.4M 个训练样本实例。
 - V3 在 step 160k 时共处理约 10.24M 个训练样本实例。
 - V3 英文 1/2/3/4 词的采样概率约为 22.22%/33.33%/33.33%/11.11%。
+- V3 代码只把 Chinese 标签识别为中文；Cantonese、Sichuanese、None 标签实际走了 1～4 分支。
+- V4 修正语言判断：非 English 且含汉字的文本统一走中文 2～8；英文 1 词中 80% 从 df>=5 的非 stopword 内容词按低频权重采样，20% 从全部词均匀采样。
+- V4 词频文件：/cfs/data/private/WangYaoChi/train_data/all/english_word_df.json；统计 6,800,665 条训练记录、999,630 条英文记录和 180,476 个英文词，合格内容词 median df=17。
+- V4 使用 7 卡、每卡 batch 9，global batch 63；不加入 hard negative、multi-positive 或 pooling 改动。
 - V2 训练结束记录：step 100k train loss 0.1720；eval loss 0.0826，global R@1 99.84%，local R@1 97.34%，local R@5 99.92%。
 - V2 与 V3 同为 global batch 64，但 V3 同时改变了 subtext 采样、训练步数和 warmup，因此两版差异不是严格的单变量实验。
 
@@ -113,7 +119,8 @@ STOP 按目标长度拆分：
 | 方法 | 结果根目录 |
 |---|---|
 | CTC 7/24 两层检索 | /cfs/data/private/WangYaoChi/test_out/joint_ctc_50_grpo_2/asr_hotword |
-| GLCLAP V2 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune |
-| GLCLAP V3 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_full_finetune_subtext_v2 |
+| GLCLAP V2 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v2 |
+| GLCLAP V3 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v3 |
+| GLCLAP V4 | /cfs/data/private/WangYaoChi/model/glclap/retrieval_v4 |
 
 CTC 四个子目录分别为 stop1、stop2、aishell_hotword、voyah；每个目录的 hotword_eval.txt 是汇总，details/results_detail.jsonl 是逐条检索明细。

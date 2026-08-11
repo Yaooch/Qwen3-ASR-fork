@@ -1,11 +1,13 @@
 # coding: utf-8
 """独立训练 GLCLAP 音频-热词检索模型。"""
 import argparse
+import hashlib
 import json
 import os
 import random
 import re
 import time
+import unicodedata
 from typing import Dict, Iterator, List
 
 import librosa
@@ -25,10 +27,21 @@ TRAIN_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.j
 EVAL_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
 AUDIO_MODEL = "/cfs/data/private/WangYaoChi/model/glclap/data2vec-audio-large"
 TEXT_MODEL = "/cfs/data/private/WangYaoChi/model/glclap/bert-base-multilingual-uncased"
-OUTPUT_DIR = "/cfs/data/private/WangYaoChi/model/glclap/retrieval"
+OUTPUT_DIR = "/cfs/data/private/WangYaoChi/model/glclap/retrieval_v4"
+ENGLISH_WORD_DF = "/cfs/data/private/WangYaoChi/train_data/all/english_word_df.json"
 ASR_TAG = "<asr_text>"
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 UNIT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
+ENGLISH_LENGTH_WEIGHTS = {1: 4, 2: 3, 3: 2, 4: 1}
+ENGLISH_STOPWORDS = frozenset(
+    """
+    a an the and or but if then else of to in on at by for from with without
+    is am are was were be been being do does did have has had this that these
+    those it its i you he she we they me him her us them my your his our their
+    as not no yes can could will would shall should may might must s t d ll m
+    re ve
+    """.split()
+)
 
 
 def parse_text(raw: str):
@@ -43,22 +56,90 @@ def parse_text(raw: str):
     return language, text.strip()
 
 
-def sample_subtext(text: str, language: str = "", max_units: int = 8, rng=random) -> str:
-    """从中英文混合文本中抽取连续 span，并保留原始字符间隔。"""
+def normalize_word(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).lower()
+
+
+def load_word_df(path: str):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    frequencies = data.get("document_frequency", data)
+    frequencies = {normalize_word(str(word)): int(count) for word, count in frequencies.items()}
+    eligible = [
+        count for word, count in frequencies.items()
+        if count >= 5 and word not in ENGLISH_STOPWORDS
+    ]
+    if not eligible:
+        raise ValueError(f"英文词频文件没有 df>=5 的有效内容词：{path}")
+    return frequencies, float(np.median(eligible))
+
+
+def sample_subtext_info(
+    text: str,
+    language: str = "",
+    max_units: int = 8,
+    word_df=None,
+    median_df: float = 1.0,
+    rng=random,
+):
+    """抽取 V4 连续 span，并返回采样统计。"""
     matches = list(UNIT_RE.finditer(text))
-    chinese = language.lower().startswith("chinese") if language else bool(HAN_RE.search(text))
+    english = language.lower().startswith("english")
+    chinese = bool(HAN_RE.search(text)) and not english
     min_length, max_length = (2, 8) if chinese else (1, 4)
     max_length = min(max_length, max_units, len(matches))
     if max_length < min_length:
-        return text.strip()
+        value = text.strip()
+        return value, len(matches), not chinese, False, False
+
     lengths = list(range(min_length, max_length + 1))
-    if chinese:
-        weights = [3 if length in (2, 3) else 1 for length in lengths]
-    else:
-        weights = [{1: 2, 2: 3, 3: 3, 4: 1}[length] for length in lengths]
+    weights = (
+        [3 if length in (2, 3) else 1 for length in lengths]
+        if chinese else [ENGLISH_LENGTH_WEIGHTS[length] for length in lengths]
+    )
     length = rng.choices(lengths, weights=weights, k=1)[0]
-    start = rng.randint(0, len(matches) - length)
-    return text[matches[start].start():matches[start + length - 1].end()].strip()
+    if not chinese and length == 1:
+        frequencies = word_df or {}
+        candidates = []
+        candidate_weights = []
+        for index, match in enumerate(matches):
+            word = normalize_word(match.group())
+            frequency = frequencies.get(word, 0)
+            if word not in ENGLISH_STOPWORDS and frequency >= 5:
+                candidates.append(index)
+                candidate_weights.append(
+                    min(4.0, max(0.5, (median_df / frequency) ** 0.5))
+                )
+        if candidates and rng.random() < 0.8:
+            start = rng.choices(candidates, weights=candidate_weights, k=1)[0]
+        else:
+            start = rng.randrange(len(matches))
+    else:
+        start = rng.randint(0, len(matches) - length)
+
+    value = text[matches[start].start():matches[start + length - 1].end()].strip()
+    word = normalize_word(value) if length == 1 else ""
+    frequency = (word_df or {}).get(word, 0)
+    return (
+        value,
+        length,
+        not chinese,
+        word in ENGLISH_STOPWORDS,
+        5 <= frequency <= median_df,
+    )
+
+
+def sample_subtext(
+    text: str,
+    language: str = "",
+    max_units: int = 8,
+    word_df=None,
+    median_df: float = 1.0,
+    rng=random,
+) -> str:
+    return sample_subtext_info(
+        text, language, max_units, word_df, median_df, rng
+    )[0]
 
 
 def iter_jsonl_shard(path: str, part: int, parts: int) -> Iterator[Dict]:
@@ -142,6 +223,7 @@ class GLCLAPCollator:
         text_model: str,
         max_text_length: int,
         max_subtext_units: int,
+        english_word_df: str,
     ):
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(
             audio_model, local_files_only=True
@@ -150,6 +232,7 @@ class GLCLAPCollator:
         self.tokenizer = BertTokenizer.from_pretrained(text_model, local_files_only=True)
         self.max_text_length = max_text_length
         self.max_subtext_units = max_subtext_units
+        self.word_df, self.median_df = load_word_df(english_word_df)
 
     def __call__(self, rows: List[Dict]) -> Dict[str, torch.Tensor]:
         audio = self.feature_extractor(
@@ -160,10 +243,17 @@ class GLCLAPCollator:
             return_tensors="pt",
         )
         texts = [x["text"] for x in rows]
-        subtexts = [
-            sample_subtext(x["text"], x["language"], self.max_subtext_units)
+        sampled = [
+            sample_subtext_info(
+                x["text"],
+                x["language"],
+                self.max_subtext_units,
+                self.word_df,
+                self.median_df,
+            )
             for x in rows
         ]
+        subtexts = [x[0] for x in sampled]
         text = self.tokenizer(
             texts,
             padding=True,
@@ -185,6 +275,20 @@ class GLCLAPCollator:
             "text_attention_mask": text["attention_mask"],
             "subtext_input_ids": subtext["input_ids"],
             "subtext_attention_mask": subtext["attention_mask"],
+            "_sample_units": torch.tensor([x[1] for x in sampled]),
+            "_sample_english": torch.tensor([x[2] for x in sampled]),
+            "_sample_stopword": torch.tensor([x[3] for x in sampled]),
+            "_sample_low_frequency": torch.tensor([x[4] for x in sampled]),
+            "_sample_hash": torch.tensor([
+                int.from_bytes(
+                    hashlib.blake2b(
+                        normalize_word(value).encode("utf-8"), digest_size=8
+                    ).digest(),
+                    "little",
+                    signed=True,
+                )
+                for value in subtexts
+            ]),
         }
 
 
@@ -210,7 +314,9 @@ def evaluate(model, loader, batches: int, device: torch.device, dtype: torch.dty
     iterator = iter(loader)
     total = {"loss": 0.0, "global_r1": 0.0, "local_r1": 0.0, "local_r5": 0.0}
     for _ in range(batches):
-        batch = move_batch(next(iterator), device)
+        batch = next(iterator)
+        batch = {key: value for key, value in batch.items() if not key.startswith("_")}
+        batch = move_batch(batch, device)
         with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             out = model(**batch, gather=True)
         total["loss"] += float(out["loss"])
@@ -328,10 +434,11 @@ def parse_args():
     parser.add_argument("--audio_model", default=AUDIO_MODEL)
     parser.add_argument("--text_model", default=TEXT_MODEL)
     parser.add_argument("--output_dir", default=OUTPUT_DIR)
+    parser.add_argument("--english_word_df", default=ENGLISH_WORD_DF)
     parser.add_argument("--resume_from", default="")
     parser.add_argument("--init_from", default="")
     parser.add_argument("--embed_dim", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=32, help="每卡 batch；两卡真实 global batch=2x")
+    parser.add_argument("--batch_size", type=int, default=32, help="每卡 batch")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=100000)
     parser.add_argument("--eval_every", type=int, default=1000)
@@ -370,6 +477,7 @@ def main():
         args.text_model,
         args.max_text_length,
         args.max_subtext_units,
+        args.english_word_df,
     )
     train_loader = make_loader(args.train_jsonl, args, collator, rank, world_size)
     eval_loader = make_loader(args.eval_jsonl, args, collator, rank, world_size)
@@ -408,9 +516,24 @@ def main():
 
     iterator = iter(train_loader)
     running = 0.0
+    data_counts = torch.zeros(8, dtype=torch.long)
+    hash_batches = []
     last_time = time.time()
     for step in range(start_step + 1, args.max_steps + 1):
-        batch = move_batch(next(iterator), device)
+        batch = next(iterator)
+        units = batch.pop("_sample_units")
+        english = batch.pop("_sample_english").bool()
+        stopword = batch.pop("_sample_stopword").bool()
+        low_frequency = batch.pop("_sample_low_frequency").bool()
+        hashes = batch.pop("_sample_hash")
+        data_counts[0] += len(units)
+        data_counts[1] += english.sum()
+        for length in range(1, 5):
+            data_counts[length + 1] += (english & (units == length)).sum()
+        data_counts[6] += (english & (units == 1) & stopword).sum()
+        data_counts[7] += (english & (units == 1) & low_frequency).sum()
+        hash_batches.append(hashes)
+        batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             out = model(**batch, gather=True)
@@ -421,16 +544,43 @@ def main():
         scheduler.step()
         running += float(loss.detach())
 
-        if rank == 0 and step % args.log_every == 0:
-            elapsed = time.time() - last_time
-            print(
-                f"step={step} loss={running / args.log_every:.4f} "
-                f"global={float(out['global_loss'].detach()):.4f} "
-                f"local={float(out['local_loss'].detach()):.4f} "
-                f"lr={scheduler.get_last_lr()[0]:.2e} step_s={elapsed / args.log_every:.3f}"
-            )
-            running = 0.0
-            last_time = time.time()
+        if step % args.log_every == 0:
+            counts = data_counts.to(device)
+            if world_size > 1:
+                dist.all_reduce(counts)
+            local_hashes = torch.stack(hash_batches).to(device)
+            if world_size > 1:
+                parts = [torch.empty_like(local_hashes) for _ in range(world_size)]
+                dist.all_gather(parts, local_hashes)
+                global_hashes = torch.cat(parts, dim=1)
+            else:
+                global_hashes = local_hashes
+            duplicate_rows = 0
+            for row_hashes in global_hashes:
+                _, repeated = torch.unique(row_hashes, return_counts=True)
+                duplicate_rows += int(repeated[repeated > 1].sum())
+            if rank == 0:
+                elapsed = time.time() - last_time
+                english_total = max(int(counts[1]), 1)
+                one_word = max(int(counts[2]), 1)
+                length_ratio = "/".join(
+                    f"{100 * int(counts[index]) / english_total:.1f}"
+                    for index in range(2, 6)
+                )
+                print(
+                    f"step={step} loss={running / args.log_every:.4f} "
+                    f"global={float(out['global_loss'].detach()):.4f} "
+                    f"local={float(out['local_loss'].detach()):.4f} "
+                    f"lr={scheduler.get_last_lr()[0]:.2e} step_s={elapsed / args.log_every:.3f} "
+                    f"en_len1/2/3/4={length_ratio}% "
+                    f"en1_stop={100 * int(counts[6]) / one_word:.1f}% "
+                    f"en1_low={100 * int(counts[7]) / one_word:.1f}% "
+                    f"dup={100 * duplicate_rows / int(counts[0]):.2f}%"
+                )
+                running = 0.0
+                last_time = time.time()
+            data_counts.zero_()
+            hash_batches.clear()
 
         if args.eval_every > 0 and step % args.eval_every == 0:
             metrics = evaluate(model, eval_loader, args.eval_batches, device, dtype)

@@ -5,7 +5,12 @@ from collections import Counter
 import torch
 
 from finetuning.eval_glclap import normalize_text, read_candidates, read_key_value
-from finetuning.train_glclap import iter_jsonl_shard, parse_text, sample_subtext
+from finetuning.train_glclap import (
+    iter_jsonl_shard,
+    load_word_df,
+    parse_text,
+    sample_subtext,
+)
 from qwen_asr.joint.glclap import feature_mask, glclap_loss
 
 
@@ -27,17 +32,59 @@ def test_sample_subtext_uses_language_specific_lengths():
     rng = random.Random(7)
     english = Counter(
         len(sample_subtext("one two three four five six", "English", rng=rng).split())
-        for _ in range(1000)
+        for _ in range(10000)
     )
     chinese = Counter(
         len(sample_subtext("一二三四五六七八九十", "Chinese", rng=rng))
-        for _ in range(1000)
+        for _ in range(10000)
     )
 
     assert set(english) == {1, 2, 3, 4}
-    assert english[2] > english[4] and english[3] > english[4]
+    for length, expected in {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}.items():
+        assert abs(english[length] / sum(english.values()) - expected) < 0.02
     assert set(chinese) == set(range(2, 9))
     assert chinese[2] > chinese[4] and chinese[3] > chinese[8]
+
+
+def test_han_dialects_use_chinese_lengths():
+    for language in ("Cantonese", "Sichuanese", "None"):
+        lengths = {
+            len(sample_subtext("一二三四五六七八九十", language, rng=random.Random(seed)))
+            for seed in range(200)
+        }
+        assert 1 not in lengths
+        assert lengths == set(range(2, 9))
+
+
+def test_one_word_sampling_prefers_low_frequency_content():
+    rng = random.Random(11)
+    selected = Counter(
+        sample_subtext(
+            "the quasar",
+            "English",
+            max_units=1,
+            word_df={"the": 10000, "quasar": 5},
+            median_df=5,
+            rng=rng,
+        )
+        for _ in range(2000)
+    )
+    assert selected["quasar"] / sum(selected.values()) > 0.85
+
+
+def test_load_word_df_uses_valid_content_median(tmp_path):
+    path = tmp_path / "word_df.json"
+    path.write_text(json.dumps({
+        "document_frequency": {
+            "the": 1000,
+            "quasar": 5,
+            "nebula": 9,
+            "typo": 2,
+        }
+    }), encoding="utf-8")
+    frequencies, median = load_word_df(str(path))
+    assert frequencies["the"] == 1000
+    assert median == 7.0
 
 
 def test_iter_jsonl_shard_reads_each_row_once(tmp_path):
