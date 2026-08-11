@@ -82,8 +82,6 @@ class Qwen3ASRJointModel(nn.Module):
         self.rnnt = RNNT(vocab_size, self.encoder_output_size, blank_id=blank_id) if "rnnt" in self.heads else None
         self.processor = None
         self._asr_wrapper = None
-        for p in self.parameters():
-            p.requires_grad = True
 
     def head(self, name: str):
         head = getattr(self, name, None)
@@ -106,14 +104,15 @@ class Qwen3ASRJointModel(nn.Module):
         if "heads" not in cfg:
             raise ValueError(f"joint checkpoint 配置缺少 heads：{os.path.join(model_path, JOINT_CONFIG)}")
 
+        heads = cfg["heads"] if load_heads else ()
         base = Qwen3ASRModel.from_pretrained(model_path, dtype=dtype, device_map=device_map, **kwargs)
         model = cls(
             qwen_model=base.model,
             vocab_size=cfg["vocab_size"],
             vocab=cfg.get("vocab", {}),
             blank_id=cfg.get("blank_id", 0),
-            heads=cfg["heads"],
-            train_tasks=("llm", *cfg["heads"]),
+            heads=heads,
+            train_tasks=("llm", *heads),
             ctc_config={"adapter_type": cfg.get("ctc_adapter", "mlp")},
         )
         model.processor = base.processor

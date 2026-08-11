@@ -42,7 +42,7 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 - 批量推理用 `--encoder_mode offline/stream/train_mask`；`train_mask` 是训练侧 chunk mask 理论上限，不代表线上真实流式行为；兼容保留 `--stream/--no_stream` 作为别名。
 - `--mode` 只接受 `llm/ctc/rnnt` 的逗号组合，不再使用 `joint` 模式。
 - 真实流式推理每 640ms 处理一个 waveform chunk，batch 内 active chunk 合批送 encoder KV cache；CTC/RNNT 流式解码固定 batched greedy。
-- 流式对齐检查使用 `qwen_asr/tools/check_stream_alignment.py`；多 GPU 批量推理由子进程自行读取 scp 并分片，避免通过启动 pipe 传递大 shard。
+- 多 GPU 批量推理由子进程自行读取 scp 并分片，避免通过启动 pipe 传递大 shard。
 
 ## 热词和评估约定
 
@@ -55,13 +55,13 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 
 ## 热词 GRPO 强化学习
 
-- 目标：让 talker 在注入「真热词 + 干扰词」混合列表时选对并原样输出真热词、不误注入干扰词、非热词部分不退化。详见 `docs/sdd/specs/2026-06-25-hotword-grpo-rl-design.md` 与计划 `docs/sdd/plans/2026-06-25-hotword-grpo-rl.md`，分支 `rl/hotword-grpo`。
+- 目标：让 talker 在注入「真热词 + 干扰词」混合列表时选对并原样输出真热词、不误注入干扰词、非热词部分不退化。
 - 训练数据用 ContextASR（`train_contextasr2.jsonl`，每条 `text` 为 ground-truth、`prompt` 已含混合热词列表）；候选列表直接用数据预给列表，不与 retriever 耦合。
 - 奖励纯函数在 `qwen_asr/tools/hotword_reward.py`：`parse_text_field` 剥 `language X<asr_text>` 前缀并去标点，`split_truth` 按子串划真热词/干扰词，`compute_reward = w_r·recall − w_f·fp − w_mix·hybrid_injection − w_c·non_hotword_cer − w_fmt·(1−fmt)`；`hybrid_injection_rate` 惩罚真热词与干扰词片段拼出的中文混合词。
-- 训练组件在 `finetuning/grpo_core.py`（数据读写/组内优势+clip+KL 数学/LoRA 装配，轻量、可单测）与 `finetuning/grpo_train.py`（`RolloutSampler` 音频 embedding 缓存 + G 路采样 + ref/train logprob + 训练主循环）；评测统一走 `finetuning/hotword_eval.sh` + `qwen_asr/tools/hotword_eval.py`。
+- 训练组件在 `finetuning/grpo_core.py`（数据读写/组内优势+clip+KL 数学/LoRA 装配，轻量、可单测）与 `finetuning/grpo_train.py`（`RolloutSampler` 音频 embedding + G 路采样 + ref/train logprob + 训练主循环）；评测统一走 `finetuning/hotword_eval.sh` + `qwen_asr/tools/hotword_eval.py`。
 - 模型加载统一 `from_pretrained(..., load_heads=False, attn_implementation=...).to("cuda")`（GRPO 只用 LLM + audio_tower，不加载 CTC/RNNT 头）；LoRA 评测经 `PeftModel.from_pretrained(joint, lora)` 包整个 joint，与训练的 adapter key 对齐。
 - 训练 `bash finetuning/grpo_train.sh [OUTPUT_DIR] [NPROC] [RESUME]`（默认 4 卡，经 `torchrun` 数据并行：各卡取 rank-strided 样本做 G 路 rollout 与 backward，LoRA 梯度 all-reduce 求平均后同步步进；`apply_lora` 后由 rank 0 广播 LoRA 初始参数，保证各卡一致），单卡跑传 `NPROC=1`；`--batch_size_per_rank` 控制每卡每步累积样本数，effective batch = NPROC × batch_size_per_rank；`RESUME=1` 从 `OUTPUT_DIR/lora` 续训（恢复 LoRA 权重 + 优化器状态 + step）。评测 `bash finetuning/hotword_eval.sh`（设 `lora` 变量挂载 RL LoRA，留空评基线）。成功标准：热词召回升、误注入降、非热词 CER 不劣化（≤基线 +0.5% 绝对），三者同时达成。
-- 纯函数与数学单测在 `tests/tools/test_hotword_reward.py`、`tests/finetuning/test_grpo_core.py`（数据/数学/LoRA）；模型相关集成测试标 `@pytest.mark.integration` 默认跳过（`pytest.ini`），手动 `pytest -m integration` 跑。
+- 纯函数与数学单测在 `tests/tools/test_hotword_reward.py`、`tests/finetuning/test_grpo_core.py`；不保留依赖个人 checkpoint 的集成测试。
 
 ## 脚本和验证
 

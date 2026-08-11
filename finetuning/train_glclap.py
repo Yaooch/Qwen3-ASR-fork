@@ -1,7 +1,6 @@
 # coding: utf-8
 """独立训练 GLCLAP 音频-热词检索模型。"""
 import argparse
-import hashlib
 import json
 import os
 import random
@@ -21,7 +20,6 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoFeatureExtractor, BertTokenizer, get_cosine_schedule_with_warmup
 
 from qwen_asr.joint.glclap import GLCLAPModel
-
 
 TRAIN_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
 EVAL_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
@@ -43,7 +41,6 @@ ENGLISH_STOPWORDS = frozenset(
     """.split()
 )
 
-
 def parse_text(raw: str):
     """解析 language X<asr_text>文本，不改写 ground truth。"""
     raw = str(raw or "").strip()
@@ -55,10 +52,8 @@ def parse_text(raw: str):
         language = language[9:].strip()
     return language, text.strip()
 
-
 def normalize_word(text: str) -> str:
     return unicodedata.normalize("NFKC", text).lower()
-
 
 def load_word_df(path: str):
     with open(path, encoding="utf-8") as f:
@@ -73,24 +68,22 @@ def load_word_df(path: str):
         raise ValueError(f"英文词频文件没有 df>=5 的有效内容词：{path}")
     return frequencies, float(np.median(eligible))
 
-
-def sample_subtext_info(
+def sample_subtext(
     text: str,
     language: str = "",
     max_units: int = 8,
     word_df=None,
     median_df: float = 1.0,
     rng=random,
-):
-    """抽取 V4 连续 span，并返回采样统计。"""
+) -> str:
+    """抽取 V4 连续 span。"""
     matches = list(UNIT_RE.finditer(text))
     english = language.lower().startswith("english")
     chinese = bool(HAN_RE.search(text)) and not english
     min_length, max_length = (2, 8) if chinese else (1, 4)
     max_length = min(max_length, max_units, len(matches))
     if max_length < min_length:
-        value = text.strip()
-        return value, len(matches), not chinese, False, False
+        return text.strip()
 
     lengths = list(range(min_length, max_length + 1))
     weights = (
@@ -118,29 +111,7 @@ def sample_subtext_info(
         start = rng.randint(0, len(matches) - length)
 
     value = text[matches[start].start():matches[start + length - 1].end()].strip()
-    word = normalize_word(value) if length == 1 else ""
-    frequency = (word_df or {}).get(word, 0)
-    return (
-        value,
-        length,
-        not chinese,
-        word in ENGLISH_STOPWORDS,
-        5 <= frequency <= median_df,
-    )
-
-
-def sample_subtext(
-    text: str,
-    language: str = "",
-    max_units: int = 8,
-    word_df=None,
-    median_df: float = 1.0,
-    rng=random,
-) -> str:
-    return sample_subtext_info(
-        text, language, max_units, word_df, median_df, rng
-    )[0]
-
+    return value
 
 def iter_jsonl_shard(path: str, part: int, parts: int) -> Iterator[Dict]:
     """按字节区间读取 JSONL，避免每个 rank 扫描完整大文件。"""
@@ -162,7 +133,6 @@ def iter_jsonl_shard(path: str, part: int, parts: int) -> Iterator[Dict]:
                 continue
             if isinstance(row, dict):
                 yield row
-
 
 class AudioTextDataset(IterableDataset):
     """多卡/多 worker 字节分片的流式音频数据集。"""
@@ -215,7 +185,6 @@ class AudioTextDataset(IterableDataset):
             if not valid:
                 raise RuntimeError(f"数据分片没有有效样本：{self.path} part={part}/{parts}")
 
-
 class GLCLAPCollator:
     def __init__(
         self,
@@ -244,7 +213,7 @@ class GLCLAPCollator:
         )
         texts = [x["text"] for x in rows]
         sampled = [
-            sample_subtext_info(
+            sample_subtext(
                 x["text"],
                 x["language"],
                 self.max_subtext_units,
@@ -253,7 +222,7 @@ class GLCLAPCollator:
             )
             for x in rows
         ]
-        subtexts = [x[0] for x in sampled]
+        subtexts = sampled
         text = self.tokenizer(
             texts,
             padding=True,
@@ -275,38 +244,20 @@ class GLCLAPCollator:
             "text_attention_mask": text["attention_mask"],
             "subtext_input_ids": subtext["input_ids"],
             "subtext_attention_mask": subtext["attention_mask"],
-            "_sample_units": torch.tensor([x[1] for x in sampled]),
-            "_sample_english": torch.tensor([x[2] for x in sampled]),
-            "_sample_stopword": torch.tensor([x[3] for x in sampled]),
-            "_sample_low_frequency": torch.tensor([x[4] for x in sampled]),
-            "_sample_hash": torch.tensor([
-                int.from_bytes(
-                    hashlib.blake2b(
-                        normalize_word(value).encode("utf-8"), digest_size=8
-                    ).digest(),
-                    "little",
-                    signed=True,
-                )
-                for value in subtexts
-            ]),
         }
-
 
 def seed_worker(worker_id: int) -> None:
     seed = torch.initial_seed() % (2**32)
     random.seed(seed)
     np.random.seed(seed)
 
-
 def move_batch(batch: Dict[str, torch.Tensor], device: torch.device):
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-
 
 def recall(logits: torch.Tensor, k: int) -> float:
     labels = torch.arange(logits.shape[0], device=logits.device)
     topk = logits.topk(min(k, logits.shape[1]), dim=1).indices
     return float((topk == labels.unsqueeze(1)).any(dim=1).float().mean())
-
 
 @torch.no_grad()
 def evaluate(model, loader, batches: int, device: torch.device, dtype: torch.dtype):
@@ -315,7 +266,6 @@ def evaluate(model, loader, batches: int, device: torch.device, dtype: torch.dty
     total = {"loss": 0.0, "global_r1": 0.0, "local_r1": 0.0, "local_r5": 0.0}
     for _ in range(batches):
         batch = next(iterator)
-        batch = {key: value for key, value in batch.items() if not key.startswith("_")}
         batch = move_batch(batch, device)
         with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             out = model(**batch, gather=True)
@@ -325,7 +275,6 @@ def evaluate(model, loader, batches: int, device: torch.device, dtype: torch.dty
         total["local_r5"] += recall(out["local_logits"], 5)
     model.train()
     return {key: value / batches for key, value in total.items()}
-
 
 def save_checkpoint(model, optimizer, scheduler, args, step: int, name: str = "") -> str:
     output = os.path.join(args.output_dir, name or f"checkpoint-{step}")
@@ -348,14 +297,12 @@ def save_checkpoint(model, optimizer, scheduler, args, step: int, name: str = ""
         json.dump({"step": step, **vars(args)}, f, ensure_ascii=False, indent=2)
     return output
 
-
 def init_from_checkpoint(model, path: str) -> None:
     """只加载已有可训练权重，用于改变解冻范围后的下一训练阶段。"""
     weights = load_file(os.path.join(path, "model.safetensors"))
     unexpected = model.load_state_dict(weights, strict=False).unexpected_keys
     if unexpected:
         raise RuntimeError(f"checkpoint 含未知参数：{unexpected}")
-
 
 def load_checkpoint(model, optimizer, scheduler, path: str) -> int:
     weights = load_file(os.path.join(path, "model.safetensors"))
@@ -374,7 +321,6 @@ def load_checkpoint(model, optimizer, scheduler, path: str) -> int:
     scheduler.load_state_dict(state["scheduler"])
     return int(state["step"])
 
-
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -383,7 +329,6 @@ def setup_distributed():
     if world_size > 1:
         dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     return rank, local_rank, world_size, torch.device(f"cuda:{local_rank}")
-
 
 def make_loader(path, args, collator, rank, world_size, repeat=True):
     dataset = AudioTextDataset(
@@ -408,7 +353,6 @@ def make_loader(path, args, collator, rank, world_size, repeat=True):
         kwargs["prefetch_factor"] = 2
     return DataLoader(**kwargs)
 
-
 def build_optimizer(model, args):
     projection, encoder = [], []
     for name, param in model.named_parameters():
@@ -425,7 +369,6 @@ def build_optimizer(model, args):
     if encoder:
         groups.append({"params": encoder, "lr": args.lr_encoder, "weight_decay": args.weight_decay})
     return AdamW(groups)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="训练 GLCLAP 音频-热词检索模型")
@@ -460,7 +403,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
@@ -516,23 +458,9 @@ def main():
 
     iterator = iter(train_loader)
     running = 0.0
-    data_counts = torch.zeros(8, dtype=torch.long)
-    hash_batches = []
     last_time = time.time()
     for step in range(start_step + 1, args.max_steps + 1):
         batch = next(iterator)
-        units = batch.pop("_sample_units")
-        english = batch.pop("_sample_english").bool()
-        stopword = batch.pop("_sample_stopword").bool()
-        low_frequency = batch.pop("_sample_low_frequency").bool()
-        hashes = batch.pop("_sample_hash")
-        data_counts[0] += len(units)
-        data_counts[1] += english.sum()
-        for length in range(1, 5):
-            data_counts[length + 1] += (english & (units == length)).sum()
-        data_counts[6] += (english & (units == 1) & stopword).sum()
-        data_counts[7] += (english & (units == 1) & low_frequency).sum()
-        hash_batches.append(hashes)
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
@@ -545,42 +473,16 @@ def main():
         running += float(loss.detach())
 
         if step % args.log_every == 0:
-            counts = data_counts.to(device)
-            if world_size > 1:
-                dist.all_reduce(counts)
-            local_hashes = torch.stack(hash_batches).to(device)
-            if world_size > 1:
-                parts = [torch.empty_like(local_hashes) for _ in range(world_size)]
-                dist.all_gather(parts, local_hashes)
-                global_hashes = torch.cat(parts, dim=1)
-            else:
-                global_hashes = local_hashes
-            duplicate_rows = 0
-            for row_hashes in global_hashes:
-                _, repeated = torch.unique(row_hashes, return_counts=True)
-                duplicate_rows += int(repeated[repeated > 1].sum())
             if rank == 0:
                 elapsed = time.time() - last_time
-                english_total = max(int(counts[1]), 1)
-                one_word = max(int(counts[2]), 1)
-                length_ratio = "/".join(
-                    f"{100 * int(counts[index]) / english_total:.1f}"
-                    for index in range(2, 6)
-                )
                 print(
                     f"step={step} loss={running / args.log_every:.4f} "
                     f"global={float(out['global_loss'].detach()):.4f} "
                     f"local={float(out['local_loss'].detach()):.4f} "
-                    f"lr={scheduler.get_last_lr()[0]:.2e} step_s={elapsed / args.log_every:.3f} "
-                    f"en_len1/2/3/4={length_ratio}% "
-                    f"en1_stop={100 * int(counts[6]) / one_word:.1f}% "
-                    f"en1_low={100 * int(counts[7]) / one_word:.1f}% "
-                    f"dup={100 * duplicate_rows / int(counts[0]):.2f}%"
+                    f"lr={scheduler.get_last_lr()[0]:.2e} step_s={elapsed / args.log_every:.3f}"
                 )
                 running = 0.0
                 last_time = time.time()
-            data_counts.zero_()
-            hash_batches.clear()
 
         if args.eval_every > 0 and step % args.eval_every == 0:
             metrics = evaluate(model, eval_loader, args.eval_batches, device, dtype)
@@ -608,7 +510,6 @@ def main():
     if world_size > 1:
         dist.barrier()
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()

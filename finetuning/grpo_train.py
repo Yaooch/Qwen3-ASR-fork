@@ -36,7 +36,7 @@ from finetuning.grpo_core import (
 
 
 # --------------------------------------------------------------------------
-# Rollout：音频 embedding 缓存 + G 路采样 + token logprob
+# Rollout：音频 embedding + G 路采样 + token logprob
 # 与 qwen_asr/joint/model.py 的 decode_llm 路径对齐：音频 embedding 由 encode_offline
 # 产出；prompt 由 _asr_wrapper._build_text_prompt 构造，audio placeholder 用 processor.audio_token；
 # 采样走 qwen_model.generate(do_sample)，logprob 走 thinker.forward 的 logits。
@@ -68,20 +68,13 @@ class RolloutSampler:
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.device = device
-        self._audio_cache = {}
         # 显式 pad_token_id，避免 generate 时 "Setting pad_token_id to eos" 告警刷屏
         eos = getattr(self.joint.qwen_model.generation_config, "eos_token_id", None)
         self.pad_token_id = eos[0] if isinstance(eos, (list, tuple)) else eos
         self._eos_set = set(eos if isinstance(eos, (list, tuple)) else [eos])
 
-    def clear_audio_cache(self) -> None:
-        """跨样本清理音频 embedding 缓存，避免长训练 OOM。"""
-        self._audio_cache = {}
-
     def audio_embedding(self, audio_path: str) -> torch.Tensor:
-        """返回该音频的 LLM 输入 embedding (n_audio_tokens, hidden)，缓存。"""
-        if audio_path in self._audio_cache:
-            return self._audio_cache[audio_path]
+        """返回该音频的 LLM 输入 embedding (n_audio_tokens, hidden)。"""
         wav, _ = librosa.load(audio_path, sr=16000, mono=True)
         wav = wav.astype("float32")
         fe = self.processor.feature_extractor
@@ -102,9 +95,7 @@ class RolloutSampler:
         lens = feature_lens(feats, mask)
         tower = self.joint.qwen_model.thinker.audio_tower
         _, llm, _ = encode_offline(tower, feats, lens, need_llm=True)
-        emb = llm[: int(lens[0])]  # 单条音频：llm 即 (n_audio, hidden) 的 LLM 音频 embedding
-        self._audio_cache[audio_path] = emb
-        return emb
+        return llm[: int(lens[0])]  # 单条音频：llm 即 (n_audio, hidden) 的 LLM 音频 embedding
 
     def build_batch(self, sample):
         """构造 G 份相同 prompt 的 batch（同音频同 prompt，仅 rollout 生成不同）。
@@ -251,7 +242,6 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--resume", type=int, default=0, choices=[0, 1], help="1 表示续训，0 表示重新训练")
     p.add_argument("--resume_from", default="", help="续训 LoRA 目录；为空时使用 output_dir/lora")
-    p.add_argument("--smoke", action="store_true", help="少量样本 1 step 自检")
     return p.parse_args()
 
 
@@ -313,14 +303,12 @@ def main():
                     dist.broadcast(p.data, src=0)
     peft.eval()
 
-    group_size = 4 if args.smoke else args.group_size
-    temperature = 1.0 if args.smoke else args.temperature
     sampler = RolloutSampler(
         peft,
         joint.processor,
         asr_wrapper,
-        group_size=group_size,
-        temperature=temperature,
+        group_size=args.group_size,
+        temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
         device=device,
     )
@@ -343,18 +331,16 @@ def main():
                 "优化器重置、step 从 0 起（旧版 checkpoint 兜底）"
             )
 
-    limit = 8 if args.smoke else None
-    samples = load_samples(args.data, limit=limit)
+    samples = load_samples(args.data)
     train = samples
     # 多卡按 rank stride 切分，各卡样本数一致以保持步数对齐
     train_local = train[rank::world] if world > 1 else train
-    max_steps = 1 if args.smoke else args.max_steps
     accum = args.batch_size_per_rank
 
     step = start_step
     idx = start_step * accum
     reward_history = deque(maxlen=50)  # 滚动 reward 均值，平滑样本难度噪声看真趋势
-    while step < max_steps and idx < len(train_local):
+    while step < args.max_steps and idx < len(train_local):
         opt.zero_grad()
         last_loss = 0.0
         step_rewards = []
@@ -373,7 +359,6 @@ def main():
             )
             if float(rewards.std().item()) < 1e-6:
                 # 组内无区分，无学习信号：跳过 backward（仍消耗该样本，保持各卡步数对齐）
-                sampler.clear_audio_cache()
                 continue
             adv = group_advantages(rewards.unsqueeze(0)).squeeze(0)  # (G,)
             # 1 次 batch 带梯度前向算所有 rollout 的 logp（复用 inputs，避免重 tokenize）
@@ -390,20 +375,18 @@ def main():
                 )
                 n_valid += 1
             if n_valid == 0:
-                sampler.clear_audio_cache()
                 continue
             # 累积：按 accum 与 world 同时归一，等价于对所有样本梯度求平均
             (loss_acc / n_valid / accum).backward()
             did_backward = True
             last_loss = float(loss_acc.detach() / n_valid)
             step_rewards.append(rewards.detach().float())
-            sampler.clear_audio_cache()
 
         has_update = torch.tensor(1 if did_backward else 0, device=device)
         if world > 1:
             dist.all_reduce(has_update, op=dist.ReduceOp.SUM)
         if int(has_update.item()) == 0:
-            if is_main and (step % 10 == 0 or args.smoke):
+            if is_main and step % 10 == 0:
                 print(f"step {step} all-skipped (eff_batch={world * accum})")
             step += 1
             continue
@@ -425,7 +408,7 @@ def main():
         if reward_stats is not None:
             reward_history.append(float(reward_stats.mean()))
 
-        if is_main and (step % 10 == 0 or args.smoke):
+        if is_main and step % 10 == 0:
             if reward_stats is not None:
                 roll_mean = sum(reward_history) / len(reward_history) if reward_history else 0.0
                 print(

@@ -11,23 +11,15 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-from datetime import datetime
 from typing import Dict, List
 
 import editdistance
 import torch
 
-from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
+from finetuning.infer import batches, load_joint_model, log
 from qwen_asr.tools.nlu import intent_metrics, parse_intent
 
-
 ASR_NLU_PROMPT = "转写语音并提取用户意图"
-
-
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-ASR ASR+NLU 批量推理 / 评测。")
@@ -44,7 +36,6 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=256)
     return p.parse_args()
 
-
 def load_items(path: str) -> List[Dict]:
     items = []
     with open(path, "r", encoding="utf-8") as f:
@@ -59,7 +50,6 @@ def load_items(path: str) -> List[Dict]:
             items.append({"utt_id": str(line_no), "audio": audio, "ref": assistant})
     return items
 
-
 def split_text_intent(s: str):
     """从 'language X<asr_text>文本\n意图JSON' 或 '文本\n意图JSON' 拆出 (文本, 意图dict|None)。"""
     if not s:
@@ -72,12 +62,6 @@ def split_text_intent(s: str):
     intent = parse_intent(intent_str) if intent_str.strip().startswith("{") else None
     return text_part, intent
 
-
-def batches(items, size):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
-
-
 def worker(rank, gpu_id, world_size, args, items, tmp_path):
     shard = items[rank::world_size]
     if not torch.cuda.is_available():
@@ -87,14 +71,7 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     log(f"进程{rank}启动：GPU {gpu_id}，样本 {len(shard)}")
 
-    model = Qwen3ASRJointModel.from_pretrained(
-        args.ckpt, dtype=dtype, device_map=None, load_heads=False,
-        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
-    ).to(device)
-    if args.lora:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, args.lora)
-    model.eval()
+    model = load_joint_model(args.ckpt, dtype, device, args.lora, load_heads=False)
 
     rows = []
     with torch.no_grad():
@@ -130,7 +107,6 @@ def worker(rank, gpu_id, world_size, args, items, tmp_path):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     log(f"进程{rank}完成")
 
-
 def merge(tmp_files, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     rows = []
@@ -161,7 +137,6 @@ def merge(tmp_files, output_dir):
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
     print(f"明细：{detail_path}")
-
 
 def main():
     args = parse_args()
@@ -202,7 +177,6 @@ def main():
     for path in tmp_files:
         if os.path.exists(path):
             os.remove(path)
-
 
 if __name__ == "__main__":
     main()

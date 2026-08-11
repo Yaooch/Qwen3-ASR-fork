@@ -5,7 +5,7 @@
 """
 import json
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -24,13 +24,11 @@ class GrpoSample:
     prompt: str  # 原 prompt 字段（rollout 时原样用作 context）
 
 
-def load_samples(jsonl_path: str, limit: Optional[int] = None) -> List[GrpoSample]:
+def load_samples(jsonl_path: str) -> List[GrpoSample]:
     """读 ContextASR jsonl → GRPO 训练样本。"""
     samples: List[GrpoSample] = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if limit is not None and i >= limit:
-                break
+        for line in f:
             line = line.strip()
             if not line:
                 continue

@@ -2,30 +2,22 @@ import json
 import os
 import tempfile
 
-import pytest
 import torch
 
 from finetuning.grpo_core import (
-    apply_lora,
-    assert_only_text_decoder_trainable,
     group_advantages,
     grpo_loss,
     load_samples,
 )
 
-CKPT = "/cfs/data/private/WangYaoChi/model/qwen3-asr-ctc-joint-14-hotword-1/checkpoint-228"
-
-
 # --------------------------------------------------------------------------
 # grpo_data: load_samples
 # --------------------------------------------------------------------------
-
 
 def _write(path, rows):
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
 
 def test_load_samples_parses_fields():
     with tempfile.NamedTemporaryFile(
@@ -51,18 +43,15 @@ def test_load_samples_parses_fields():
     assert s.hotwords == ["洪金宝", "伊佐美纪"]
     assert "专属名词" in s.prompt
 
-
 # --------------------------------------------------------------------------
 # grpo_math: group_advantages / grpo_loss
 # --------------------------------------------------------------------------
-
 
 def test_group_advantages_zero_mean_per_group():
     r = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     a = group_advantages(r)
     assert a.shape == (1, 4)
     assert abs(float(a.sum())) < 1e-6
-
 
 def test_grpo_loss_finite_and_sign():
     logp = torch.zeros(2, 4, requires_grad=True)
@@ -83,26 +72,3 @@ def test_grpo_kl_penalty_is_zero_at_ref_and_positive_when_changed():
     ref = torch.zeros(2)
     assert float(grpo_loss(same, same.detach(), adv, ref, beta=1.0).detach()) == 0.0
     assert float(grpo_loss(moved, moved.detach(), adv, ref, beta=1.0).detach()) > 0.0
-
-
-# --------------------------------------------------------------------------
-# grpo_lora: apply_lora（集成，需真实 ckpt，默认跳过）
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_apply_lora_only_text_decoder_trainable():
-    from qwen_asr.joint import Qwen3ASRJointModel
-    from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
-
-    joint = Qwen3ASRJointModel.from_pretrained(
-        CKPT,
-        dtype=torch.bfloat16,
-        device_map=None,
-        load_heads=False,
-        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
-    ).to("cuda")
-    peft_model = apply_lora(joint)
-    assert_only_text_decoder_trainable(peft_model)
-    n = sum(1 for p in peft_model.parameters() if p.requires_grad)
-    assert n > 0

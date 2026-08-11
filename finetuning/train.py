@@ -54,6 +54,7 @@ class DataCollatorForJointTraining:
     sampling_rate: int = 16000
     stream_train: bool = False
     need_llm: bool = True
+    need_aux: bool = True
 
     def __post_init__(self):
         self.cjk = re.compile(r"([\u4e00-\u9fff])")
@@ -90,19 +91,23 @@ class DataCollatorForJointTraining:
             eos = self.processor.tokenizer.eos_token or ""
             full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
             full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
-            prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
+            audio_token = self.processor.audio_token
             if self.stream_train:
-                stream_lens = [max(1, int(conv_len(int(x)))) for x in full["feature_attention_mask"].sum(dim=1).tolist()]
-                audio_token = self.processor.audio_token
-                full_tok = self.processor.tokenizer(
-                    [text.replace(audio_token, audio_token * length, 1) for text, length in zip(full_texts, stream_lens)],
+                audio_lens = [
+                    max(1, int(conv_len(int(length))))
+                    for length in full["feature_attention_mask"].sum(dim=1).tolist()
+                ]
+                full.update(self.processor.tokenizer(
+                    [text.replace(audio_token, audio_token * length, 1) for text, length in zip(full_texts, audio_lens)],
                     return_tensors="pt", padding=True, truncation=False,
-                )
-                prefix = self.processor.tokenizer(
-                    [text.replace(audio_token, audio_token * length, 1) for text, length in zip(prefix_texts, stream_lens)],
-                    return_tensors="pt", padding=True, truncation=False,
-                )
-                full.update(full_tok)
+                ))
+            else:
+                audio_id = self.processor.tokenizer.convert_tokens_to_ids(audio_token)
+                audio_lens = (full["input_ids"] == audio_id).sum(dim=1).tolist()
+            prefix = self.processor.tokenizer(
+                [text.replace(audio_token, audio_token * length, 1) for text, length in zip(prefix_texts, audio_lens)],
+                return_tensors="pt", padding=True, truncation=False,
+            )
 
             labels = full["input_ids"].clone()
             for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
@@ -117,6 +122,9 @@ class DataCollatorForJointTraining:
                 padding=True, truncation=False, return_attention_mask=True,
             )
             full["feature_attention_mask"] = full.pop("attention_mask")
+
+        if not self.need_aux:
+            return full
 
         ids_list = [self.text_to_ids(text) for text in targets]
         max_len = max((len(ids) for ids in ids_list), default=0)
@@ -249,39 +257,44 @@ class JointTrainer(Trainer):
             return metrics
 
         dataloader = self.get_eval_dataloader(eval_dataset)
+        stats = {head: {"edits": 0, "chars": 0, "shown": 0} for head in heads}
         self.model.eval()
-        for head in heads:
-            edits, chars, shown = 0, 0, 0
-            with torch.no_grad():
-                for batch in dataloader:
-                    inputs = self._prepare_inputs(batch)
-                    if "input_features" not in inputs:
-                        return metrics
-                    ref_param = next(base.qwen_model.parameters())
-                    feats = inputs["input_features"].to(device=ref_param.device, dtype=ref_param.dtype)
-                    mask = inputs.get("feature_attention_mask")
-                    mask = mask.to(device=ref_param.device) if mask is not None else None
-                    lens_in = feature_lens(feats, mask)
-                    tower = base.qwen_model.thinker.audio_tower
-                    if base.stream_train:
-                        hs, _, lens = encode_train_mask(
-                            tower, feats, lens_in,
-                            TRAIN_MASK_LEFT_FRAMES, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_RIGHT_FRAMES,
-                            False,
-                        )
-                    else:
-                        hs, _, lens = encode_offline(tower, feats, lens_in, False)
-                    preds = base.decode_aux(head, hs, lens)
-                    for pred, ref in zip(preds, inputs.get("texts", [])):
-                        ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
-                        ref = "".join(self.data_collator.sp_model.encode_as_pieces(ref.upper())).replace("▁", " ").strip().lower()
-                        if self.args.process_index == 0 and shown < 3:
-                            print(f"[验证样例{shown}] {head.upper()}: {pred}")
-                            print(f"[验证样例{shown}] 参考: {ref}")
-                            shown += 1
-                        edits += editdistance.eval(pred, ref)
-                        chars += len(ref)
-            cer = edits / chars if chars else 0.0
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs = self._prepare_inputs(batch)
+                if "input_features" not in inputs:
+                    return metrics
+                ref_param = next(base.qwen_model.parameters())
+                feats = inputs["input_features"].to(device=ref_param.device, dtype=ref_param.dtype)
+                mask = inputs.get("feature_attention_mask")
+                mask = mask.to(device=ref_param.device) if mask is not None else None
+                lens_in = feature_lens(feats, mask)
+                tower = base.qwen_model.thinker.audio_tower
+                if base.stream_train:
+                    hs, _, lens = encode_train_mask(
+                        tower, feats, lens_in,
+                        TRAIN_MASK_LEFT_FRAMES, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_RIGHT_FRAMES,
+                        False,
+                    )
+                else:
+                    hs, _, lens = encode_offline(tower, feats, lens_in, False)
+
+                refs = []
+                for ref in inputs.get("texts", []):
+                    ref = ref.split("<asr_text>")[-1].strip() if "<asr_text>" in ref else ref.strip()
+                    refs.append("".join(self.data_collator.sp_model.encode_as_pieces(ref.upper())).replace("▁", " ").strip().lower())
+                for head in heads:
+                    stat = stats[head]
+                    for pred, ref in zip(base.decode_aux(head, hs, lens), refs):
+                        if self.args.process_index == 0 and stat["shown"] < 3:
+                            print(f"[验证样例{stat['shown']}] {head.upper()}: {pred}")
+                            print(f"[验证样例{stat['shown']}] 参考: {ref}")
+                            stat["shown"] += 1
+                        stat["edits"] += editdistance.eval(pred, ref)
+                        stat["chars"] += len(ref)
+
+        for head, stat in stats.items():
+            cer = stat["edits"] / stat["chars"] if stat["chars"] else 0.0
             key = f"{metric_key_prefix}_{head}_cer"
             metrics[key] = cer
             self.log({key: cer})
@@ -500,6 +513,7 @@ def main():
         processor,
         vocab,
         sp_model,
+        need_aux=bool(args.active_heads),
         sampling_rate=args.sr,
         stream_train=(args.stream_train == 1),
         need_llm=("llm" in args.loss_tasks),

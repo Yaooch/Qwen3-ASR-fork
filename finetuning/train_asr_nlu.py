@@ -15,73 +15,20 @@ assistant 格式 "language X<asr_text>文本\n意图JSON"。每条派生 ASR + A
 import argparse
 import os
 import random
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Dict, List
 
-import librosa
 import torch
 from datasets import Dataset, load_dataset
 from filelock import FileLock
 from transformers import Trainer, TrainingArguments
 
 from qwen_asr.joint import Qwen3ASRJointModel
-from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION, DEFAULT_PROMPT
+from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
+from finetuning.train import DataCollatorForJointTraining
 from finetuning.grpo_core import apply_lora, assert_only_text_decoder_trainable
-
 
 ASR_PROMPT = "转写语音"
 ASR_NLU_PROMPT = "转写语音并提取用户意图"
-
-
-@dataclass
-class AsrNluCollator:
-    """音频 collator：{audio, prompt, target} -> input_ids + input_features + labels。
-    复用 train.py 的 need_llm 路径(ASR chat_template + audio placeholder)，不产 ctc target。"""
-
-    processor: Any
-    sampling_rate: int = 16000
-
-    def __call__(self, features: List[Dict[str, Any]]):
-        rows = []
-        for item in features:
-            try:
-                wav, _ = librosa.load(item["audio"], sr=self.sampling_rate, mono=True)
-            except Exception as exc:
-                print(f"音频读取失败，跳过：{item['audio']}，{exc}")
-                continue
-            if len(wav) / self.sampling_rate > 1000.0:
-                print(f"音频过长，跳过：{item['audio']}")
-                continue
-            rows.append((item, wav))
-        if not rows:
-            return None
-
-        audios = [wav for _, wav in rows]
-        targets = [item["target"] for item, _ in rows]
-        prefix_texts = [
-            self.processor.apply_chat_template(
-                [[
-                    {"role": "system", "content": item.get("prompt") or DEFAULT_PROMPT},
-                    {"role": "user", "content": [{"type": "audio", "audio": None}]},
-                ]],
-                add_generation_prompt=True, tokenize=False,
-            )[0]
-            for item, _ in rows
-        ]
-        eos = self.processor.tokenizer.eos_token or ""
-        full_texts = [prefix + target + eos for prefix, target in zip(prefix_texts, targets)]
-
-        full = self.processor(text=full_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
-        prefix = self.processor(text=prefix_texts, audio=audios, return_tensors="pt", padding=True, truncation=False)
-        labels = full["input_ids"].clone()
-        for idx, length in enumerate(prefix["attention_mask"].sum(dim=1).tolist()):
-            labels[idx, :length] = -100
-        pad_id = self.processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
-        full["labels"] = labels
-        return full
-
 
 def expand_two_way(example: Dict) -> List[Dict]:
     """一条 ASR+NLU 标注 -> ASR 样本 + ASR+NLU 样本。"""
@@ -93,7 +40,6 @@ def expand_two_way(example: Dict) -> List[Dict]:
         {"audio": audio_path, "prompt": ASR_PROMPT, "target": text_part},
         {"audio": audio_path, "prompt": ASR_NLU_PROMPT, "target": assistant},
     ]
-
 
 def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR ASR+NLU 联合 LoRA SFT")
@@ -117,7 +63,6 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--resume_from", type=str, default="")
     return p.parse_args()
-
 
 def main():
     args = parse_args()
@@ -172,7 +117,7 @@ def main():
     if is_main:
         print(f"派生样本：{len(examples)}（ASR + ASR+NLU 各 {len(raw)}），训练 {len(train_ds)}，验证 {len(eval_ds)}")
 
-    collator = AsrNluCollator(processor)
+    collator = DataCollatorForJointTraining(processor, {}, None, need_aux=False)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -214,7 +159,6 @@ def main():
     trainer.save_model(args.output_dir)
     if is_main:
         print(f"ASR+NLU LoRA 已保存到：{args.output_dir}")
-
 
 if __name__ == "__main__":
     main()

@@ -65,6 +65,22 @@ def batches(items: List[Dict], size: int):
         yield items[start: start + size]
 
 
+def load_joint_model(ckpt, dtype, device, lora=None, load_heads=True):
+    model = Qwen3ASRJointModel.from_pretrained(
+        ckpt,
+        dtype=dtype,
+        device_map=None,
+        load_heads=load_heads,
+        attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
+    ).to(device)
+    if lora:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, lora)
+    model.eval()
+    return model
+
+
 def make_hotword(args):
     if not args.hotword_file:
         return None
@@ -85,16 +101,7 @@ def worker(rank: int, gpu_id: int, world_size: int, args, tmp_path: str):
     rows = []
     if os.path.exists(os.path.join(args.ckpt, JOINT_CONFIG)):
         # ---- joint checkpoint 分支 ----
-        model = Qwen3ASRJointModel.from_pretrained(
-            args.ckpt,
-            dtype=dtype,
-            device_map=None,
-            attn_implementation=DEFAULT_ATTN_IMPLEMENTATION,
-        ).to(device)
-        if args.lora:
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, args.lora)
-        model.eval()
+        model = load_joint_model(args.ckpt, dtype, device, args.lora)
         missing = [name for name in args.modes if name in ("ctc", "rnnt") and name not in model.heads]
         if missing:
             raise RuntimeError(f"checkpoint 没有这些头：{','.join(missing)}")
