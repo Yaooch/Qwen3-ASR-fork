@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import time
 from typing import Dict, List, Tuple
 
 import librosa
@@ -79,14 +80,50 @@ def encode_candidates(
     return torch.cat(embeddings)
 
 
+@torch.no_grad()
+def retrieve_batch(
+    model: GLCLAPModel,
+    audio,
+    candidates: torch.Tensor,
+    top_k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    with torch.autocast(
+        "cuda", dtype=dtype, enabled=device.type == "cuda" and dtype != torch.float32
+    ):
+        _, audio_local, audio_mask = model.encode_audio(
+            audio["input_values"], audio["attention_mask"]
+        )
+        similarity = torch.einsum("kd,btd->bkt", candidates, audio_local)
+        similarity = similarity.masked_fill(
+            ~audio_mask[:, None, :], torch.finfo(similarity.dtype).min
+        ).amax(dim=-1)
+        return similarity.topk(top_k, dim=-1)
+
+
+def latency_stats(values: List[float]) -> Dict[str, float]:
+    ordered = sorted(values)
+
+    def percentile(q: float) -> float:
+        return ordered[round((len(ordered) - 1) * q)]
+
+    return {
+        "mean": sum(ordered) / len(ordered),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "max": ordered[-1],
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="在 STOP1/STOP2 上评测 GLCLAP 热词检索")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", default="")
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--text_batch_size", type=int, default=256)
-    parser.add_argument("--top_k", type=int, default=5)
+    parser.add_argument("--top_k", type=int, default=3)
     parser.add_argument("--max_utts", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
@@ -117,6 +154,9 @@ def main():
         config["audio_model"], local_files_only=True
     )
     tokenizer = BertTokenizer.from_pretrained(config["text_model"], local_files_only=True)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    candidate_start = time.perf_counter()
     with torch.autocast("cuda", dtype=dtype, enabled=device.type == "cuda" and dtype != torch.float32):
         candidate_embeddings = encode_candidates(
             model,
@@ -126,14 +166,33 @@ def main():
             config["max_text_length"],
             device,
         )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    candidate_encode_ms = (time.perf_counter() - candidate_start) * 1000
 
     top_k = min(args.top_k, len(candidates))
+    warmup_wav = librosa.load(records[0][1], sr=16000, mono=True)[0]
+    warmup_audio = feature_extractor(
+        [warmup_wav],
+        sampling_rate=16000,
+        padding=True,
+        return_attention_mask=True,
+        return_tensors="pt",
+    ).to(device)
+    retrieve_batch(model, warmup_audio, candidate_embeddings, top_k, device, dtype)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
     top1_hits = 0
     topk_hits = 0
+    latencies = []
     details = []
     for start in range(0, len(records), args.batch_size):
         batch = records[start:start + args.batch_size]
         waveforms = [librosa.load(path, sr=16000, mono=True)[0] for _, path, _ in batch]
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        retrieve_start = time.perf_counter()
         audio = feature_extractor(
             waveforms,
             sampling_rate=16000,
@@ -141,17 +200,13 @@ def main():
             return_attention_mask=True,
             return_tensors="pt",
         ).to(device)
-        with torch.no_grad(), torch.autocast(
-            "cuda", dtype=dtype, enabled=device.type == "cuda" and dtype != torch.float32
-        ):
-            _, audio_local, audio_mask = model.encode_audio(
-                audio["input_values"], audio["attention_mask"]
-            )
-            similarity = torch.einsum("kd,btd->bkt", candidate_embeddings, audio_local)
-            similarity = similarity.masked_fill(
-                ~audio_mask[:, None, :], torch.finfo(similarity.dtype).min
-            ).amax(dim=-1)
-            scores, indices = similarity.topk(top_k, dim=-1)
+        scores, indices = retrieve_batch(
+            model, audio, candidate_embeddings, top_k, device, dtype
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        item_ms = (time.perf_counter() - retrieve_start) * 1000 / len(batch)
+        latencies.extend([item_ms] * len(batch))
 
         scores = scores.float().cpu().tolist()
         indices = indices.cpu().tolist()
@@ -167,6 +222,8 @@ def main():
                 "text": transcripts.get(utt_id, ""),
                 "hit_top1": hit_top1,
                 f"hit_top{top_k}": hit_topk,
+                "retrieve_ms": round(item_ms, 3),
+                "returned_count": len(retrieved),
                 "retrieved": [
                     {"text": text, "score": round(score, 6)}
                     for text, score in zip(retrieved, row_scores)
@@ -180,12 +237,18 @@ def main():
                 flush=True,
             )
 
+    stats = latency_stats(latencies)
     if args.output:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
             for row in details:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"明细：{args.output}")
+    print(f"候选编码：{candidate_encode_ms:.2f} ms（离线一次）")
+    print(
+        f"在线延迟 batch={args.batch_size} mean={stats['mean']:.2f} ms "
+        f"p50={stats['p50']:.2f} ms p95={stats['p95']:.2f} ms max={stats['max']:.2f} ms"
+    )
     print(
         f"结果 checkpoint={args.checkpoint} utterances={len(records)} "
         f"candidates={len(candidates)} top1_recall={top1_hits / len(records):.4f} "
