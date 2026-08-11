@@ -19,7 +19,6 @@ from .defaults import (
     hotword_prompt,
 )
 from .encoder import encode_offline, encode_stream, encode_train_mask, feature_lens
-from .llm import audio_prompts, inject_audio, left_tokenize
 from .rnnt import RNNT
 
 ENCODER_MODES = {"offline", "stream", "train_mask"}
@@ -49,6 +48,39 @@ def read_cfg(path: Optional[str]) -> Dict:
 
 def ids_to_text(ids: List[int], vocab: Dict[int, str]) -> str:
     return "".join(vocab.get(i, "") for i in ids).replace("▁", " ").strip().lower()
+
+
+def audio_prompt(asr_wrapper, audio_token, audio_length, context="", language=None):
+    """按音频 token 长度构造一条 ASR prompt。"""
+    text = asr_wrapper._build_text_prompt(
+        context=context or "", force_language=language
+    )
+    return text.replace(audio_token, audio_token * int(audio_length), 1)
+
+
+def left_tokenize(tokenizer, texts, **kwargs):
+    """临时使用 left padding，不改变 tokenizer 的全局状态。"""
+    old_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        return tokenizer(texts, **kwargs)
+    finally:
+        tokenizer.padding_side = old_side
+
+
+def inject_audio(thinker, input_ids, audio_features):
+    """把音频特征写入 input_ids 对应的 audio placeholder。"""
+    embeds = thinker.get_input_embeddings()(input_ids)
+    audio_mask = thinker.get_placeholder_mask(input_ids, inputs_embeds=embeds)
+    prompt_count = int(audio_mask[..., 0].sum().item())
+    feature_count = audio_features.numel() // audio_features.shape[-1]
+    if prompt_count != feature_count:
+        raise RuntimeError(
+            f"audio placeholder mismatch: prompt={prompt_count}, features={feature_count}"
+        )
+    return embeds.masked_scatter(
+        audio_mask, audio_features.to(device=embeds.device, dtype=embeds.dtype)
+    )
 
 
 class Qwen3ASRJointModel(nn.Module):
@@ -171,13 +203,16 @@ class Qwen3ASRJointModel(nn.Module):
             raise RuntimeError("模型未正确初始化，请使用 from_pretrained 加载。")
         thinker, processor = self.qwen_model.thinker, self.processor
         device = next(self.qwen_model.parameters()).device
-        prompts = audio_prompts(
-            self._asr_wrapper,
-            processor.audio_token,
-            [feats.shape[0] for feats in feats_list],
-            contexts,
-            languages,
-        )
+        prompts = [
+            audio_prompt(
+                self._asr_wrapper,
+                processor.audio_token,
+                feats.shape[0],
+                context,
+                language,
+            )
+            for feats, context, language in zip(feats_list, contexts, languages)
+        ]
         tok = left_tokenize(
             processor.tokenizer,
             prompts,

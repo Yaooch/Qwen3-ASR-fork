@@ -22,10 +22,14 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 
 from qwen_asr.inference.utils import parse_asr_output
-from qwen_asr.joint import Qwen3ASRJointModel
+from qwen_asr.joint.model import (
+    Qwen3ASRJointModel,
+    audio_prompt,
+    inject_audio,
+    left_tokenize,
+)
 from qwen_asr.joint.defaults import DEFAULT_ATTN_IMPLEMENTATION
 from qwen_asr.joint.encoder import encode_offline, feature_lens
-from qwen_asr.joint.llm import audio_prompts, inject_audio, left_tokenize
 from qwen_asr.tools.hotword_reward import compute_reward
 from finetuning.grpo_core import (
     apply_lora,
@@ -48,8 +52,8 @@ from finetuning.grpo_core import (
 class RolloutResult:
     ids: torch.LongTensor   # (T_gen,) 生成 token
     text: str
-    logp_old: torch.Tensor  # (T_gen,) behavior policy logprob，固定跨 PPO epoch
-    logp_ref: torch.Tensor  # (T_gen,) base(LoRA-off) logprob，detach
+    old_logp: torch.Tensor  # (T_gen,) behavior policy logprob，固定跨 PPO epoch
+    ref_logp: torch.Tensor  # (T_gen,) base(LoRA-off) logprob，detach
 
 
 class RolloutSampler:
@@ -104,12 +108,11 @@ class RolloutSampler:
         返回 input_ids (G,T)、attn (G,T)、audio_embeds (G, n_audio, hidden)。"""
         processor = self.processor
         audio_embeds_1d = self.audio_embedding(sample.audio)  # (n_audio, hidden)
-        text, = audio_prompts(
+        text = audio_prompt(
             self.asr_wrapper,
             processor.audio_token,
-            [audio_embeds_1d.shape[0]],
-            [sample.prompt],
-            [None],
+            audio_embeds_1d.shape[0],
+            sample.prompt,
         )
         tok = left_tokenize(
             processor.tokenizer,
@@ -219,8 +222,8 @@ class RolloutSampler:
             RolloutResult(
                 ids=ids.detach(),
                 text=text,
-                logp_old=old.detach(),
-                logp_ref=ref.detach(),
+                old_logp=old.detach(),
+                ref_logp=ref.detach(),
             )
             for (ids, text), old, ref in zip(gen_results, old_logps, ref_logps)
         ]
@@ -230,23 +233,6 @@ class RolloutSampler:
         """训练时 LoRA-on 带梯度重算各 rollout logp（1 次 batch 前向）。"""
         input_ids, audio_embeds = inputs
         return self._logp_batch(input_ids, audio_embeds, gen_ids_list, use_lora=True)
-
-
-def ppo_group_loss(sampler, inputs, rollouts, advantages, beta):
-    """用固定 behavior/ref logp 计算一个 rollout group 的 PPO loss。"""
-    logps = sampler.token_logp_batch(inputs, [result.ids for result in rollouts])
-    losses = [
-        grpo_loss(
-            logp,
-            result.logp_old.to(logp.dtype),
-            advantage.expand_as(logp),
-            result.logp_ref.to(logp.dtype),
-            beta=beta,
-        )
-        for result, advantage, logp in zip(rollouts, advantages, logps)
-        if logp.numel()
-    ]
-    return sum(losses) / len(losses)
 
 
 # --------------------------------------------------------------------------
@@ -411,7 +397,21 @@ def main():
         for _ in range(args.ppo_epochs):
             opt.zero_grad()
             for inputs, rollouts, advantages in groups:
-                loss = ppo_group_loss(sampler, inputs, rollouts, advantages, args.beta)
+                logps = sampler.token_logp_batch(
+                    inputs, [result.ids for result in rollouts]
+                )
+                losses = [
+                    grpo_loss(
+                        logp,
+                        result.old_logp.to(logp.dtype),
+                        advantage.expand_as(logp),
+                        result.ref_logp.to(logp.dtype),
+                        beta=args.beta,
+                    )
+                    for result, advantage, logp in zip(rollouts, advantages, logps)
+                    if logp.numel()
+                ]
+                loss = sum(losses) / len(losses)
                 (loss / accum).backward()
                 loss_values.append(float(loss.detach()))
 

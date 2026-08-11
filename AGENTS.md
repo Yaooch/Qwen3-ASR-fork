@@ -5,7 +5,7 @@ Qwen3-ASR 仓库包含官方 ASR 包、推理/服务入口，以及联合 CTC/RN
 ## 目录边界
 
 - 官方能力放在 `qwen_asr/core/`、`qwen_asr/inference/`、`qwen_asr/cli/`。
-- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward 和 `transcribe`，`encoder.py` 负责 Encoder、长度和流式 KV cache，`llm.py` 统一 prompt/tokenize/音频注入，`ctc.py/rnnt.py/defaults.py` 放其余核心逻辑。
+- 联合 CTC/RNNT 实验核心放在 `qwen_asr/joint/`：`model.py` 负责训练 forward、`transcribe` 和共用的 LLM 输入构造，`encoder.py` 负责 Encoder、长度和流式 KV cache，`ctc.py/rnnt.py/defaults.py` 放其余核心逻辑。
 - 热词检索只保留 `qwen_asr/joint/hotword/` 的音素级两层实现：`FastRAG` 粗筛 + 边界约束 DP 精筛，统一由 `HotwordRetriever` 对外提供接口。
 - `finetuning/` 只放长期使用的训练、推理、评估入口；`qwen_asr/tools/` 只保留主链路依赖或会重复使用的评估/诊断工具，一次性数据加工脚本不要提交到仓库。
 - 默认 prompt、训练词表路径、训练 SentencePiece 路径、WER 脚本路径和流式常量统一放在 `qwen_asr/joint/defaults.py`。
