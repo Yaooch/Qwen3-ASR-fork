@@ -27,6 +27,7 @@ qwen_asr_ext/
 │   ├── train.py            # rollout、logprob 和分布式训练主循环
 │   └── train.sh            # 训练入口
 ├── glclap/                 # 音频-文本热词检索
+│   ├── README.md           # V1～V4 实验记录和后续方案
 │   ├── model.py            # GLCLAP 模型和对比损失
 │   ├── train.py            # 训练数据、采样和训练循环
 │   ├── train.sh            # 训练入口
@@ -157,6 +158,7 @@ glclap/train.sh
 ```
 
 从 [glclap/train.py](glclap/train.py) 的 `main` 开始，再进入 [glclap/model.py](glclap/model.py) 的 `forward`。
+版本训练参数与统一评测结果见 [glclap/README.md](glclap/README.md)。
 
 两种评测共用 [glclap/benchmark.py](glclap/benchmark.py) 的数据读取和指标，但查询方式不同：
 
