@@ -389,7 +389,7 @@ def parse_args():
 
     p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe，auto 会继承源 checkpoint")
 
-    p.add_argument("--stream_train", type=int, default=0, help="1 表示 CTC/RNNT 按流式窗口特征训练")
+    p.add_argument("--stream_train", type=int, default=0, help="1 表示所有音频任务使用 train-mask Encoder")
 
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--pin_memory", type=int, default=1)

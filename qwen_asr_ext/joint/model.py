@@ -378,7 +378,7 @@ class Qwen3ASRJointModel(nn.Module):
         # 训练时 CTC/RNNT 和可选 LLM 复用同一次 encoder 输出。
         tower = self.qwen_model.thinker.audio_tower
         feat_lengths = feature_lens(input_features, feature_attention_mask)
-        if self.stream_train and aux_tasks:
+        if self.stream_train:
             hs, llm, lens = encode_train_mask(
                 tower, input_features, feat_lengths,
                 TRAIN_MASK_LEFT_FRAMES, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_RIGHT_FRAMES,

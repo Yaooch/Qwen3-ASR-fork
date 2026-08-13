@@ -1,6 +1,6 @@
 # GLCLAP 检索实验记录
 
-更新时间：2026-08-12
+更新时间：2026-08-13
 
 ## 公共设置
 
@@ -70,4 +70,6 @@ V3 / V4 的统一评测明细位于各版本目录下的 `eval_{stop1,stop2,aish
 
 目标是在最终 ASR 链路中复用已经计算的 Qwen3-ASR `ln_post` 特征，不再运行额外的 Data2Vec Encoder。文本侧继续使用 multilingual BERT，候选词 embedding 可离线预计算。
 
-第一阶段冻结原始 Qwen3-ASR Audio Encoder 和 mBERT，只训练两个 512 维投影层与温度参数，损失和 V4 数据采样保持不变。这能直接比较两种预训练音频特征的可对齐性，同时不会破坏原模型的 ASR 能力。若效果有潜力，再比较解冻 Qwen Encoder 最后若干层或加入 ASR/CTC 联合损失。
+V5 用官方 Qwen3-ASR-1.7B 初始化，在 `train_mask` 下全量训练从 Mel 到 `ln_post` 的 Audio Encoder、mBERT、两个 512 维投影层和温度参数；Qwen `proj1/act/proj2` 不在检索计算图中。损失和 V4 数据采样保持不变，global batch 固定为 64（8 卡 × 8 或 4 卡 × 16）。本阶段只探索检索性能上限；若有效，再联合训练 CTC、LLM 和 GLCLAP。
+
+V5 评测把完整 `ln_post` Encoder 输出作为计时边界：主延迟只统计 1024→512 投影、候选相似度和 Top-K，不包含特征提取与 Qwen Encoder。候选文本 embedding 仍离线预计算。

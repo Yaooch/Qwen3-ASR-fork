@@ -20,6 +20,11 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoFeatureExtractor, BertTokenizer, get_cosine_schedule_with_warmup
 
 from qwen_asr_ext.glclap.model import GLCLAPModel
+from qwen_asr_ext.joint.defaults import (
+    TRAIN_MASK_CURRENT_FRAMES,
+    TRAIN_MASK_LEFT_FRAMES,
+    TRAIN_MASK_RIGHT_FRAMES,
+)
 
 TRAIN_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl"
 EVAL_JSONL = "/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
@@ -193,12 +198,14 @@ class GLCLAPCollator:
         max_text_length: int,
         max_subtext_units: int,
         english_word_df: str,
+        audio_backend: str = "data2vec",
     ):
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(
             audio_model, local_files_only=True
         )
         # 当前 transformers 对该 BERT fast tokenizer 有误报，slow tokenizer 行为稳定。
         self.tokenizer = BertTokenizer.from_pretrained(text_model, local_files_only=True)
+        self.audio_backend = audio_backend
         self.max_text_length = max_text_length
         self.max_subtext_units = max_subtext_units
         self.word_df, self.median_df = load_word_df(english_word_df)
@@ -237,14 +244,24 @@ class GLCLAPCollator:
             max_length=self.max_text_length,
             return_tensors="pt",
         )
-        return {
-            "input_values": audio["input_values"],
-            "audio_attention_mask": audio["attention_mask"],
+        batch = {
             "text_input_ids": text["input_ids"],
             "text_attention_mask": text["attention_mask"],
             "subtext_input_ids": subtext["input_ids"],
             "subtext_attention_mask": subtext["attention_mask"],
         }
+        if self.audio_backend == "qwen":
+            mask = audio.get("feature_attention_mask", audio.get("attention_mask"))
+            batch.update({
+                "input_features": audio["input_features"],
+                "feature_attention_mask": mask,
+            })
+        else:
+            batch.update({
+                "input_values": audio["input_values"],
+                "audio_attention_mask": audio["attention_mask"],
+            })
+        return batch
 
 def seed_worker(worker_id: int) -> None:
     seed = torch.initial_seed() % (2**32)
@@ -375,6 +392,10 @@ def parse_args():
     parser.add_argument("--train_jsonl", default=TRAIN_JSONL)
     parser.add_argument("--eval_jsonl", default=EVAL_JSONL)
     parser.add_argument("--audio_model", default=AUDIO_MODEL)
+    parser.add_argument("--audio_backend", choices=["data2vec", "qwen"], default="data2vec")
+    parser.add_argument("--stream_left_frames", type=int, default=TRAIN_MASK_LEFT_FRAMES)
+    parser.add_argument("--stream_current_frames", type=int, default=TRAIN_MASK_CURRENT_FRAMES)
+    parser.add_argument("--stream_right_frames", type=int, default=TRAIN_MASK_RIGHT_FRAMES)
     parser.add_argument("--text_model", default=TEXT_MODEL)
     parser.add_argument("--output_dir", default=OUTPUT_DIR)
     parser.add_argument("--english_word_df", default=ENGLISH_WORD_DF)
@@ -406,6 +427,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.encoder_mode = "train_mask" if args.audio_backend == "qwen" else "data2vec"
     if args.resume_from and args.init_from:
         raise ValueError("--resume_from 与 --init_from 不能同时使用。")
     rank, local_rank, world_size, device = setup_distributed()
@@ -420,6 +442,7 @@ def main():
         args.max_text_length,
         args.max_subtext_units,
         args.english_word_df,
+        args.audio_backend,
     )
     train_loader = make_loader(args.train_jsonl, args, collator, rank, world_size)
     eval_loader = make_loader(args.eval_jsonl, args, collator, rank, world_size)
@@ -431,6 +454,10 @@ def main():
         args.unfreeze_audio_layers,
         args.unfreeze_text_layers,
         not args.no_gradient_checkpointing,
+        args.audio_backend,
+        args.stream_left_frames,
+        args.stream_current_frames,
+        args.stream_right_frames,
     ).to(device)
     if args.init_from:
         init_from_checkpoint(raw_model, args.init_from)

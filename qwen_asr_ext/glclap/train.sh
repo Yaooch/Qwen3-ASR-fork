@@ -6,22 +6,38 @@ project_root=$(cd "$script_dir/../.." && pwd)
 export PYTHONPATH="$project_root:${PYTHONPATH:-}"
 cd "$project_root"
 
-output_dir=${1:-/cfs/data/private/WangYaoChi/model/glclap/retrieval_v4}
-nproc=${2:-7}
+output_dir=${1:-/cfs/data/private/WangYaoChi/model/glclap/retrieval_v5}
+nproc=${2:-8}
 shift $(( $# > 0 ? 1 : 0 ))
 shift $(( $# > 0 ? 1 : 0 ))
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,2,3,4,5,6,7} torchrun \
+case "$nproc" in
+  8)
+    batch_size=8
+    default_devices=0,1,2,3,4,5,6,7
+    ;;
+  4)
+    batch_size=16
+    default_devices=0,1,2,3
+    ;;
+  *)
+    echo "只支持 8 卡 × batch 8 或 4 卡 × batch 16，当前 nproc=$nproc" >&2
+    exit 2
+    ;;
+esac
+
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$default_devices} torchrun \
   --standalone \
   --nproc_per_node="$nproc" \
   -m qwen_asr_ext.glclap.train \
   --train_jsonl /cfs/data/private/WangYaoChi/train_data/all/train_700w_shuffled.jsonl \
   --eval_jsonl /cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl \
-  --audio_model /cfs/data/private/WangYaoChi/model/glclap/data2vec-audio-large \
+  --audio_backend qwen \
+  --audio_model /cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B \
   --text_model /cfs/data/private/WangYaoChi/model/glclap/bert-base-multilingual-uncased \
   --english_word_df /cfs/data/private/WangYaoChi/train_data/all/english_word_df.json \
   --output_dir "$output_dir" \
-  --batch_size 9 \
+  --batch_size "$batch_size" \
   --num_workers 4 \
   --unfreeze_audio_layers -1 \
   --unfreeze_text_layers -1 \
