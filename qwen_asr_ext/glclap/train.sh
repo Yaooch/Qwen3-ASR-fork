@@ -18,7 +18,7 @@ case "$nproc" in
     ;;
   4)
     batch_size=16
-    default_devices=0,1,2,3
+    default_devices=4,5,6,7
     ;;
   *)
     echo "只支持 8 卡 × batch 8 或 4 卡 × batch 16，当前 nproc=$nproc" >&2
