@@ -77,7 +77,10 @@ def encode_train_mask(
     """流式训练用的 chunk mask 编码：整段 Mel → aux 特征 + 可选 LLM 投影。"""
     hidden_states = conv_subsample_batch(tower, feats)
     t = hidden_states.shape[1]
-    pos_emb = tower.positional_embedding.positional_embedding[:t, :].unsqueeze(0)
+    positions = tower.positional_embedding.positional_embedding
+    if t > positions.shape[0]:
+        raise ValueError(f"Encoder帧数{t}超过位置编码上限{positions.shape[0]}。")
+    pos_emb = positions[:t, :].unsqueeze(0)
     hidden_states = hidden_states + pos_emb.to(hidden_states.device, dtype=hidden_states.dtype)
 
     # 构建 chunk 级 attention mask

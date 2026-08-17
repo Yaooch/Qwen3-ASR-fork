@@ -37,20 +37,32 @@ def feature_mask(
     return steps.unsqueeze(0) < lengths.unsqueeze(1)
 
 
-def _gather_grad(x: torch.Tensor) -> torch.Tensor:
+def _pad_batch(x: torch.Tensor, size: int) -> torch.Tensor:
+    if x.shape[0] == size:
+        return x
+    padding = x.new_zeros((size - x.shape[0], *x.shape[1:]))
+    return torch.cat((x, padding), dim=0)
+
+
+def _gather_grad(x: torch.Tensor, sizes) -> torch.Tensor:
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return x
     from torch.distributed.nn.functional import all_gather
 
-    return torch.cat(all_gather(x), dim=0)
+    padded = _pad_batch(x, max(sizes))
+    return torch.cat(
+        [part[:size] for part, size in zip(all_gather(padded), sizes)],
+        dim=0,
+    )
 
 
-def _gather_mask(mask: torch.Tensor) -> torch.Tensor:
+def _gather_mask(mask: torch.Tensor, sizes) -> torch.Tensor:
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return mask
-    parts = [torch.empty_like(mask) for _ in range(dist.get_world_size())]
-    dist.all_gather(parts, mask)
-    return torch.cat(parts, dim=0)
+    padded = _pad_batch(mask, max(sizes))
+    parts = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, padded)
+    return torch.cat([part[:size] for part, size in zip(parts, sizes)], dim=0)
 
 
 def gather_embeddings(
@@ -67,8 +79,7 @@ def gather_embeddings(
     batch = torch.tensor([text_global.shape[0]], device=text_global.device)
     batches = [torch.empty_like(batch) for _ in range(dist.get_world_size())]
     dist.all_gather(batches, batch)
-    if any(int(x.item()) != int(batch.item()) for x in batches):
-        raise RuntimeError("GLCLAP 多卡训练要求每个 rank 的 batch size 相同。")
+    sizes = [int(x.item()) for x in batches]
 
     max_time = torch.tensor(audio_local.shape[1], device=audio_local.device)
     dist.all_reduce(max_time, op=dist.ReduceOp.MAX)
@@ -78,11 +89,11 @@ def gather_embeddings(
         audio_mask = F.pad(audio_mask, (0, pad), value=False)
 
     return (
-        _gather_grad(text_global),
-        _gather_grad(text_local),
-        _gather_grad(audio_global),
-        _gather_grad(audio_local),
-        _gather_mask(audio_mask),
+        _gather_grad(text_global, sizes),
+        _gather_grad(text_local, sizes),
+        _gather_grad(audio_global, sizes),
+        _gather_grad(audio_local, sizes),
+        _gather_mask(audio_mask, sizes),
     )
 
 
@@ -118,6 +129,75 @@ def glclap_loss(
         "global_logits": global_logits,
         "local_logits": local_logits,
     }
+
+
+class GLCLAPHead(nn.Module):
+    """接收已有音频 Encoder 输出的 GLCLAP 训练头。"""
+
+    def __init__(
+        self,
+        text_model: str,
+        audio_dim: int,
+        embed_dim: int = 512,
+        gradient_checkpointing: bool = True,
+    ):
+        super().__init__()
+        from transformers import BertModel
+
+        self.text_model = text_model
+        self.embed_dim = embed_dim
+        self.text_encoder = BertModel.from_pretrained(
+            text_model, local_files_only=True, add_pooling_layer=False
+        )
+        self.audio_projection = nn.Linear(audio_dim, embed_dim, bias=False)
+        self.text_projection = nn.Linear(
+            self.text_encoder.config.hidden_size, embed_dim, bias=False
+        )
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
+        if gradient_checkpointing:
+            self.text_encoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+    def encode_text(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).last_hidden_state
+        pooled = masked_mean(hidden, attention_mask.bool())
+        return F.normalize(self.text_projection(pooled), dim=-1)
+
+    def forward(
+        self,
+        audio_hidden: torch.Tensor,
+        audio_mask: torch.Tensor,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        subtext_input_ids: torch.Tensor,
+        subtext_attention_mask: torch.Tensor,
+        gather: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        projected = self.audio_projection(audio_hidden)
+        audio_local = F.normalize(projected, dim=-1)
+        audio_global = F.normalize(masked_mean(projected, audio_mask), dim=-1)
+        text_global = self.encode_text(text_input_ids, text_attention_mask)
+        text_local = self.encode_text(subtext_input_ids, subtext_attention_mask)
+        if gather:
+            text_global, text_local, audio_global, audio_local, audio_mask = gather_embeddings(
+                text_global, text_local, audio_global, audio_local, audio_mask
+            )
+        return glclap_loss(
+            text_global,
+            text_local,
+            audio_global,
+            audio_local,
+            audio_mask,
+            self.logit_scale,
+        )
 
 
 class GLCLAPModel(nn.Module):

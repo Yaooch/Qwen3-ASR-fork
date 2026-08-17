@@ -83,7 +83,7 @@ def inject_audio(thinker, input_ids, audio_features):
 
 
 class Qwen3ASRJointModel(nn.Module):
-    """Qwen3-ASR + CTC/RNNT 辅助头；训练和推理主入口都在这里。"""
+    """Qwen3-ASR + CTC/RNNT/GLCLAP 辅助头；训练和推理主入口都在这里。"""
 
     def __init__(
         self,
@@ -95,6 +95,7 @@ class Qwen3ASRJointModel(nn.Module):
         train_tasks: Iterable[str] = ("llm", "ctc"),
         loss_weights: Optional[Dict[str, float]] = None,
         ctc_config: Optional[Dict] = None,
+        glclap_config: Optional[Dict] = None,
         stream_train: bool = False,
     ):
         super().__init__()
@@ -103,15 +104,24 @@ class Qwen3ASRJointModel(nn.Module):
         self.vocab_size = vocab_size
         self.blank_id = blank_id
         self._id_to_token = {v: k for k, v in vocab.items()}
-        self.heads = names(heads, {"ctc", "rnnt"}, "heads")
-        self.train_tasks = names(train_tasks, {"llm", "ctc", "rnnt"}, "train_tasks")
-        self.loss_weights = {"llm": 0.8, "ctc": 0.2, "rnnt": 0.2}
+        self.heads = names(heads, {"ctc", "rnnt", "glclap"}, "heads")
+        self.train_tasks = names(
+            train_tasks, {"llm", "ctc", "rnnt", "glclap"}, "train_tasks"
+        )
+        self.loss_weights = {"llm": 0.8, "ctc": 0.2, "rnnt": 0.2, "glclap": 1.0}
         if loss_weights:
             self.loss_weights.update({k: float(v) for k, v in loss_weights.items()})
         self.stream_train = stream_train
         self.encoder_output_size = qwen_model.thinker.audio_tower.config.d_model
         self.ctc = CTC(vocab_size, self.encoder_output_size, blank_id=blank_id, **(ctc_config or {})) if "ctc" in self.heads else None
         self.rnnt = RNNT(vocab_size, self.encoder_output_size, blank_id=blank_id) if "rnnt" in self.heads else None
+        self.glclap = None
+        if "glclap" in self.heads:
+            from qwen_asr_ext.glclap.model import GLCLAPHead
+
+            self.glclap = GLCLAPHead(
+                audio_dim=self.encoder_output_size, **(glclap_config or {})
+            )
         self.processor = None
         self._asr_wrapper = None
 
@@ -145,7 +155,13 @@ class Qwen3ASRJointModel(nn.Module):
             blank_id=cfg.get("blank_id", 0),
             heads=heads,
             train_tasks=("llm", *heads),
+            loss_weights=cfg.get("loss_weights"),
             ctc_config={"adapter_type": cfg.get("ctc_adapter", "mlp")},
+            glclap_config={
+                "text_model": cfg.get("glclap_text_model", ""),
+                "embed_dim": cfg.get("glclap_embed_dim", 512),
+                "gradient_checkpointing": False,
+            } if "glclap" in heads else None,
         )
         model.processor = base.processor
         model._asr_wrapper = base
@@ -164,7 +180,11 @@ class Qwen3ASRJointModel(nn.Module):
 
     def save_aux(self, output_dir: str, heads=None, copy_heads_from: Optional[str] = None) -> None:
         os.makedirs(output_dir, exist_ok=True)
-        heads = names(self.heads if heads is None else heads, {"ctc", "rnnt"}, "heads")
+        heads = names(
+            self.heads if heads is None else heads,
+            {"ctc", "rnnt", "glclap"},
+            "heads",
+        )
         source_cfg = read_cfg(copy_heads_from)
         for name in heads:
             dst = os.path.join(output_dir, f"{name}_head.pt")
@@ -188,6 +208,18 @@ class Qwen3ASRJointModel(nn.Module):
         }
         if "ctc" in heads:
             cfg["ctc_adapter"] = self.ctc.adapter_type if self.ctc is not None else source_cfg.get("ctc_adapter", "mlp")
+        if "glclap" in heads:
+            cfg["glclap_text_model"] = (
+                self.glclap.text_model
+                if self.glclap is not None
+                else source_cfg.get("glclap_text_model", "")
+            )
+            cfg["glclap_embed_dim"] = (
+                self.glclap.embed_dim
+                if self.glclap is not None
+                else source_cfg.get("glclap_embed_dim", 512)
+            )
+        cfg["loss_weights"] = self.loss_weights
         with open(os.path.join(output_dir, JOINT_CONFIG), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -357,12 +389,21 @@ class Qwen3ASRJointModel(nn.Module):
         ctc_target_ids=None,
         ctc_target_lengths=None,
         texts=None,
+        glclap_text_input_ids=None,
+        glclap_text_attention_mask=None,
+        glclap_subtext_input_ids=None,
+        glclap_subtext_attention_mask=None,
         tasks=None,
         **kwargs,
     ):
-        tasks = names(tasks or self.train_tasks, {"llm", "ctc", "rnnt"}, "tasks")
+        tasks = names(
+            tasks or self.train_tasks,
+            {"llm", "ctc", "rnnt", "glclap"},
+            "tasks",
+        )
         aux_tasks = [x for x in ("ctc", "rnnt") if x in tasks]
         need_llm = "llm" in tasks
+        need_glclap = "glclap" in tasks
         # 纯文本路径(NLU):无音频输入,跳过 audio_tower,直接 thinker 文本前向。
         # ASR / ASR+NLU 路径(input_features 非空)不受影响,仍走下方 audio encode。
         if input_features is None:
@@ -396,6 +437,32 @@ class Qwen3ASRJointModel(nn.Module):
             losses.append(self.loss_weights.get(name, 1.0) * loss)
             if name == "ctc" and not self.training:
                 outputs["log_probs"] = self.ctc.log_softmax(head_hs, lens)
+
+        if need_glclap:
+            if self.glclap is None:
+                raise RuntimeError("当前模型没有 GLCLAP 头。")
+            glclap_inputs = (
+                glclap_text_input_ids,
+                glclap_text_attention_mask,
+                glclap_subtext_input_ids,
+                glclap_subtext_attention_mask,
+            )
+            if any(value is None for value in glclap_inputs):
+                raise ValueError("GLCLAP 训练缺少文本或子文本 token。")
+            steps = torch.arange(hs.shape[1], device=hs.device)
+            audio_mask = steps.unsqueeze(0) < lens.unsqueeze(1)
+            glclap = self.glclap(
+                hs,
+                audio_mask,
+                glclap_text_input_ids,
+                glclap_text_attention_mask,
+                glclap_subtext_input_ids,
+                glclap_subtext_attention_mask,
+            )
+            outputs["glclap_loss"] = glclap["loss"]
+            outputs["glclap_global_loss"] = glclap["global_loss"]
+            outputs["glclap_local_loss"] = glclap["local_loss"]
+            losses.append(self.loss_weights.get("glclap", 1.0) * glclap["loss"])
 
         if need_llm:
             inputs_embeds = inject_audio(self.qwen_model.thinker, input_ids, llm)

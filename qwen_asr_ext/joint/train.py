@@ -4,15 +4,24 @@ import json
 import os
 import re
 import shutil
+import statistics
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import editdistance
 import librosa
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
 from filelock import FileLock
 from qwen_asr import Qwen3ASRModel
+from qwen_asr_ext.glclap.train import (
+    ENGLISH_WORD_DF,
+    TEXT_MODEL as GLCLAP_TEXT_MODEL,
+    load_word_df,
+    parse_text,
+    sample_subtext,
+)
 from qwen_asr_ext.joint import Qwen3ASRJointModel
 from qwen_asr_ext.joint.defaults import (
     DEFAULT_ATTN_IMPLEMENTATION, DEFAULT_PROMPT, TRAIN_MASK_CURRENT_FRAMES, TRAIN_MASK_LEFT_FRAMES,
@@ -21,14 +30,14 @@ from qwen_asr_ext.joint.defaults import (
 from qwen_asr_ext.joint.encoder import conv_len, encode_offline, encode_train_mask, feature_lens
 from qwen_asr_ext.joint.model import names, read_cfg
 from safetensors.torch import load_model as load_safetensors_model
-from transformers import Trainer, TrainingArguments
+from transformers import BertTokenizer, Trainer, TrainingArguments
 from transformers.modeling_utils import load_sharded_checkpoint
 
 
-TASKS = {"llm", "proj", "encoder", "ctc", "rnnt"}
+TASKS = {"llm", "proj", "encoder", "ctc", "rnnt", "glclap"}
 PROJ_MODULES = ("proj1", "act", "proj2")
 PROJ_PARAM_KEYS = tuple(f".{name}." for name in PROJ_MODULES)
-
+MAX_TRAIN_AUDIO_SECONDS = 30.0
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
@@ -41,7 +50,23 @@ def latest_checkpoint(output_dir: str) -> Optional[str]:
     for name in os.listdir(output_dir):
         m = _CKPT_RE.match(name)
         path = os.path.join(output_dir, name)
-        if m and os.path.isdir(path) and (best is None or int(m.group(1)) > best[0]):
+        complete = (
+            os.path.isfile(os.path.join(path, "trainer_state.json"))
+            and any(
+                os.path.isfile(os.path.join(path, model_file))
+                for model_file in (
+                    "model.safetensors",
+                    "model.safetensors.index.json",
+                    "pytorch_model.bin",
+                )
+            )
+        )
+        if (
+            m
+            and os.path.isdir(path)
+            and complete
+            and (best is None or int(m.group(1)) > best[0])
+        ):
             best = (int(m.group(1)), path)
     return best[1] if best else None
 
@@ -55,6 +80,12 @@ class DataCollatorForJointTraining:
     stream_train: bool = False
     need_llm: bool = True
     need_aux: bool = True
+    need_glclap: bool = False
+    glclap_tokenizer: Any = None
+    glclap_word_df: Optional[dict] = None
+    glclap_median_df: float = 1.0
+    max_subtext_units: int = 8
+    max_audio_seconds: float = MAX_TRAIN_AUDIO_SECONDS
 
     def __post_init__(self):
         self.cjk = re.compile(r"([\u4e00-\u9fff])")
@@ -67,8 +98,10 @@ class DataCollatorForJointTraining:
             except Exception as exc:
                 print(f"音频读取失败，跳过：{item['audio']}，{exc}")
                 continue
-            if len(wav) / self.sampling_rate > 1000.0:
-                print(f"音频过长，跳过：{item['audio']}")
+            if len(wav) / self.sampling_rate > self.max_audio_seconds:
+                print(
+                    f"音频超过{self.max_audio_seconds:g}秒，跳过：{item['audio']}"
+                )
                 continue
             rows.append((item, wav))
         if not rows:
@@ -123,6 +156,38 @@ class DataCollatorForJointTraining:
             )
             full["feature_attention_mask"] = full.pop("attention_mask")
 
+        if self.need_glclap:
+            parsed = [parse_text(text) for text in targets]
+            glclap_texts = [text for _, text in parsed]
+            subtexts = [
+                sample_subtext(
+                    text,
+                    language,
+                    self.max_subtext_units,
+                    self.glclap_word_df,
+                    self.glclap_median_df,
+                )
+                for language, text in parsed
+            ]
+            text_tokens = self.glclap_tokenizer(
+                glclap_texts,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt",
+            )
+            subtext_tokens = self.glclap_tokenizer(
+                subtexts,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt",
+            )
+            full["glclap_text_input_ids"] = text_tokens["input_ids"]
+            full["glclap_text_attention_mask"] = text_tokens["attention_mask"]
+            full["glclap_subtext_input_ids"] = subtext_tokens["input_ids"]
+            full["glclap_subtext_attention_mask"] = subtext_tokens["attention_mask"]
+
         if not self.need_aux:
             return full
 
@@ -174,6 +239,95 @@ def set_trainable(model: Qwen3ASRJointModel, tasks: Iterable[str]) -> None:
             set_module(getattr(audio_tower, name, None), True)
     set_module(model.ctc, "ctc" in tasks)
     set_module(model.rnnt, "rnnt" in tasks)
+    set_module(model.glclap, "glclap" in tasks)
+
+
+def weights_from_grad_norms(
+    medians: Dict[str, float],
+    current: Dict[str, float],
+    target_ratios: Dict[str, float],
+) -> Dict[str, float]:
+    """把辅助任务的目标梯度比例换算成loss权重。"""
+    if medians.get("llm", 0.0) <= 0:
+        raise ValueError("LLM梯度范数必须大于0。")
+    weights = dict(current)
+    llm_weight = weights.get("llm", 1.0)
+    for name, ratio in target_ratios.items():
+        if medians.get(name, 0.0) <= 0:
+            raise ValueError(f"{name}梯度范数必须大于0。")
+        value = ratio * llm_weight * medians["llm"] / medians[name]
+        weights[name] = min(100.0, max(1e-4, value))
+    return weights
+
+
+def calibrate_loss_weights(
+    model: Qwen3ASRJointModel,
+    trainer,
+    steps: int,
+    target_ratios: Dict[str, float],
+    output_dir: str,
+) -> None:
+    """按共享 Encoder 梯度范数校准辅助任务权重。"""
+    if steps <= 0:
+        return
+    raw_keys = {"llm": "llm_loss", "ctc": "ctc_loss", "glclap": "glclap_loss"}
+    tasks = ["llm", *[name for name in ("ctc", "glclap") if name in target_ratios]]
+    layers = model.qwen_model.thinker.audio_tower.layers[-2:]
+    probe = [param for layer in layers for param in layer.parameters() if param.requires_grad]
+    if not probe:
+        raise ValueError("loss校准要求阶段二放开Audio Encoder。")
+
+    norms = {name: [] for name in tasks}
+    iterator = iter(trainer.get_train_dataloader())
+    model.train()
+    for _ in range(steps):
+        try:
+            inputs = next(iterator)
+        except StopIteration:
+            iterator = iter(trainer.get_train_dataloader())
+            inputs = next(iterator)
+        inputs = trainer._prepare_inputs(inputs)
+        with trainer.accelerator.autocast():
+            outputs = model(**inputs)
+        missing = [name for name in tasks if raw_keys[name] not in outputs]
+        if missing:
+            raise ValueError(f"loss校准缺少任务输出：{missing}")
+        for name in tasks:
+            grads = torch.autograd.grad(
+                outputs[raw_keys[name]],
+                probe,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            squared = sum(
+                grad.detach().float().square().sum()
+                for grad in grads
+                if grad is not None
+            )
+            if not torch.is_tensor(squared):
+                squared = torch.zeros((), device=next(model.parameters()).device)
+            if dist.is_initialized():
+                dist.all_reduce(squared, op=dist.ReduceOp.SUM)
+                squared /= dist.get_world_size()
+            norms[name].append(float(squared.sqrt().cpu()))
+        del outputs
+
+    medians = {name: statistics.median(values) for name, values in norms.items()}
+    model.loss_weights.update(
+        weights_from_grad_norms(medians, model.loss_weights, target_ratios)
+    )
+
+    result = {
+        "steps": steps,
+        "gradient_norm_median": medians,
+        "target_gradient_ratio": target_ratios,
+        "loss_weights": model.loss_weights,
+    }
+    if trainer.args.process_index == 0:
+        path = os.path.join(output_dir, "loss_calibration.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print("Loss校准：" + json.dumps(result, ensure_ascii=False))
 
 
 class JointTrainer(Trainer):
@@ -194,6 +348,10 @@ class JointTrainer(Trainer):
                 return "ctc"
             if param_name.startswith(("rnnt.", "module.rnnt.")):
                 return "rnnt"
+            if param_name.startswith(("glclap.text_encoder.", "module.glclap.text_encoder.")):
+                return "glclap_text"
+            if param_name.startswith(("glclap.", "module.glclap.")):
+                return "glclap_proj"
             if ".audio_tower." in param_name:
                 return "proj" if any(x in param_name for x in PROJ_PARAM_KEYS) else "encoder"
             return "llm"
@@ -222,7 +380,20 @@ class JointTrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         if isinstance(outputs, dict) and model.training:
-            for key in ("loss", "llm_loss", "ctc_loss", "rnnt_loss"):
+            base = model.module if hasattr(model, "module") else model
+            for name in ("llm", "ctc", "rnnt", "glclap"):
+                raw = outputs.get(f"{name}_loss")
+                if torch.is_tensor(raw):
+                    weight = float(base.loss_weights.get(name, 1.0))
+                    outputs[f"{name}_weight"] = raw.new_tensor(weight)
+                    outputs[f"weighted_{name}_loss"] = weight * raw
+            for key in (
+                "loss", "llm_loss", "ctc_loss", "rnnt_loss", "glclap_loss",
+                "glclap_global_loss", "glclap_local_loss",
+                "llm_weight", "ctc_weight", "rnnt_weight", "glclap_weight",
+                "weighted_llm_loss", "weighted_ctc_loss", "weighted_rnnt_loss",
+                "weighted_glclap_loss",
+            ):
                 value = loss if key == "loss" else outputs.get(key)
                 if torch.is_tensor(value):
                     self._loss_sums[key] = self._loss_sums.get(key, 0.0) + float(value.detach().float().item())
@@ -238,6 +409,16 @@ class JointTrainer(Trainer):
             logs = merged
             self._loss_sums = {}
             self._loss_count = 0
+        logs = {
+            key: (
+                float(f"{value:.3e}")
+                if key.endswith("_lr")
+                else round(value, 3)
+            )
+            if isinstance(value, float)
+            else value
+            for key, value in logs.items()
+        }
         return super().log(logs, *args, **kwargs)
 
     def _prepare_inputs(self, inputs):
@@ -309,6 +490,9 @@ class JointTrainer(Trainer):
             print(f"恢复训练：{resume_from_checkpoint}")
         self._load_qwen(base.qwen_model, resume_from_checkpoint)
         load_heads(base, resume_from_checkpoint, is_main=self.args.process_index == 0, strict=False)
+        cfg = read_cfg(resume_from_checkpoint)
+        if cfg.get("loss_weights"):
+            base.loss_weights.update(cfg["loss_weights"])
 
     @staticmethod
     def _load_qwen(qwen_model, ckpt_dir: str):
@@ -337,11 +521,8 @@ class JointTrainer(Trainer):
         gen = getattr(base.qwen_model, "generation_config", None)
         if gen is not None and not getattr(gen, "do_sample", False):
             gen.temperature = None
-        base.qwen_model.save_pretrained(output_dir, safe_serialization=True)
+        base.qwen_model.save_pretrained(output_dir, safe_serialization=False)
         base.save_aux(output_dir, heads=self.save_heads, copy_heads_from=self.head_source)
-        old = os.path.join(output_dir, "pytorch_model.bin")
-        if os.path.exists(old):
-            os.remove(old)
 
 
 def load_heads(model: Qwen3ASRJointModel, path: str, heads=None, is_main: bool = True, strict: bool = True):
@@ -366,7 +547,12 @@ def parse_args():
     p.add_argument("--train_file", type=str, required=True)
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-joint-out")
-    p.add_argument("--train", type=str, default="llm,ctc", help="逗号组合：llm,proj,encoder,ctc,rnnt")
+    p.add_argument(
+        "--train",
+        type=str,
+        default="llm,ctc",
+        help="逗号组合：llm,proj,encoder,ctc,rnnt,glclap",
+    )
     p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--vocab_path", type=str, default=TRAIN_VOCAB_PATH)
     p.add_argument("--sp_model_path", type=str, default=TRAIN_SP_MODEL_PATH)
@@ -383,9 +569,19 @@ def parse_args():
     p.add_argument("--lr_encoder", type=float, default=1e-5)
     p.add_argument("--lr_ctc", type=float, default=1e-3)
     p.add_argument("--lr_rnnt", type=float, default=1e-3)
+    p.add_argument("--lr_glclap_text", type=float, default=1e-5)
+    p.add_argument("--lr_glclap_proj", type=float, default=1e-3)
     p.add_argument("--w_llm", type=float, default=1.0)
     p.add_argument("--w_ctc", type=float, default=1.0)
     p.add_argument("--w_rnnt", type=float, default=1.0)
+    p.add_argument("--w_glclap", type=float, default=1.0)
+    p.add_argument("--glclap_text_model", type=str, default=GLCLAP_TEXT_MODEL)
+    p.add_argument("--glclap_embed_dim", type=int, default=512)
+    p.add_argument("--english_word_df", type=str, default=ENGLISH_WORD_DF)
+    p.add_argument("--max_subtext_units", type=int, default=8)
+    p.add_argument("--loss_calibration_steps", type=int, default=0)
+    p.add_argument("--ctc_grad_ratio", type=float, default=0.25)
+    p.add_argument("--glclap_grad_ratio", type=float, default=0.25)
 
     p.add_argument("--ctc_adapter", type=str, default="auto", help="auto/mlp/moe，auto 会继承源 checkpoint")
 
@@ -411,15 +607,23 @@ def parse_args():
         raise ValueError("proj 只作用于 LLM 路径，请和 llm 一起训练。")
     args.loss_tasks = tuple(x for x in args.tasks if x not in ("encoder", "proj"))
     if not args.loss_tasks:
-        raise ValueError("--train 至少需要包含 llm/ctc/rnnt 之一；encoder/proj 只能配合这些 loss 一起训练。")
+        raise ValueError("--train 至少需要包含 llm/ctc/rnnt/glclap 之一；encoder/proj 只能配合这些 loss 一起训练。")
+    if args.loss_calibration_steps > 0:
+        required = {"llm", "encoder"}
+        if not required.issubset(args.tasks):
+            raise ValueError("loss校准要求 --train 同时包含 llm 和 encoder。")
+        if not ({"ctc", "glclap"} & set(args.loss_tasks)):
+            raise ValueError("loss校准至少需要一个CTC或GLCLAP辅助任务。")
+        if args.ctc_grad_ratio <= 0 or args.glclap_grad_ratio <= 0:
+            raise ValueError("loss校准的目标梯度比例必须大于0。")
     save_heads = [
         name
-        for name in ("ctc", "rnnt")
+        for name in ("ctc", "rnnt", "glclap")
         if os.path.exists(os.path.join(args.model_path, f"{name}_head.pt"))
     ]
     active_heads = []
     for name in args.loss_tasks:
-        if name in ("ctc", "rnnt"):
+        if name in ("ctc", "rnnt", "glclap"):
             if name not in save_heads:
                 save_heads.append(name)
             active_heads.append(name)
@@ -484,8 +688,17 @@ def main():
         blank_id=0,
         heads=args.active_heads,
         train_tasks=args.loss_tasks,
-        loss_weights={"llm": args.w_llm, "ctc": args.w_ctc, "rnnt": args.w_rnnt},
+        loss_weights={
+            "llm": args.w_llm,
+            "ctc": args.w_ctc,
+            "rnnt": args.w_rnnt,
+            "glclap": args.w_glclap,
+        },
         ctc_config={"adapter_type": args.ctc_adapter},
+        glclap_config={
+            "text_model": args.glclap_text_model,
+            "embed_dim": args.glclap_embed_dim,
+        } if "glclap" in args.heads else None,
         stream_train=(args.stream_train == 1),
     )
     model.processor = processor
@@ -509,6 +722,15 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
+    glclap_tokenizer = None
+    glclap_word_df = None
+    glclap_median_df = 1.0
+    if "glclap" in args.loss_tasks:
+        glclap_tokenizer = BertTokenizer.from_pretrained(
+            args.glclap_text_model, local_files_only=True
+        )
+        glclap_word_df, glclap_median_df = load_word_df(args.english_word_df)
+
     collator = DataCollatorForJointTraining(
         processor,
         vocab,
@@ -517,6 +739,11 @@ def main():
         sampling_rate=args.sr,
         stream_train=(args.stream_train == 1),
         need_llm=("llm" in args.loss_tasks),
+        need_glclap=("glclap" in args.loss_tasks),
+        glclap_tokenizer=glclap_tokenizer,
+        glclap_word_df=glclap_word_df,
+        glclap_median_df=glclap_median_df,
+        max_subtext_units=args.max_subtext_units,
     )
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -531,10 +758,11 @@ def main():
         dataloader_pin_memory=(args.pin_memory == 1),
         dataloader_persistent_workers=(args.persistent_workers == 1),
         dataloader_prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        dataloader_drop_last=True,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        save_safetensors=True,
+        save_safetensors=False,
         eval_strategy="steps",
         eval_steps=args.save_steps,
         do_eval=bool(args.eval_file),
@@ -552,6 +780,8 @@ def main():
             "encoder": args.lr_encoder,
             "ctc": args.lr_ctc,
             "rnnt": args.lr_rnnt,
+            "glclap_text": args.lr_glclap_text,
+            "glclap_proj": args.lr_glclap_proj,
         },
         save_heads=args.heads,
         head_source=args.model_path,
@@ -566,6 +796,21 @@ def main():
     resume_from = (args.resume_from or "").strip()
     if not resume_from and args.resume == 1:
         resume_from = latest_checkpoint(training_args.output_dir) or ""
+    if args.loss_calibration_steps > 0 and not resume_from:
+        ratios = {}
+        if "ctc" in args.loss_tasks:
+            ratios["ctc"] = args.ctc_grad_ratio
+        if "glclap" in args.loss_tasks:
+            ratios["glclap"] = args.glclap_grad_ratio
+        calibrate_loss_weights(
+            model,
+            trainer,
+            args.loss_calibration_steps,
+            ratios,
+            training_args.output_dir,
+        )
+        if dist.is_initialized():
+            dist.barrier()
     trainer.train(resume_from_checkpoint=resume_from or None)
     trainer.save_model(training_args.output_dir)
 
