@@ -13,7 +13,7 @@ num_gpus=$(awk -F',' '{print NF}' <<< "$gpu_ids")
 base_model="/cfs/data/private/hubk/Qwen3-ASR/Qwen/Qwen3-ASR-1___7B"
 train_file="/cfs/data/private/WangYaoChi/train_data/all/train_shuffled.jsonl"
 eval_file="/cfs/data/private/WangYaoChi/train_data/all/eval_shuffled.jsonl"
-output_root="/cfs/data/private/WangYaoChi/model/joint_ctc_llm_glclap"
+output_root="/cfs/data/private/WangYaoChi/model/joint_ctc_llm_glclap_2"
 text_model="/cfs/data/private/WangYaoChi/model/glclap/bert-base-multilingual-uncased"
 word_df="/cfs/data/private/WangYaoChi/train_data/all/english_word_df.json"
 
@@ -27,9 +27,9 @@ if [[ "$stage" == "1" ]]; then
     lr_encoder=0
     lr_llm=0
     lr_proj=0
-    lr_ctc=1e-3
-    lr_glclap_text=1e-5
-    lr_glclap_proj=1e-3
+    lr_ctc=2e-3
+    lr_glclap_text=2e-5
+    lr_glclap_proj=2e-3
     calibration_steps=0
 elif [[ "$stage" == "2" ]]; then
     model_path="${output_root}/stage1_heads"
@@ -41,13 +41,13 @@ elif [[ "$stage" == "2" ]]; then
     train_tasks="llm,proj,encoder,ctc,glclap"
     batch_size=16
     grad_acc=4
-    epochs=2
-    lr_encoder=5e-6
-    lr_llm=5e-6
+    epochs=1
+    lr_encoder=1e-5
+    lr_llm=1e-5
     lr_proj=1e-5
-    lr_ctc=1e-4
-    lr_glclap_text=5e-6
-    lr_glclap_proj=1e-4
+    lr_ctc=1e-3
+    lr_glclap_text=1e-5
+    lr_glclap_proj=1e-3
     calibration_steps=100
 else
     echo "stage只支持1或2"
@@ -55,7 +55,7 @@ else
 fi
 
 tmp_dir="/tmp/qwen3_asr_joint/stage${stage}"
-logging_dir="${PROJECT_ROOT}/reports/tensorboard/joint_ctc_llm_glclap/stage${stage}"
+logging_dir="${PROJECT_ROOT}/reports/tensorboard/joint_ctc_llm_glclap_2/stage${stage}"
 mkdir -p "$output_dir" "${output_root}/dataset_cache" "$tmp_dir" "$logging_dir"
 export CUDA_VISIBLE_DEVICES="$gpu_ids"
 export OMP_NUM_THREADS=4
@@ -76,7 +76,7 @@ torchrun \
     --train_file "$train_file" \
     --eval_file "$eval_file" \
     --output_dir "$output_dir" \
-    --resume 1 \
+    --resume 0 \
     --train "$train_tasks" \
     --batch_size "$batch_size" \
     --grad_acc "$grad_acc" \

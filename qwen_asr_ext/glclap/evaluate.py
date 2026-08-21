@@ -8,14 +8,79 @@ from typing import Dict, List, Tuple
 
 import librosa
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from safetensors.torch import load_file
 from transformers import AutoFeatureExtractor, BertTokenizer
 
 from qwen_asr_ext.glclap.benchmark import RetrievalMetrics, latency_stats, load_hotword_benchmark
-from qwen_asr_ext.glclap.model import GLCLAPModel
+from qwen_asr_ext.glclap.model import GLCLAPModel, masked_mean
+from qwen_asr_ext.joint.defaults import (
+    TRAIN_MASK_CURRENT_FRAMES,
+    TRAIN_MASK_LEFT_FRAMES,
+    TRAIN_MASK_RIGHT_FRAMES,
+)
+from qwen_asr_ext.joint.encoder import encode_train_mask, feature_lens
 
 
-def load_model(checkpoint: str, device: torch.device) -> Tuple[GLCLAPModel, Dict]:
+class JointGLCLAPModel(nn.Module):
+    """复用 joint checkpoint 的 Qwen Audio Encoder 和 GLCLAP 头。"""
+
+    def __init__(self, checkpoint: str):
+        super().__init__()
+        from qwen_asr_ext.joint import Qwen3ASRJointModel
+
+        self.joint = Qwen3ASRJointModel.from_pretrained(
+            checkpoint,
+            dtype=torch.bfloat16,
+            device_map=None,
+        )
+        if self.joint.glclap is None:
+            raise RuntimeError("joint checkpoint 没有 GLCLAP 头。")
+
+    def encode_text(self, input_ids, attention_mask):
+        return self.joint.glclap.encode_text(input_ids, attention_mask)
+
+    def extract_audio_features(
+        self,
+        input_features=None,
+        feature_attention_mask=None,
+        **_,
+    ):
+        tower = self.joint.qwen_model.thinker.audio_tower
+        lengths = feature_lens(input_features, feature_attention_mask)
+        hidden, _, lengths = encode_train_mask(
+            tower,
+            input_features,
+            lengths,
+            TRAIN_MASK_LEFT_FRAMES,
+            TRAIN_MASK_CURRENT_FRAMES,
+            TRAIN_MASK_RIGHT_FRAMES,
+            need_llm=False,
+        )
+        steps = torch.arange(hidden.shape[1], device=hidden.device)
+        return hidden, steps.unsqueeze(0) < lengths.unsqueeze(1)
+
+    def encode_audio_features(self, hidden, mask):
+        projected = self.joint.glclap.audio_projection(hidden)
+        local = F.normalize(projected, dim=-1)
+        global_ = F.normalize(masked_mean(projected, mask), dim=-1)
+        return global_, local, mask
+
+
+def load_model(checkpoint: str, device: torch.device) -> Tuple[nn.Module, Dict]:
+    joint_config = os.path.join(checkpoint, "joint_config.json")
+    if os.path.isfile(joint_config):
+        with open(joint_config, encoding="utf-8") as f:
+            saved = json.load(f)
+        config = {
+            "audio_backend": "qwen",
+            "audio_model": checkpoint,
+            "text_model": saved["glclap_text_model"],
+            "max_text_length": 128,
+        }
+        return JointGLCLAPModel(checkpoint).to(device).eval(), config
+
     with open(os.path.join(checkpoint, "config.json"), encoding="utf-8") as f:
         config = json.load(f)
     model = GLCLAPModel(

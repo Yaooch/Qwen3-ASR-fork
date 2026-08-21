@@ -19,7 +19,6 @@ language=""
 hotword_file=""
 hotword_topk=5
 lora=""
-lora="/cfs/data/private/WangYaoChi/model/joint_ctc_50_asr_nlu_1"
 encoder_mode="stream"
 wer_script="$(awk -F'"' '/^WER_SCRIPT = / {print $2; exit}' "${PROJECT_ROOT}/qwen_asr_ext/joint/defaults.py")"
 pinyin_style="tone3"

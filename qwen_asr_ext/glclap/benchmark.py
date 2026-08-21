@@ -34,12 +34,18 @@ def read_candidates(path: str) -> List[str]:
 def load_hotword_benchmark(data_dir: str, source_name: str, max_utts: int = 0, sort_records=False):
     sources = read_key_value(os.path.join(data_dir, source_name))
     targets = {
-        key: normalize_text(value)
+        key: [normalize_text(word) for word in value.replace("，", ",").split(",") if word.strip()]
         for key, value in read_key_value(os.path.join(data_dir, "utt_hotword.txt")).items()
     }
     transcripts = read_key_value(os.path.join(data_dir, "text"))
     candidates = read_candidates(os.path.join(data_dir, "hotword.txt"))
-    records = [(key, source, targets[key]) for key, source in sources.items() if key in targets]
+    expand_ids = any(len(words) > 1 for words in targets.values())
+    records = []
+    for key, source in sources.items():
+        for index, target in enumerate(targets.get(key, [])):
+            record_id = f"{key}__hot{index}" if expand_ids else key
+            records.append((record_id, source, target))
+            transcripts[record_id] = transcripts.get(key, "")
     if sort_records:
         records.sort(key=lambda row: row[0])
     if max_utts > 0:
